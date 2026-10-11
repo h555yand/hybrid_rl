@@ -41,6 +41,12 @@ from tbp.monty.hydra import instantiate_experiment
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# python src/tbp/tbp.monty/run.py experiment=tutorial/surf_agent_2obj_train_mujoco
+
+# src/tbp/tbp.monty/src/tbp/monty/conf/env_interface/tutorial_train_2obj_predefined.yaml
+# src/tbp/tbp.monty/src/tbp/monty/conf/experiment/tutorial/surf_agent_2obj_train_mujoco.yaml
+# src/tbp/tbp.monty/src/tbp/monty/conf/experiment/tutorial/surf_agent_2obj_eval_mujoco.yaml
+
 # ═══ Paths ═══
 MONTY_CONF = os.path.join(os.path.dirname(tbp.monty.__file__), "conf")
 PRETRAINED = os.path.expanduser(
