@@ -1,4 +1,4 @@
-# Bio-Inspired Hybrid RL for 3D Navigation
+# Bio-Inspired Hybrid RL for goal-directed 3D Navigation
 
 # Bio-Inspired Hybrid RL for 3D Object Navigation
 ## Abstract
