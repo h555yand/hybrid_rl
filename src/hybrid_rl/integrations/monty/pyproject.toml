@@ -1,0 +1,120 @@
+[build-system]
+requires = ["setuptools >= 71.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+authors = [
+    { name = "Aleksei Isaev" }
+]
+classifiers = [
+]
+dependencies = [
+    "hydra-core>=1.3.2", # Hydra is used for configuring Monty
+]
+description = "Prototype of hybrid RL approach: Episodic Memory (HNSW + kNN + Gaussian Kernel Interpolation) , Habits / skills (Soft Actor-Critic (SAC)) " # TODO: Update this description
+dynamic = ["version"]
+name = "hybrid_RL_prototype" # TODO: Update this name
+readme = "README.md"
+
+[project.optional-dependencies]
+dev = [
+    # Check for undeclared dependencies
+    "deptry",
+
+    # Python static type checker
+    "mypy==1.11.2",
+
+    # Testing, code style, etc...
+    "pytest==7.1.1",
+    "pytest-xdist==2.5.0",
+    "pytest-cov==3.0.0",
+
+    # Python linter and formatter
+    "ruff==0.14.2",
+]
+
+[project.urls]
+Repository = "https://github.com/h555yand/hybrid_RL_prototype" # TODO: Update this URL
+Issues = "https://github.com/h555yand/hybrid_RL_prototype/issues" # TODO: Update this URL
+
+[tool.deptry]
+exclude = ["venv", "\\.venv", "\\.direnv", "\\.git", "setup\\.py"]
+experimental_namespace_package = true # recognize `tbp.` prefixed packages as a namespace package
+ignore = ["DEP002"]
+
+
+[tool.mypy]
+explicit_package_bases = true
+files = ["src", "tests"]
+mypy_path = ["src", "tests"]
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+# module = "tbp.monty.*"
+ignore_missing_imports = true # Remove once tbp.monty types are published
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -n auto"
+testpaths = ["tests/unit"]
+filterwarnings = [
+    "ignore:.*:DeprecationWarning",
+]
+junit_family = "xunit1"
+
+[tool.ruff]
+line-length = 120
+target-version = "py38"
+
+[tool.ruff.format]
+indent-style = "space"
+line-ending = "auto"
+quote-style = "double"
+skip-magic-trailing-comma = false
+
+[tool.ruff.lint]
+preview = true
+explicit-preview-rules = true # comment this out to check all preview rules
+select = [
+    "ALL",
+    # Explicitly opt-in to preview rules
+    "CPY001", # Missing copyright notice at top of file
+    "DOC201", # return is not documented in docstring
+    "DOC202", # Docstring should not have a returns section because the function doesn't return anything
+    "DOC402", # yield is not documented in docstring
+    "DOC403", # Docstring has a "Yields" section but the function doesn't yield anything
+    "DOC501", # Raised exception {id} missing from docstring
+    "DOC502", # Raised exception is not explicitly raised: {id}
+    "E261", # Insert at least two spaces before an inline comment
+    "E262", # Inline comment should start with '# '
+    "E265", # Block comment should start with '# '
+]
+ignore = [
+    "COM812", # Trailing comma missing; conflicts with ruff format
+    "ISC001", # Implicitly concatenated string literals on one line; conflicts with ruff format
+    "TRY301", "G004", "SLF001", "EM101", "EM102", "TRY003", "FBT001", "FBT002"
+]
+
+[tool.ruff.lint.per-file-ignores]
+# D104: Missing docstring in public package
+"__init__.py" = ["D104"]
+# D100: Missing docstring in public module
+# D101: Missing docstring in public class
+# D102: Missing docstring in public method
+# S101: Use of `assert` detected
+"tests/**.py" = ["D100", "D101", "D102", "S101", "SLF001", "PLR2004"]
+"src/tbp/hybrid_rl/visualize_env.py" = ["PLR0913"]
+
+[tool.ruff.lint.flake8-copyright]
+author = "Aleksei Isaev"
+
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true

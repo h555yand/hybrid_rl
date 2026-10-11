@@ -1,0 +1,4351 @@
+# Copyright 2026 [Aleksey Isaev]
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""RL Goal Approach Experiment — Hydra-compatible experiment class.
+
+Orchestrates the full RL navigation pipeline: Q-learning training,
+evaluation, Behavioral Cloning, SAC training, and adaptive mode.
+Configured via Hydra YAML.
+"""
+
+from __future__ import annotations
+
+import datetime
+import json
+import logging
+import pickle
+import time
+import types
+from pathlib import Path
+from typing import Any
+import random
+
+import numpy as np
+import torch
+from omegaconf import DictConfig, OmegaConf
+from typing_extensions import Self
+
+from .ablation_runner import (
+    run_episodes,
+    run_eval_per_seed,
+)
+from .action_interpreter import ActionInterpreter
+from .adaptive_manager import AdaptiveTrainingManager
+from .behavioral_cloning import BCTrainer
+from .config import DEFAULT_CONFIG
+from .episode_pools import get_or_generate_pools
+from .experience_extractor import ExperienceExtractor
+from .lightweight_env import LightweightEnv
+from .mesh_factory import prepare_demo_meshes
+from .rl_goal_approach_controller import (
+    RLGoalApproachController,
+    RunningQStats
+)
+from .sac_trainer import PSACTrainer
+from .ablation_runner import _maybe_save_visualization, visualize_agent_goal
+from .strategic_sac import StrategicSAC, StrategicBCTrainer
+from .episode_pools import _is_reachable_by_surface
+from .arbitrator import sac_to_discrete
+from .action_interpreter import ActionInterpreter
+from .ycb_utils import convert_ycb_objects
+from .mujoco_env_adapter import MuJoCoEnvAdapter
+
+logger = logging.getLogger(__name__)
+
+_ADAPTIVE_MIN_DIST = 10.0
+_ADAPTIVE_MAX_DIST = 120.0
+_ADAPTIVE_LOG_INTERVAL = 100
+_SAC_WARMUP_STEPS = 5000
+_BC_NUM_EPOCHS = 200
+# _EVAL_EPSILON = 0.02
+_COLLISION_DEPTH_THRESHOLD = 0.5
+
+
+class RLGoalApproachExperiment:
+    """Hydra-compatible experiment for RL goal approach training.
+
+    Supports stages: Q-learning train, eval, BC train, SAC train,
+    SAC eval, and adaptive mode. All parameters configured via YAML.
+
+    Model storage convention::
+
+        runs/
+        ├── q_store_seed_11/     # Q-learning model
+        ├── sac_seed_11/         # SAC model
+        ├── bc_model/            # BC model (no seed)
+        ├── adaptive_q_seed_11/  # Adaptive Q-store
+        ├── adaptive_sac_seed_11/# Adaptive SAC
+        └── meta/                # Training metadata
+
+    Usage::
+
+        python run.py experiment=rl_goal_approach
+    """
+
+    def __init__(self, config: DictConfig) -> None:
+        """Initialize experiment from Hydra config.
+
+        Args:
+            config: Hydra DictConfig with experiment parameters.
+        """
+        self.config: dict[str, Any] = (
+            OmegaConf.to_object(config)
+            if isinstance(config, DictConfig)
+            else config
+        )
+
+        self.seed = self.config.get("seed", 42)
+        self.output_dir = Path(
+            self.config["logging"]["output_dir"]
+        )
+        self.run_name = self.config["logging"]["run_name"]
+
+        raw_vis = self.config.get("visualise", False)
+        if raw_vis is False or raw_vis is None:
+            self.visualise = None
+        else:
+            self.visualise = str(raw_vis)
+
+        # Directories
+        self.data_dir = self.output_dir / "data"
+        self.runs_dir = self.data_dir / "runs"
+        self.scripts_dir = self.data_dir / "episode_scripts"
+
+        # Pipeline stages
+        self.do_train = self.config.get("do_train", False)
+        self.do_eval = self.config.get("do_eval", False)
+        self.do_heur_eval = self.config.get("do_heur_eval", False)
+        self.do_bc_train = self.config.get("do_bc_train", False)
+        self.do_sac_train = self.config.get(
+            "do_sac_train", False
+        )
+        self.do_sac_eval = self.config.get(
+            "do_sac_eval", False
+        )
+        self.do_adaptive = self.config.get(
+            "do_adaptive", False
+        )
+
+        # Training config
+        self.training_stages: list[dict[str, Any]] = (
+            self.config.get("training_stages", [])
+        )
+        self.curriculum_levels: list[tuple[float, float]] = [
+            tuple(level)
+            for level in self.config.get(
+                "curriculum_levels",
+                [[10.0, 40.0], [20.0, 80.0], [40.0, 120.0]],
+            )
+        ]
+        self.curriculum_filters: list[dict[str, Any]] = (
+            self.config.get(
+                "curriculum_filters", []
+            )
+        )
+        self.train_seeds: list[int] = self.config.get(
+            "train_seeds", [11]
+        )
+        self.eval_seeds: list[int] = self.config.get(
+            "eval_seeds", [44]
+        )
+        self.sac_eval_seeds: list[int] = self.config.get(
+            "sac_eval_seeds", [77, 88, 99]
+        )
+        self.sac_seed: int = self.config.get(
+            "sac_seed", self.train_seeds[0]
+        )
+        self.adapt_seed: int = self.config.get(
+            "adapt_seed", 42
+        )
+        self.eval_episodes_per_level: int = self.config.get(
+            "eval_episodes_per_level", 500
+        )
+        self.sac_eval_episodes_per_level: int = self.config.get(
+            "sac_eval_episodes_per_level", 500
+        )
+        self.regenerate_scripts: bool = self.config.get(
+            "regenerate_scripts", True
+        )
+
+        # RL config
+        self.rl_config: dict[str, Any] = {
+            **DEFAULT_CONFIG,
+            **self.config.get("rl_config", {}),
+        }
+
+        self.promote_threshold: float = self.config.get(
+            "promote_threshold", 0.55
+        )
+        self.promote_window: int = self.config.get(
+            "promote_window", 100
+        )
+
+        # SAC config
+        self.sac_config: dict[str, Any] = self.config.get(
+            "sac_config", {}
+        )
+        self.sac_meshes: list[str] = self.config.get(
+            "sac_meshes",
+            ["cube", "cylinder", "mug", "cup"],
+        )
+        self.sac_episodes_per_mesh: dict[str, int] = (
+            self.config.get(
+                "sac_episodes_per_mesh",
+                {
+                    "cube": 1000,
+                    "cylinder": 1500,
+                    "mug": 2000,
+                    "cup": 2000,
+                },
+            )
+        )
+
+        # Adaptive config
+        self.adaptive_mesh: str = self.config.get(
+            "adaptive_mesh", "cup"
+        )
+        self.adaptive_episodes: int = self.config.get(
+            "adaptive_episodes", 3000
+        )
+
+        # Eval meshes
+        self.eval_meshes: list[str] = self.config.get(
+            "eval_meshes",
+            ["cube", "cylinder", "mug", "cup"],
+        )
+        # BC mesh filter: which meshes to include in BC training data
+        # If not specified, uses all eval_meshes (backward compatible)
+        self.bc_mesh_names: set[str] = set(
+            self.config.get(
+                "bc_mesh_names",
+                [],  # empty = use all eval_meshes
+            )
+        )
+        # YCB eval config
+        self.do_ycb_eval = self.config.get("do_ycb_eval", False)
+        self.ycb_config = self.config.get("ycb_config", {})
+        self.do_ycb_mujoco_eval = self.config.get("do_ycb_mujoco_eval", False)
+        self.ycb_mujoco_config = self.config.get("ycb_mujoco_config", {})
+        self.do_ycb_mujoco_adaptive = self.config.get("do_ycb_mujoco_adaptive", False)
+        self.ycb_mujoco_adaptive_config = self.config.get("ycb_mujoco_adaptive_config", {})
+
+    # ══════════════════════════════════════════════════════
+    # Model path helpers
+    # ══════════════════════════════════════════════════════
+
+    def _q_model_dir(self, seed: int) -> str:
+        """Get Q-store directory path for a seed.
+
+        Args:
+            seed: Training seed.
+
+        Returns:
+            Path string to Q-store directory.
+        """
+        return str(self.runs_dir / f"q_store_seed_{seed}")
+
+    def _sac_model_dir(self, seed: int) -> str:
+        """Get SAC model directory path for a seed.
+
+        Args:
+            seed: Training seed.
+
+        Returns:
+            Path string to SAC model directory.
+        """
+        return str(self.runs_dir / f"sac_seed_{seed}")
+
+    def _resolve_load_dir(
+        self,
+        load_mode: str | None,
+        model_type: str,
+        seed: int,
+    ) -> str | None:
+        """Resolve load_mode to actual directory path.
+
+        Args:
+            load_mode: null (from scratch), "auto" (standard path),
+                or explicit path string.
+            model_type: "q_store" or "sac".
+            seed: Training seed.
+
+        Returns:
+            Directory path or None.
+        """
+        if load_mode is None:
+            return None
+        if load_mode == "auto":
+            if model_type == "q_store":
+                return self._q_model_dir(seed)
+            if model_type == "sac":
+                return self._sac_model_dir(seed)
+            return None
+        return str(load_mode)
+
+    def _save_meta(
+        self,
+        model_type: str,
+        seed: int | None,
+        stats: dict[str, Any],
+        meshes: list[str],
+    ) -> None:
+        """Save training metadata to meta/ directory.
+
+        Args:
+            model_type: "q_store", "sac", or "bc".
+            seed: Training seed (None for BC).
+            stats: Training statistics.
+            meshes: List of meshes trained on.
+        """
+        meta_dir = self.runs_dir / "meta"
+        meta_dir.mkdir(parents=True, exist_ok=True)
+
+        meta_name = (
+            f"{model_type}_seed_{seed}.json"
+            if seed is not None
+            else f"{model_type}.json"
+        )
+        meta = {
+            "model_type": model_type,
+            "seed": seed,
+            "created": datetime.datetime.now(
+                tz=datetime.timezone.utc
+            ).isoformat(),
+            "meshes": meshes,
+            "stats": stats,
+        }
+        meta_path = meta_dir / meta_name
+        with meta_path.open("w") as f:
+            json.dump(meta, f, indent=2)
+        logger.info("Meta saved to %s", meta_path)
+
+    @staticmethod
+    def _balance_bc_transitions(
+        transitions: list,
+        total_target: int = 100000,
+        mesh_weights: dict[str, float] | None = None,
+        level_weights: dict[int, float] | None = None,
+        min_per_group: int = 50,
+        action_min_pct: float = 0.01,
+        action_min_absolute: int = 100,
+    ) -> list:
+        """Balance BC transitions by (mesh, level) with
+        complexity weights, then balance action types on
+        the full dataset.
+
+        Pipeline:
+        1. Group by (mesh_id, level)
+        2. Weighted sample per group
+        3. Concatenate
+        4. Balance rare action types on full dataset
+        5. Shuffle
+
+        Args:
+            transitions: All BC transitions.
+            total_target: Target size before action balance.
+            mesh_weights: Per-mesh complexity weights.
+            level_weights: Per-level difficulty weights.
+            min_per_group: Minimum samples to include group.
+            action_min_pct: Min fraction for action balance.
+            action_min_absolute: Min count for action balance.
+
+        Returns:
+            Balanced transitions.
+        """
+        if mesh_weights is None:
+            mesh_weights = {}
+        if level_weights is None:
+            level_weights = {0: 1.0, 1: 1.5, 2: 2.0}
+
+        type_names = (
+            ExperienceExtractor.get_type_names()
+        )
+        mesh_id_to_name = {
+            v: k
+            for k, v in (
+                ExperienceExtractor
+                .MESH_NAME_TO_ID.items()
+            )
+        }
+
+        # ═══ Step 1: Group by (mesh_id, level) ═══
+        groups: dict[tuple[int, int], list] = {}
+        for tr in transitions:
+            mesh_id = getattr(tr, "mesh_id", -1)
+            level = getattr(tr, "level", 0)
+            key = (mesh_id, level)
+            if key not in groups:
+                groups[key] = []
+            groups[key].append(tr)
+
+        # ═══ Step 2: Log before ═══
+        logger.info(
+            "BC balance BEFORE (%d total):",
+            len(transitions),
+        )
+        for (mid, level), trs in sorted(
+            groups.items()
+        ):
+            mname = mesh_id_to_name.get(
+                mid, f"mesh_{mid}"
+            )
+            action_counts: dict[str, int] = {}
+            for tr in trs:
+                aname = type_names.get(
+                    tr.action_type,
+                    f"type_{tr.action_type}",
+                )
+                action_counts[aname] = (
+                    action_counts.get(aname, 0) + 1
+                )
+            top_actions = dict(
+                sorted(
+                    action_counts.items(),
+                    key=lambda x: -x[1],
+                )[:5]
+            )
+            logger.info(
+                "  %s/L%d: %d transitions, "
+                "actions: %s",
+                mname,
+                level,
+                len(trs),
+                top_actions,
+            )
+
+        # ═══ Step 3: Compute weighted targets ═══
+        group_weights: dict[
+            tuple[int, int], float
+        ] = {}
+        for mid, level in groups:
+            mname = mesh_id_to_name.get(
+                mid, f"mesh_{mid}"
+            )
+            mw = mesh_weights.get(mname, 1.0)
+            lw = level_weights.get(level, 1.0)
+            group_weights[(mid, level)] = mw * lw
+
+        total_weight = max(
+            sum(group_weights.values()), 1e-8
+        )
+
+        group_targets: dict[
+            tuple[int, int], int
+        ] = {}
+        for key, weight in group_weights.items():
+            group_targets[key] = max(
+                min_per_group,
+                int(
+                    total_target
+                    * weight
+                    / total_weight
+                ),
+            )
+
+        # ═══ Step 4: Weighted sample per group ═══
+        after_weighted: list = []
+        for (mid, level), trs in sorted(
+            groups.items()
+        ):
+            mname = mesh_id_to_name.get(
+                mid, f"mesh_{mid}"
+            )
+            target = group_targets[(mid, level)]
+
+            if len(trs) < min_per_group:
+                after_weighted.extend(trs)
+                logger.info(
+                    "  %s/L%d: kept all %d (too few)",
+                    mname,
+                    level,
+                    len(trs),
+                )
+                continue
+
+            if len(trs) > target:
+                indices = np.random.permutation(
+                    len(trs)
+                )[:target]
+                sampled = [trs[i] for i in indices]
+            elif len(trs) < target:
+                indices = np.random.choice(
+                    len(trs), target, replace=True
+                )
+                sampled = [trs[i] for i in indices]
+            else:
+                sampled = list(trs)
+
+            after_weighted.extend(sampled)
+
+            mw = mesh_weights.get(mname, 1.0)
+            lw = level_weights.get(level, 1.0)
+            logger.info(
+                "  %s/L%d: %d → %d "
+                "(target=%d, mw=%.1f, lw=%.1f)",
+                mname,
+                level,
+                len(trs),
+                len(sampled),
+                target,
+                mw,
+                lw,
+            )
+
+        logger.info(
+            "After weighted sampling: "
+            "%d transitions",
+            len(after_weighted),
+        )
+
+        # ═══ Step 5: Balance action types ═══
+        balanced = (
+            RLGoalApproachExperiment
+            ._balance_by_action_type(
+                after_weighted,
+                min_pct=action_min_pct,
+                min_absolute=action_min_absolute,
+            )
+        )
+
+        np.random.shuffle(balanced)
+
+        # ═══ Step 6: Log after ═══
+        after_mesh: dict[str, int] = {}
+        after_level: dict[int, int] = {}
+        after_action: dict[str, int] = {}
+        for tr in balanced:
+            mname = mesh_id_to_name.get(
+                getattr(tr, "mesh_id", -1),
+                "unknown",
+            )
+            level = getattr(tr, "level", 0)
+            aname = type_names.get(
+                tr.action_type,
+                f"type_{tr.action_type}",
+            )
+            after_mesh[mname] = (
+                after_mesh.get(mname, 0) + 1
+            )
+            after_level[level] = (
+                after_level.get(level, 0) + 1
+            )
+            after_action[aname] = (
+                after_action.get(aname, 0) + 1
+            )
+
+        total = max(len(balanced), 1)
+        logger.info(
+            "BC balance AFTER (%d total):",
+            len(balanced),
+        )
+
+        logger.info("  By mesh:")
+        for mname in sorted(after_mesh.keys()):
+            count = after_mesh[mname]
+            logger.info(
+                "    %s: %d (%.1f%%)",
+                mname,
+                count,
+                100.0 * count / total,
+            )
+
+        logger.info("  By level:")
+        for level in sorted(after_level.keys()):
+            count = after_level[level]
+            logger.info(
+                "    L%d: %d (%.1f%%)",
+                level,
+                count,
+                100.0 * count / total,
+            )
+
+        logger.info("  By action type:")
+        for aname in sorted(
+            after_action.keys(),
+            key=lambda x: -after_action[x],
+        ):
+            count = after_action[aname]
+            logger.info(
+                "    %s: %d (%.1f%%)",
+                aname,
+                count,
+                100.0 * count / total,
+            )
+
+        logger.info(
+            "BC balance: %d → %d transitions",
+            len(transitions),
+            len(balanced),
+        )
+        return balanced
+    
+    @staticmethod
+    def _balance_by_action_type(
+        transitions: list,
+        min_pct: float = 0.01,
+        min_absolute: int = 100,
+    ) -> list:
+        """Ensure minimum representation of each
+        action type.
+
+        Each type gets at least max(min_absolute,
+        total * min_pct) examples.
+        Only oversamples types that already have
+        >= min_absolute examples.
+
+        Args:
+            transitions: BC transitions.
+            min_pct: Minimum fraction of total (0.01=1%).
+            min_absolute: Minimum raw examples to
+                qualify for oversampling.
+
+        Returns:
+            Balanced transitions.
+        """
+        type_names = (
+            ExperienceExtractor.get_type_names()
+        )
+
+        by_type: dict[int, list] = {}
+        for tr in transitions:
+            tid = tr.action_type
+            if tid not in by_type:
+                by_type[tid] = []
+            by_type[tid].append(tr)
+
+        total = len(transitions)
+        min_target = max(
+            min_absolute,
+            int(total * min_pct),
+        )
+
+        logger.info(
+            "Action type balance: total=%d, "
+            "min_target=%d (%.1f%% or %d)",
+            total,
+            min_target,
+            min_pct * 100,
+            min_absolute,
+        )
+        logger.info("  BEFORE:")
+        for tid in sorted(by_type.keys()):
+            name = type_names.get(
+                tid, f"type_{tid}"
+            )
+            logger.info(
+                "    %s: %d (%.2f%%)",
+                name,
+                len(by_type[tid]),
+                100.0 * len(by_type[tid])
+                / max(total, 1),
+            )
+
+        balanced = list(transitions)
+        for tid, trs in by_type.items():
+            name = type_names.get(
+                tid, f"type_{tid}"
+            )
+            if (
+                len(trs) < min_target
+                and len(trs) >= min_absolute
+            ):
+                need = min_target - len(trs)
+                indices = np.random.choice(
+                    len(trs), need, replace=True
+                )
+                extra = [trs[i] for i in indices]
+                balanced.extend(extra)
+                logger.info(
+                    "    %s: oversampled %d → %d",
+                    name,
+                    len(trs),
+                    min_target,
+                )
+            elif len(trs) < min_absolute:
+                logger.info(
+                    "    %s: skipped (%d < %d "
+                    "min_absolute)",
+                    name,
+                    len(trs),
+                    min_absolute,
+                )
+
+        logger.info(
+            "  Action type balance: %d → %d",
+            total,
+            len(balanced),
+        )
+
+        return balanced
+    # ══════════════════════════════════════════════════════
+    # Context manager
+    # ══════════════════════════════════════════════════════
+
+    def __enter__(self) -> Self:
+        """Set up experiment directories and demo meshes.
+
+        Returns:
+            Self for use in with-statement.
+        """
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.runs_dir.mkdir(parents=True, exist_ok=True)
+        self.scripts_dir.mkdir(parents=True, exist_ok=True)
+        prepare_demo_meshes(self.data_dir)
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        exc_traceback: types.TracebackType | None,
+    ) -> bool:
+        """Clean up on context exit.
+
+        Returns:
+            False to not suppress exceptions.
+        """
+        return False
+
+    def run(self) -> None:
+        """Run all enabled pipeline stages."""
+        start_time = time.time()
+
+        if self.do_train:
+            self._run_train()
+        if self.do_eval:
+            self._run_eval()
+        if self.do_heur_eval:
+            self._run_heuristic_eval()
+        if self.do_bc_train:
+            self._run_bc_train()
+        if self.do_sac_train:
+            self._run_sac_train()
+        if self.do_sac_eval:
+            self._run_sac_eval()
+        if self.do_adaptive:
+            self._run_adaptive()
+        if self.do_ycb_eval:
+            self._run_ycb_eval()
+        if self.do_ycb_mujoco_eval:
+            self._run_ycb_mujoco_eval()
+        if self.do_ycb_mujoco_adaptive:
+            self._run_ycb_mujoco_adaptive()
+
+        elapsed = time.time() - start_time
+        logger.info("Experiment complete in %.1fs", elapsed)
+
+    # ══════════════════════════════════════════════════════
+    # Q-learning training
+    # ══════════════════════════════════════════════════════
+
+    def _run_train(self) -> None:
+        """Run Q-learning training across all stages."""
+        logger.info("=" * 60)
+        logger.info("Q-Learning Training (all stages)")
+        logger.info("=" * 60)
+
+        trained_meshes: list[str] = []
+
+        for stage_idx, stage in enumerate(
+            self.training_stages
+        ):
+            mesh_name = stage["mesh"]
+            mesh_path = str(
+                self.data_dir / f"{mesh_name}.stl"
+            )
+            episodes = stage["episodes"]
+            epsilon_start = stage["epsilon_start"]
+            load_mode = stage.get("load_mode")
+            pool_seed = stage.get("pool_seed", None)
+
+            # Per-stage overrides with global fallback
+            stage_curriculum_levels = stage.get(
+                "curriculum_levels", self.curriculum_levels
+            )
+            stage_curriculum_filters = stage.get(
+                "curriculum_filters", self.curriculum_filters
+            )
+            stage_warmup = stage.get(
+                "warmup_episodes",
+                self.rl_config.get("warmup_episodes", 100),
+            )
+            stage_promote_threshold = stage.get(
+                "promote_threshold", self.promote_threshold
+            )
+            stage_promote_window = stage.get(
+                "promote_window", self.promote_window
+            )
+
+            logger.info(
+                "STAGE %d/%d: %s, episodes=%d, eps=%.2f, "
+                "load_mode=%s, pool_seed=%s, "
+                "warmup=%d, promote=%.2f/%d",
+                stage_idx + 1,
+                len(self.training_stages),
+                mesh_name,
+                episodes,
+                epsilon_start,
+                load_mode,
+                pool_seed,
+                stage_warmup,
+                stage_promote_threshold,
+                stage_promote_window,
+            )
+
+            stage_cfg = {
+                **self.rl_config,
+                "epsilon_start": epsilon_start,
+                "epsilon_min": stage.get(
+                    "epsilon_min", 0.05
+                ),
+                "num_episodes": episodes,
+                "warmup_episodes": stage_warmup,
+                "unfreeze_normalization": (
+                    load_mode is not None
+                ),
+                # Strategic epsilon follows tactical
+                "strategic_epsilon_start": stage.get(
+                    "strategic_epsilon_start",
+                    epsilon_start,
+                ),
+                "strategic_epsilon_min": stage.get(
+                    "strategic_epsilon_min",
+                    stage.get("epsilon_min", 0.05),
+                ),
+            }
+
+            # Determine seeds and prefix for pool generation
+            if pool_seed is not None:
+                pool_seeds = [pool_seed]
+                pool_prefix = (
+                    f"train_{mesh_name}_ps{pool_seed}"
+                )
+            else:
+                pool_seeds = self.train_seeds
+                pool_prefix = f"train_{mesh_name}"
+
+            train_pools = get_or_generate_pools(
+                mesh_path=mesh_path,
+                seeds=pool_seeds,
+                episodes_per_level=episodes,
+                scripts_dir=self.scripts_dir,
+                curriculum_levels=stage_curriculum_levels,
+                regenerate=self.regenerate_scripts,
+                prefix=pool_prefix,
+                curriculum_filters=stage_curriculum_filters,
+            )
+
+            for seed in self.train_seeds:
+                save_dir = self._q_model_dir(seed)
+                load_dir = self._resolve_load_dir(
+                    load_mode, "q_store", seed
+                )
+
+                lookup_seed = (
+                    pool_seed
+                    if pool_seed is not None
+                    else seed
+                )
+                seed_pools = train_pools.get(lookup_seed)
+                episode_pools = (
+                    seed_pools.get("levels")
+                    if seed_pools
+                    else None
+                )
+
+                curriculum_config = {
+                    "levels": stage_curriculum_levels,
+                    "filters": stage_curriculum_filters,
+                    "promote_threshold": (
+                        stage_promote_threshold
+                    ),
+                    "promote_window": (
+                        stage_promote_window
+                    ),
+                }
+
+                run_result = run_episodes(
+                    mesh_dir=str(self.data_dir),
+                    save_dir=save_dir,
+                    load_dir=load_dir,
+                    num_episodes=episodes,
+                    config=stage_cfg,
+                    mesh_path=mesh_path,
+                    seed=seed,
+                    return_metrics=True,
+                    curriculum_config=curriculum_config,
+                    episode_pools=episode_pools,
+                    visualise=self.visualise,
+                )
+
+                stage_output = (
+                    self.data_dir
+                    / f"train_result_{mesh_name}"
+                    f"_seed_{seed}"
+                    f"_stage_{stage_idx}.json"
+                )
+                stage_data = {
+                    "stage": stage_idx,
+                    "mesh": mesh_name,
+                    "seed": seed,
+                    "pool_seed": pool_seed,
+                    "epsilon_start": epsilon_start,
+                    "epsilon_min": stage.get(
+                        "epsilon_min", 0.05
+                    ),
+                    "load_mode": load_mode,
+                    "episodes": episodes,
+                    "warmup_episodes": stage_warmup,
+                    "promote_threshold": (
+                        stage_promote_threshold
+                    ),
+                    "promote_window": (
+                        stage_promote_window
+                    ),
+                    "curriculum_levels": (
+                        stage_curriculum_levels
+                    ),
+                    "curriculum_filters": (
+                        stage_curriculum_filters
+                    ),
+                    "success_rate": run_result.get(
+                        "success_rate"
+                    ),
+                    "stats": run_result.get("stats"),
+                    "curriculum_stats": run_result.get(
+                        "curriculum_stats"
+                    ),
+                }
+                with stage_output.open("w") as f:
+                    json.dump(stage_data, f, indent=2)
+                logger.info(
+                    "Stage result: success_rate=%.4f",
+                    run_result.get("success_rate", 0),
+                )
+
+            trained_meshes.append(mesh_name)
+
+        for seed in self.train_seeds:
+            self._save_meta(
+                "q_store",
+                seed,
+                {"trained_meshes": trained_meshes},
+                trained_meshes,
+            )
+
+    # ══════════════════════════════════════════════════════
+    # Q-learning evaluation
+    # ══════════════════════════════════════════════════════
+
+    def _run_eval(self) -> None:
+        """Run Q-learning eval on all meshes, save per-mesh BC data."""
+        logger.info("=" * 60)
+        logger.info("Eval on all meshes")
+        logger.info("=" * 60)
+
+        eval_cfg = {
+            **self.rl_config,
+            "mode": "eval",
+        }
+
+        all_eval_results: dict[str, Any] = {}
+
+        # ═══ NEW: directory for per-mesh BC data ═══
+        bc_per_mesh_dir = self.data_dir / "bc_per_mesh"
+        bc_per_mesh_dir.mkdir(parents=True, exist_ok=True)
+
+        for mesh_entry in self.eval_meshes:
+            if isinstance(mesh_entry, dict):
+                mesh_name = mesh_entry["mesh"]
+                eval_pool_seed = mesh_entry.get("pool_seed", None)
+                eval_curriculum_filters = mesh_entry.get(
+                    "curriculum_filters", self.curriculum_filters
+                )
+                eval_curriculum_levels = mesh_entry.get(
+                    "curriculum_levels", self.curriculum_levels
+                )
+            else:
+                mesh_name = mesh_entry
+                eval_pool_seed = None
+                eval_curriculum_filters = self.curriculum_filters
+                eval_curriculum_levels = self.curriculum_levels
+
+            mesh_path = str(
+                self.data_dir / f"{mesh_name}.stl"
+            )
+            logger.info(
+                "Evaluating: %s (pool_seed=%s)",
+                mesh_name,
+                eval_pool_seed,
+            )
+
+            if eval_pool_seed is not None:
+                pool_seeds = [eval_pool_seed]
+                pool_prefix = f"eval_{mesh_name}_ps{eval_pool_seed}"
+            else:
+                pool_seeds = self.eval_seeds
+                pool_prefix = f"eval_{mesh_name}"
+
+            eval_pools = get_or_generate_pools(
+                mesh_path=mesh_path,
+                seeds=pool_seeds,
+                episodes_per_level=(
+                    self.eval_episodes_per_level
+                ),
+                scripts_dir=self.scripts_dir,
+                curriculum_levels=eval_curriculum_levels,
+                regenerate=self.regenerate_scripts,
+                prefix=pool_prefix,
+                curriculum_filters=eval_curriculum_filters,
+            )
+
+            if eval_pool_seed is not None:
+                remapped_pools: dict[int, Any] = {}
+                for es in self.eval_seeds:
+                    remapped_pools[es] = eval_pools[eval_pool_seed]
+                eval_pools = remapped_pools
+
+            eval_results, bc_transitions = (
+                run_eval_per_seed(
+                    data_dir=self.data_dir,
+                    runs_dir=self.runs_dir,
+                    mesh_path=mesh_path,
+                    train_seeds=self.train_seeds,
+                    eval_seeds=self.eval_seeds,
+                    variant="q_store",
+                    eval_cfg=eval_cfg,
+                    eval_pools=eval_pools,
+                    collect_bc=True,
+                    episodes_per_level=(
+                        self.eval_episodes_per_level
+                    ),
+                    mesh_name=mesh_name,
+                    visualise=self.visualise,
+                )
+            )
+
+            all_eval_results[mesh_name] = eval_results
+
+            # ═══ NEW: save per-mesh BC data ═══
+            if bc_transitions:
+                bc_mesh_path = (
+                    bc_per_mesh_dir
+                    / f"bc_qstore_{mesh_name}.pkl"
+                )
+                with bc_mesh_path.open("wb") as f:
+                    pickle.dump(bc_transitions, f)
+                logger.info(
+                    "  %s: %d transitions saved to %s",
+                    mesh_name,
+                    len(bc_transitions),
+                    bc_mesh_path,
+                )
+
+            mesh_output = (
+                self.data_dir
+                / f"eval_result_{mesh_name}.json"
+            )
+            with mesh_output.open("w") as f:
+                json.dump(eval_results, f, indent=2)
+
+        eval_output = self.data_dir / "eval_result_all.json"
+        with eval_output.open("w") as f:
+            json.dump(all_eval_results, f, indent=2)
+            
+    def _run_heuristic_eval(self) -> list[Any]:
+        """Run heuristic eval on all meshes, save per-mesh BC data."""
+        logger.info("=" * 60)
+        logger.info("Heuristic Expert Data Collection")
+        logger.info("=" * 60)
+
+        heuristic_cfg = {
+            **self.rl_config,
+            "mode": "eval",
+            "eval_epsilon": 1.0,
+            "temperature_override": 0.01,
+            "strategic_eval_epsilon": 1.0,
+            "air_start_enabled": True,
+            "air_start_in_eval": True,
+        }
+
+        all_heuristic_results: dict[str, Any] = {}
+
+        bc_per_mesh_dir = self.data_dir / "bc_per_mesh"
+        bc_per_mesh_dir.mkdir(parents=True, exist_ok=True)
+
+        for mesh_entry in self.eval_meshes:
+            if isinstance(mesh_entry, dict):
+                mesh_name = mesh_entry["mesh"]
+                eval_pool_seed = mesh_entry.get("pool_seed", None)
+                eval_curriculum_filters = mesh_entry.get(
+                    "curriculum_filters", self.curriculum_filters
+                )
+                eval_curriculum_levels = mesh_entry.get(
+                    "curriculum_levels", self.curriculum_levels
+                )
+            else:
+                mesh_name = mesh_entry
+                eval_pool_seed = None
+                eval_curriculum_filters = self.curriculum_filters
+                eval_curriculum_levels = self.curriculum_levels
+
+            mesh_path = str(
+                self.data_dir / f"{mesh_name}.stl"
+            )
+            logger.info(
+                "Heuristic eval: %s (pool_seed=%s)",
+                mesh_name,
+                eval_pool_seed,
+            )
+
+            if eval_pool_seed is not None:
+                pool_seeds = [eval_pool_seed]
+                pool_prefix = (
+                    f"heuristic_{mesh_name}_ps{eval_pool_seed}"
+                )
+            else:
+                pool_seeds = self.eval_seeds
+                pool_prefix = f"heuristic_{mesh_name}"
+
+            heuristic_pools = get_or_generate_pools(
+                mesh_path=mesh_path,
+                seeds=pool_seeds,
+                episodes_per_level=(
+                    self.eval_episodes_per_level
+                ),
+                scripts_dir=self.scripts_dir,
+                curriculum_levels=eval_curriculum_levels,
+                regenerate=self.regenerate_scripts,
+                prefix=pool_prefix,
+                curriculum_filters=eval_curriculum_filters,
+            )
+
+            if eval_pool_seed is not None:
+                remapped_pools: dict[int, Any] = {}
+                for es in self.eval_seeds:
+                    remapped_pools[es] = heuristic_pools[
+                        eval_pool_seed
+                    ]
+                heuristic_pools = remapped_pools
+
+            heuristic_results, heuristic_transitions = (
+                run_eval_per_seed(
+                    data_dir=self.data_dir,
+                    runs_dir=self.runs_dir,
+                    mesh_path=mesh_path,
+                    train_seeds=self.train_seeds,
+                    eval_seeds=self.eval_seeds,
+                    variant="q_store",
+                    eval_cfg=heuristic_cfg,
+                    eval_pools=heuristic_pools,
+                    collect_bc=True,
+                    episodes_per_level=(
+                        self.eval_episodes_per_level
+                    ),
+                    mesh_name=mesh_name,
+                    visualise=self.visualise,
+                    log_prefix="heuristic",
+                )
+            )
+
+            all_heuristic_results[mesh_name] = heuristic_results
+
+            # ═══ NEW: save per-mesh heuristic BC data ═══
+            if heuristic_transitions:
+                bc_mesh_path = (
+                    bc_per_mesh_dir
+                    / f"bc_heuristic_{mesh_name}.pkl"
+                )
+                with bc_mesh_path.open("wb") as f:
+                    pickle.dump(heuristic_transitions, f)
+                logger.info(
+                    "Heuristic %s: %d transitions saved to %s",
+                    mesh_name,
+                    len(heuristic_transitions),
+                    bc_mesh_path,
+                )
+
+        # Save heuristic eval results
+        heuristic_eval_path = (
+            self.data_dir / "heuristic_eval_result_all.json"
+        )
+        with heuristic_eval_path.open("w") as f:
+            json.dump(all_heuristic_results, f, indent=2)
+        logger.info(
+            "Heuristic eval results saved to %s",
+            heuristic_eval_path,
+        )
+
+        # ═══ REMOVED: no more monolithic bc_data_heuristic.pkl ═══
+        # Per-mesh files are in bc_per_mesh/ directory
+        return []  # no need to return transitions anymore
+
+    # ══════════════════════════════════════════════════════
+    # Behavioral Cloning
+    # ══════════════════════════════════════════════════════
+
+    def _run_bc_train(self) -> None:
+        """Train BC model from per-mesh eval data."""
+        logger.info("=" * 60)
+        logger.info("BC Training")
+        logger.info("=" * 60)
+
+        bc_data_combined_path = (
+            self.data_dir / "bc_data_combined.pkl"
+        )
+        if bc_data_combined_path.exists():
+            logger.info(
+                "Loading cached bc_data_combined from %s",
+                bc_data_combined_path,
+            )
+            with bc_data_combined_path.open("rb") as f:
+                bc_transitions = pickle.load(f)
+            logger.info(
+                "Loaded %d cached transitions",
+                len(bc_transitions),
+            )
+        else:
+            # ═══ Load per-mesh BC data ═══
+            bc_per_mesh_dir = (
+                self.data_dir / "bc_per_mesh"
+            )
+            if not bc_per_mesh_dir.exists():
+                logger.error(
+                    "bc_per_mesh/ not found. "
+                    "Run do_eval and do_heur_eval first."
+                )
+                return
+
+            bc_mesh_names = self.bc_mesh_names
+            heuristic_transitions = []
+            q_store_transitions = []
+
+            # Discover available files
+            available_heuristic = sorted(
+                bc_per_mesh_dir.glob(
+                    "bc_heuristic_*.pkl"
+                )
+            )
+            available_qstore = sorted(
+                bc_per_mesh_dir.glob(
+                    "bc_qstore_*.pkl"
+                )
+            )
+
+            logger.info(
+                "BC per-mesh directory: %s",
+                bc_per_mesh_dir,
+            )
+            logger.info(
+                "  Available heuristic: %s",
+                [p.stem for p in available_heuristic],
+            )
+            logger.info(
+                "  Available Q-store: %s",
+                [p.stem for p in available_qstore],
+            )
+            logger.info(
+                "  BC mesh filter: %s",
+                (
+                    list(bc_mesh_names)
+                    if bc_mesh_names
+                    else "ALL"
+                ),
+            )
+
+            # Load heuristic data (primary source)
+            for pkl_path in available_heuristic:
+                mesh_name = pkl_path.stem.replace(
+                    "bc_heuristic_", ""
+                )
+                if (
+                    bc_mesh_names
+                    and mesh_name not in bc_mesh_names
+                ):
+                    logger.info(
+                        "  SKIP heuristic %s (held-out)",
+                        mesh_name,
+                    )
+                    continue
+                with pkl_path.open("rb") as f:
+                    transitions = pickle.load(f)
+                heuristic_transitions.extend(transitions)
+                logger.info(
+                    "  LOAD heuristic %s: %d transitions",
+                    mesh_name,
+                    len(transitions),
+                )
+
+            # Load Q-store data (optional fraction)
+            q_store_fraction = float(
+                self.config.get(
+                    "bc_q_store_fraction", 0.0
+                )
+            )
+            q_store_transitions_used = []
+
+            if q_store_fraction > 0.0:
+                for pkl_path in available_qstore:
+                    mesh_name = pkl_path.stem.replace(
+                        "bc_qstore_", ""
+                    )
+                    if (
+                        bc_mesh_names
+                        and mesh_name
+                        not in bc_mesh_names
+                    ):
+                        logger.info(
+                            "  SKIP Q-store %s (held-out)",
+                            mesh_name,
+                        )
+                        continue
+                    with pkl_path.open("rb") as f:
+                        transitions = pickle.load(f)
+                    q_store_transitions.extend(
+                        transitions
+                    )
+                    logger.info(
+                        "  LOAD Q-store %s: "
+                        "%d transitions",
+                        mesh_name,
+                        len(transitions),
+                    )
+
+                max_q = int(
+                    len(heuristic_transitions)
+                    * q_store_fraction
+                )
+                if len(q_store_transitions) > max_q:
+                    indices = np.random.permutation(
+                        len(q_store_transitions)
+                    )[:max_q]
+                    q_store_transitions_used = [
+                        q_store_transitions[i]
+                        for i in indices
+                    ]
+                else:
+                    q_store_transitions_used = (
+                        q_store_transitions
+                    )
+                logger.info(
+                    "Q-store data: %d → %d "
+                    "(fraction=%.1f%%)",
+                    len(q_store_transitions),
+                    len(q_store_transitions_used),
+                    q_store_fraction * 100,
+                )
+
+            # ═══ Combine ═══
+            bc_transitions = (
+                heuristic_transitions
+                + q_store_transitions_used
+            )
+            logger.info(
+                "BC data: %d heuristic + %d Q-store "
+                "= %d total",
+                len(heuristic_transitions),
+                len(q_store_transitions_used),
+                len(bc_transitions),
+            )
+
+            # ═══ Balance by (mesh, level) + action types ═══
+            bc_total_target = self.config.get(
+                "bc_total_target", None
+            )
+
+            bc_transitions = self._balance_bc_transitions(
+                bc_transitions,
+                total_target=(
+                    int(bc_total_target)
+                    if bc_total_target is not None
+                    else len(bc_transitions)
+                ),
+                mesh_weights=self.config.get(
+                    "bc_mesh_weights", {}
+                ),
+                level_weights={
+                    int(k): float(v)
+                    for k, v in self.config.get(
+                        "bc_level_weights",
+                        {0: 1.0, 1: 1.5, 2: 2.0},
+                    ).items()
+                },
+                min_per_group=int(
+                    self.config.get("bc_min_per_group", 50)
+                ),
+                action_min_pct=float(
+                    self.config.get("bc_action_min_pct", 0.01)
+                ),
+                action_min_absolute=int(
+                    self.config.get(
+                        "bc_action_min_absolute", 100
+                    )
+                ),
+            )
+
+            np.random.shuffle(bc_transitions)
+
+            logger.info(
+                "BC data: %d total after balancing",
+                len(bc_transitions),
+            )
+            # ═══ Save detailed BC composition report ═══
+            mesh_id_to_name = {
+                v: k
+                for k, v in (
+                    ExperienceExtractor
+                    .MESH_NAME_TO_ID.items()
+                )
+            }
+            type_names = ExperienceExtractor.get_type_names()
+
+            bc_composition = {}
+            for tr in bc_transitions:
+                mname = mesh_id_to_name.get(
+                    getattr(tr, "mesh_id", -1), "unknown"
+                )
+                level = getattr(tr, "level", 0)
+                key = f"{mname}/L{level}"
+                if key not in bc_composition:
+                    bc_composition[key] = {
+                        "count": 0,
+                        "actions": {},
+                        "mesh": mname,
+                        "level": level,
+                    }
+                bc_composition[key]["count"] += 1
+                aname = type_names.get(
+                    tr.action_type,
+                    f"type_{tr.action_type}",
+                )
+                bc_composition[key]["actions"][aname] = (
+                    bc_composition[key]["actions"]
+                    .get(aname, 0) + 1
+                )
+
+            total = max(len(bc_transitions), 1)
+            bc_report = {
+                "total_transitions": len(bc_transitions),
+                "has_next_state": sum(
+                    1 for tr in bc_transitions
+                    if tr.next_state is not None
+                ),
+                "missing_next_state": sum(
+                    1 for tr in bc_transitions
+                    if tr.next_state is None
+                ),
+                "per_group": {
+                    k: {
+                        **v,
+                        "pct": round(
+                            100.0 * v["count"] / total, 1
+                        ),
+                    }
+                    for k, v in sorted(
+                        bc_composition.items()
+                    )
+                },
+                "per_mesh_total": {},
+                "per_level_total": {},
+                "per_action_total": {},
+            }
+
+            # Aggregate by mesh
+            for k, v in bc_composition.items():
+                mname = v["mesh"]
+                bc_report["per_mesh_total"][mname] = (
+                    bc_report["per_mesh_total"]
+                    .get(mname, 0) + v["count"]
+                )
+            # Aggregate by level
+            for k, v in bc_composition.items():
+                lkey = f"L{v['level']}"
+                bc_report["per_level_total"][lkey] = (
+                    bc_report["per_level_total"]
+                    .get(lkey, 0) + v["count"]
+                )
+            # Aggregate by action
+            for k, v in bc_composition.items():
+                for aname, count in v["actions"].items():
+                    bc_report["per_action_total"][aname] = (
+                        bc_report["per_action_total"]
+                        .get(aname, 0) + count
+                    )
+
+            bc_composition_path = (
+                self.data_dir / "bc_composition_report.json"
+            )
+            with bc_composition_path.open("w") as f:
+                json.dump(bc_report, f, indent=2)
+            logger.info(
+                "BC composition report saved to %s",
+                bc_composition_path,
+            )
+
+            # Save combined
+            with bc_data_combined_path.open("wb") as f:
+                pickle.dump(bc_transitions, f)
+
+        # ═══ Train BC ═══
+        num_types = len(
+            ExperienceExtractor.get_type_names()
+        )
+        trainer = BCTrainer(
+            state_dim=self.rl_config.get(
+                "state_dim", 20
+            ),
+            num_types=num_types,
+        )
+        trainer.train(
+            bc_transitions, num_epochs=_BC_NUM_EPOCHS
+        )
+        trainer.save(str(self.runs_dir / "bc_model"))
+
+        bc_stats = trainer.get_training_stats(
+            bc_transitions
+        )
+        bc_stats_path = (
+            self.data_dir / "bc_train_result.json"
+        )
+        with bc_stats_path.open("w") as f:
+            json.dump(bc_stats, f, indent=2)
+
+        # ═══ Strategic BC Training ═══
+        logger.info("=" * 40)
+        logger.info(
+            "Strategic BC Training (two separate)"
+        )
+        logger.info("=" * 40)
+
+        for seed in self.train_seeds:
+            q_dir = self._q_model_dir(seed)
+            if not (
+                Path(q_dir) / "config.json"
+            ).exists():
+                logger.warning(
+                    "Q-store not found at %s, "
+                    "skipping Strategic BC",
+                    q_dir,
+                )
+                continue
+
+            controller = (
+                RLGoalApproachController.load(
+                    q_dir,
+                    agent_id=(
+                        f"strategic_bc_seed_{seed}"
+                    ),
+                    config={
+                        **self.rl_config,
+                        "mode": "eval",
+                    },
+                )
+            )
+
+            strategic_bc_dir = str(
+                self.runs_dir / "strategic_bc_model"
+            )
+            Path(strategic_bc_dir).mkdir(
+                parents=True, exist_ok=True
+            )
+
+            # 1. Detach BC
+            detach_bc = StrategicBCTrainer(state_dim=5)
+            has_detach = (
+                detach_bc.prepare_data_from_q_store(
+                    controller.strategic_detach,
+                )
+            )
+            if has_detach:
+                detach_bc.train(num_epochs=100)
+                torch.save(
+                    detach_bc.get_actor_weights(),
+                    Path(strategic_bc_dir)
+                    / "strategic_detach_actor.pt",
+                )
+                s_mean, s_std = (
+                    detach_bc.get_normalization()
+                )
+                np.savez(
+                    Path(strategic_bc_dir)
+                    / "strategic_detach_norm.npz",
+                    state_mean=s_mean,
+                    state_std=s_std,
+                )
+                logger.info(
+                    "Strategic Detach BC saved to %s",
+                    strategic_bc_dir,
+                )
+            else:
+                logger.warning(
+                    "No data for Strategic Detach BC"
+                )
+
+            # 2. Direction BC
+            direction_bc = StrategicBCTrainer(
+                state_dim=5
+            )
+            has_direction = (
+                direction_bc.prepare_data_from_q_store(
+                    controller.strategic_direction,
+                )
+            )
+            if has_direction:
+                direction_bc.train(num_epochs=100)
+                torch.save(
+                    direction_bc.get_actor_weights(),
+                    Path(strategic_bc_dir)
+                    / "strategic_direction_actor.pt",
+                )
+                s_mean, s_std = (
+                    direction_bc.get_normalization()
+                )
+                np.savez(
+                    Path(strategic_bc_dir)
+                    / "strategic_direction_norm.npz",
+                    state_mean=s_mean,
+                    state_std=s_std,
+                )
+                logger.info(
+                    "Strategic Direction BC saved "
+                    "to %s",
+                    strategic_bc_dir,
+                )
+            else:
+                logger.warning(
+                    "No data for Strategic "
+                    "Direction BC"
+                )
+
+            # Save strategic BC stats
+            strategic_bc_stats = {
+                "seed": seed,
+                "detach": {
+                    "has_data": has_detach,
+                    "store_points": len(
+                        controller.strategic_detach
+                        .points
+                    ),
+                    "train_size": (
+                        len(detach_bc.train_states)
+                        if has_detach
+                        and hasattr(
+                            detach_bc, "train_states"
+                        )
+                        else 0
+                    ),
+                    "val_size": (
+                        len(detach_bc.val_states)
+                        if has_detach
+                        and hasattr(
+                            detach_bc, "val_states"
+                        )
+                        else 0
+                    ),
+                },
+                "direction": {
+                    "has_data": has_direction,
+                    "store_points": len(
+                        controller.strategic_direction
+                        .points
+                    ),
+                    "train_size": (
+                        len(
+                            direction_bc.train_states
+                        )
+                        if has_direction
+                        and hasattr(
+                            direction_bc,
+                            "train_states",
+                        )
+                        else 0
+                    ),
+                    "val_size": (
+                        len(direction_bc.val_states)
+                        if has_direction
+                        and hasattr(
+                            direction_bc,
+                            "val_states",
+                        )
+                        else 0
+                    ),
+                },
+            }
+            strategic_stats_path = (
+                self.data_dir
+                / "strategic_bc_train_result.json"
+            )
+            with strategic_stats_path.open("w") as f:
+                json.dump(
+                    strategic_bc_stats, f, indent=2
+                )
+
+        self._save_meta(
+            "bc",
+            None,
+            {
+                **bc_stats,
+                "bc_mesh_names": list(
+                    self.bc_mesh_names
+                ),
+                "heuristic_transitions": len(
+                    bc_transitions
+                ),
+                "q_store_fraction": float(
+                    self.config.get(
+                        "bc_q_store_fraction", 0.0
+                    )
+                ),
+            },
+            (
+                list(self.bc_mesh_names)
+                if self.bc_mesh_names
+                else list(self.eval_meshes)
+            ),
+        )
+        logger.info(
+            "BC complete: val_acc=%.4f, "
+            "transitions=%d",
+            bc_stats["val_accuracy"],
+            bc_stats["total_transitions"],
+        )
+        
+    # ══════════════════════════════════════════════════════
+    # SAC training
+    # ══════════════════════════════════════════════════════
+
+    def _run_sac_train(self) -> None:
+        """Train P-SAC model sequentially on all meshes."""
+        logger.info("=" * 60)
+        logger.info("P-SAC Training (seed=%d)", self.sac_seed)
+        logger.info("=" * 60)
+
+        num_types = len(
+            ExperienceExtractor.get_type_names()
+        )
+
+        sac_cfg = {
+            k: v
+            for k, v in self.sac_config.items()
+            if k != "load_mode"
+        }
+        trainer = PSACTrainer(
+            state_dim=self.rl_config.get("state_dim", 20),
+            num_types=num_types,
+            **sac_cfg,
+        )
+
+        load_mode = self.sac_config.get("load_mode")
+        load_dir = self._resolve_load_dir(
+            load_mode, "sac", self.sac_seed
+        )
+
+        if load_dir:
+            trainer.load(load_dir)
+            bc_combined_path = (
+                self.data_dir
+                / "bc_data_combined.pkl"
+            )
+            bc_path = (
+                bc_combined_path
+                if bc_combined_path.exists()
+                else self.data_dir / "bc_data.pkl"
+            )
+            if bc_path.exists():
+                with bc_path.open("rb") as f:
+                    bc_data = pickle.load(f)
+                
+                bc_norm = (
+                    trainer._normalize_bc_transitions(  # noqa: SLF001
+                        bc_data
+                    )
+                )
+                trainer.buffer.load_bc_data(bc_norm)
+                trainer.bc_data = bc_data
+            logger.info(
+                "SAC loaded from %s for fine-tuning",
+                load_dir,
+            )
+        else:
+            # Use combined BC data (heuristic + optional Q-store)
+            bc_combined_path = (
+                self.data_dir / "bc_data_combined.pkl"
+            )
+            bc_data_path = (
+                str(bc_combined_path)
+                if bc_combined_path.exists()
+                else str(
+                    self.data_dir / "bc_data.pkl"
+                )
+            )
+            trainer.load_bc(
+                bc_model_dir=str(
+                    self.runs_dir / "bc_model"
+                ),
+                bc_data_path=bc_data_path,
+            )
+            
+        sac_model_dir = self._sac_model_dir(self.sac_seed)
+
+        # ═══ Load Strategic SACs (only if enabled) ═══
+        use_strategic = self.sac_config.get(
+            "use_strategic_override", False
+        )
+        if use_strategic:
+            # Load Strategic BC into controller's Strategic SAC
+            # ═══ Load Strategic SACs from BC ═══
+            strategic_bc_dir = str(
+                self.runs_dir / "strategic_bc_model"
+            )
+
+            strategic_detach_sac = None
+            strategic_direction_sac = None
+
+            # Detach SAC
+            detach_actor_path = (
+                Path(strategic_bc_dir)
+                / "strategic_detach_actor.pt"
+            )
+            if detach_actor_path.exists():
+                strategic_detach_sac = StrategicSAC(
+                    state_dim=5
+                )
+                strategic_detach_sac.actor.load_state_dict(
+                    torch.load(
+                        detach_actor_path,
+                        weights_only=True,
+                    )
+                )
+                norm = np.load(
+                    Path(strategic_bc_dir)
+                    / "strategic_detach_norm.npz"
+                )
+                strategic_detach_sac._state_mean = (
+                    norm["state_mean"]
+                )
+                strategic_detach_sac._state_std = (
+                    norm["state_std"]
+                )
+                strategic_detach_sac._norm_frozen = True
+
+                # Warm start buffer from Q-store
+                for seed in self.train_seeds:
+                    q_dir = self._q_model_dir(seed)
+                    if (
+                        Path(q_dir) / "config.json"
+                    ).exists():
+                        q_ctrl = (
+                            RLGoalApproachController.load(
+                                q_dir,
+                                agent_id="strat_loader",
+                                config={
+                                    **self.rl_config,
+                                    "mode": "eval",
+                                },
+                            )
+                        )
+                        strategic_detach_sac.warm_start_from_q_store(
+                            q_ctrl.strategic_detach
+                        )
+                        break
+
+                logger.info(
+                    "Strategic Detach SAC loaded "
+                    "(buf=%d)",
+                    strategic_detach_sac.buffer_size,
+                )
+
+            # Direction SAC
+            direction_actor_path = (
+                Path(strategic_bc_dir)
+                / "strategic_direction_actor.pt"
+            )
+            if direction_actor_path.exists():
+                strategic_direction_sac = StrategicSAC(
+                    state_dim=5
+                )
+                strategic_direction_sac.actor.load_state_dict(
+                    torch.load(
+                        direction_actor_path,
+                        weights_only=True,
+                    )
+                )
+                norm = np.load(
+                    Path(strategic_bc_dir)
+                    / "strategic_direction_norm.npz"
+                )
+                strategic_direction_sac._state_mean = (
+                    norm["state_mean"]
+                )
+                strategic_direction_sac._state_std = (
+                    norm["state_std"]
+                )
+                strategic_direction_sac._norm_frozen = True
+
+                # Warm start buffer
+                for seed in self.train_seeds:
+                    q_dir = self._q_model_dir(seed)
+                    if (
+                        Path(q_dir) / "config.json"
+                    ).exists():
+                        q_ctrl = (
+                            RLGoalApproachController.load(
+                                q_dir,
+                                agent_id="strat_loader2",
+                                config={
+                                    **self.rl_config,
+                                    "mode": "eval",
+                                },
+                            )
+                        )
+                        strategic_direction_sac.warm_start_from_q_store(
+                            q_ctrl.strategic_direction
+                        )
+                        break
+
+                logger.info(
+                    "Strategic Direction SAC loaded "
+                    "(buf=%d)",
+                    strategic_direction_sac.buffer_size,
+                )
+
+            # Pass to trainer
+            trainer.load_strategic(
+                strategic_detach_sac=strategic_detach_sac,
+                strategic_direction_sac=(
+                    strategic_direction_sac
+                ),
+            )
+
+        for mesh_name, mesh_cfg in self.sac_episodes_per_mesh.items():
+            # Support both formats:
+            #   mug: 3000
+            #   mug: {episodes: 3000, pool_seed: 301}
+            if isinstance(mesh_cfg, dict):
+                num_episodes = mesh_cfg["episodes"]
+                pool_seed = mesh_cfg.get("pool_seed", self.sac_seed)
+            else:
+                num_episodes = mesh_cfg
+                pool_seed = self.sac_seed
+
+            mesh_path = str(
+                self.data_dir / f"{mesh_name}.stl"
+            )
+            logger.info(
+                "SAC Training: %s, %d episodes, pool_seed=%d",
+                mesh_name,
+                num_episodes,
+                pool_seed,
+            )
+            env = LightweightEnv(mesh_path)
+            controller = RLGoalApproachController(
+                agent_id=f"sac_{mesh_name}",
+                config={**self.rl_config, "mode": "eval"},
+            )
+
+            sac_pools = get_or_generate_pools(
+                mesh_path=mesh_path,
+                seeds=[pool_seed],
+                episodes_per_level=num_episodes,
+                scripts_dir=self.scripts_dir,
+                curriculum_levels=self.curriculum_levels,
+                regenerate=self.regenerate_scripts,
+                prefix=f"sac_train_{mesh_name}_ps{pool_seed}",
+                curriculum_filters=self.curriculum_filters,
+            )
+
+            trainer.start_mesh_tracking(mesh_name)
+
+            is_first = mesh_name == self.sac_meshes[0]
+            trainer.train(
+                env=env,
+                controller=controller,
+                num_episodes=num_episodes,
+                warmup_steps=(
+                    _SAC_WARMUP_STEPS
+                    if is_first and not load_dir
+                    else 0
+                ),
+                save_dir=sac_model_dir,
+                curriculum_levels=self.curriculum_levels,
+                promote_threshold=self.promote_threshold,
+                promote_window=self.promote_window,
+                episode_pools=sac_pools[pool_seed],
+                visualise=self.visualise,
+                mesh_name=mesh_name,
+            )
+
+            mesh_stat = trainer._get_current_mesh_stats()
+            result_path = (
+                self.data_dir
+                / f"sac_train_result_{mesh_name}.json"
+            )
+            with result_path.open("w") as f:
+                json.dump(mesh_stat, f, indent=2)
+            logger.info(
+                "SAC %s: rate=%.3f",
+                mesh_name,
+                mesh_stat.get("success_rate", 0),
+            )
+
+        final_stats = trainer.get_training_stats()
+        final_path = (
+            self.data_dir / "sac_train_result_all.json"
+        )
+        with final_path.open("w") as f:
+            json.dump(final_stats, f, indent=2)
+
+        self._save_meta(
+            "sac",
+            self.sac_seed,
+            final_stats,
+            list(self.sac_meshes),
+        )
+        logger.info(
+            "SAC training complete. Saved to %s",
+            sac_model_dir,
+        )
+
+    # ══════════════════════════════════════════════════════
+    # SAC evaluation
+    # ══════════════════════════════════════════════════════
+
+    def _run_sac_eval(self) -> None:
+        """Evaluate P-SAC model on all meshes."""
+        logger.info("=" * 60)
+        logger.info("P-SAC Eval (seed=%d)", self.sac_seed)
+        logger.info("=" * 60)
+
+        num_types = len(
+            ExperienceExtractor.get_type_names()
+        )
+        sac_trainer = PSACTrainer(
+            state_dim=self.rl_config.get("state_dim", 20),
+            num_types=num_types,
+        )
+        sac_trainer.load(
+            self._sac_model_dir(self.sac_seed)
+        )
+
+        all_results: dict[str, Any] = {}
+
+        for mesh_entry in self.eval_meshes:
+            # ═══ Parse mesh entry (dict or string) ═══
+            if isinstance(mesh_entry, dict):
+                mesh_name = mesh_entry["mesh"]
+                eval_pool_seed = mesh_entry.get(
+                    "pool_seed", None
+                )
+                eval_curriculum_filters = mesh_entry.get(
+                    "curriculum_filters",
+                    self.curriculum_filters,
+                )
+                eval_curriculum_levels = mesh_entry.get(
+                    "curriculum_levels",
+                    self.curriculum_levels,
+                )
+            else:
+                mesh_name = mesh_entry
+                eval_pool_seed = None
+                eval_curriculum_filters = self.curriculum_filters
+                eval_curriculum_levels = self.curriculum_levels
+
+            mesh_path = str(
+                self.data_dir / f"{mesh_name}.stl"
+            )
+            logger.info(
+                "SAC Eval: %s (pool_seed=%s)",
+                mesh_name,
+                eval_pool_seed,
+            )
+
+            # ═══ Determine pool seeds and prefix ═══
+            if eval_pool_seed is not None:
+                pool_seeds = [eval_pool_seed]
+                pool_prefix = (
+                    f"sac_eval_{mesh_name}_ps{eval_pool_seed}"
+                )
+            else:
+                pool_seeds = self.sac_eval_seeds
+                pool_prefix = f"sac_eval_{mesh_name}"
+
+            sac_eval_pools = get_or_generate_pools(
+                mesh_path=mesh_path,
+                seeds=pool_seeds,
+                episodes_per_level=(
+                    self.sac_eval_episodes_per_level
+                ),
+                scripts_dir=self.scripts_dir,
+                curriculum_levels=eval_curriculum_levels,
+                regenerate=self.regenerate_scripts,
+                prefix=pool_prefix,
+                curriculum_filters=eval_curriculum_filters,
+            )
+
+            # ═══ Remap pools if using shared pool_seed ═══
+            if eval_pool_seed is not None:
+                remapped_pools: dict[int, Any] = {}
+                for es in self.sac_eval_seeds:
+                    remapped_pools[es] = sac_eval_pools[
+                        eval_pool_seed
+                    ]
+                sac_eval_pools = remapped_pools
+
+            results = self._eval_sac_on_pools(
+                sac_trainer=sac_trainer,
+                sac_eval_pools=sac_eval_pools,
+                mesh_path=mesh_path,
+                curriculum_levels=eval_curriculum_levels,
+            )
+            all_results[mesh_name] = results
+
+            for key in sorted(results.keys()):
+                data = results[key]
+                logger.info(
+                    "  %s (%smm): success=%.4f, "
+                    "timeout=%.4f, collision=%.4f",
+                    key,
+                    data.get("bounds_mm", []),
+                    data["success_rate"],
+                    data["timeout_rate"],
+                    data["collision_rate"],
+                )
+
+            eval_out = (
+                self.data_dir
+                / f"sac_eval_result_{mesh_name}.json"
+            )
+            with eval_out.open("w") as f:
+                json.dump(results, f, indent=2)
+
+        all_out = (
+            self.data_dir / "sac_eval_result_all.json"
+        )
+        with all_out.open("w") as f:
+            json.dump(all_results, f, indent=2)
+        logger.info(
+            "Saved all SAC eval results to %s", all_out
+        )
+
+    def _eval_sac_on_pools(
+        self,
+        sac_trainer: PSACTrainer,
+        sac_eval_pools: dict[int, dict[str, Any]],
+        mesh_path: str,
+        curriculum_levels: list[tuple[float, float]] | None = None,
+    ) -> dict[str, Any]:
+        """Run SAC evaluation on episode pools.
+
+        Args:
+            sac_trainer: Trained PSACTrainer instance.
+            sac_eval_pools: Episode pools keyed by seed.
+            mesh_path: Path to the mesh file.
+            curriculum_levels: Per-mesh curriculum levels.
+                Falls back to self.curriculum_levels if None.
+
+        Returns:
+            Dict with per-level evaluation results.
+        """
+        if curriculum_levels is None:
+            curriculum_levels = self.curriculum_levels
+
+        type_names = ExperienceExtractor.get_type_names()
+        results: dict[str, Any] = {}
+        sample_seed = self.sac_eval_seeds[0]
+        num_levels = len(
+            sac_eval_pools[sample_seed].get("levels", [])
+        )
+
+        for level_idx in range(num_levels):
+            successes = 0
+            timeouts = 0
+            collisions = 0
+            total = 0
+            action_counts: dict[int, int] = {}
+            collision_counts: dict[int, int] = {}
+            total_steps = 0
+            episode_steps_list: list[int] = []
+            success_steps_list: list[int] = []
+
+            for eval_seed in self.sac_eval_seeds:
+                pool = sac_eval_pools[eval_seed][
+                    "levels"
+                ][level_idx]
+
+                np.random.seed(eval_seed)  # noqa: NPY002
+                torch.manual_seed(eval_seed)
+                env = LightweightEnv(
+                    mesh_path, seed=eval_seed
+                )
+                controller = RLGoalApproachController(
+                    agent_id=(
+                        f"sac_eval_L{level_idx}"
+                        f"_{eval_seed}"
+                    ),
+                    config={
+                        **self.rl_config,
+                        "mode": "eval",
+                    },
+                )
+                interpreter = ActionInterpreter(env)
+
+                for ep_data in pool:
+                    start_pos = np.array(
+                        ep_data["start_pos"]
+                    )
+                    start_rot = np.array(
+                        ep_data["start_rot"]
+                    )
+                    env.reset(
+                        position=start_pos,
+                        rotation=start_rot,
+                    )
+                    goal_pose = np.concatenate([
+                        np.array(ep_data["goal_pos"]),
+                        np.array(ep_data["goal_rot"]),
+                    ])
+                    controller.set_new_goal(
+                        goal_pose, start_pos
+                    )
+                    env.set_goal(goal_pose)
+
+                    success = False
+                    collision = False
+
+                    for step_idx in range(
+                        sac_trainer.max_steps_per_goal
+                    ):
+                        pose = env.get_pose()
+                        sensor = env.get_sensor_data()
+                        state_raw = (
+                            controller._compute_state(
+                                pose, sensor
+                            )
+                        )
+                        state = (
+                            sac_trainer.normalize_state(
+                                state_raw
+                            )
+                        )
+
+                        # Strategic override (if enabled)
+                        strategic_type = None
+                        if (
+                            sac_trainer
+                            .use_strategic_override
+                        ):
+                            strategic_type, _ = (
+                                sac_trainer
+                                ._strategic_detach_check(
+                                    state_raw,
+                                    controller,
+                                    sensor,
+                                )
+                            )
+
+                        if (
+                            strategic_type
+                            is not None
+                        ):
+                            atype = strategic_type
+                            aparams = np.zeros(
+                                3,
+                                dtype=np.float32,
+                            )
+                        else:
+                            if (
+                                sac_trainer
+                                .use_strategic_override
+                            ):
+                                dir_phase = (
+                                    sac_trainer
+                                    ._strategic_direction_check(
+                                        state_raw,
+                                        controller,
+                                        sensor,
+                                        pose,
+                                    )
+                                )
+                                if (
+                                    dir_phase
+                                    is not None
+                                ):
+                                    controller._current_phase = (
+                                        dir_phase
+                                    )
+
+                            state_t = (
+                                torch.FloatTensor(
+                                    state.astype(
+                                        np.float32
+                                    )
+                                ).unsqueeze(0)
+                            )
+                            with torch.no_grad():
+                                at, ap, _, _ = (
+                                    sac_trainer
+                                    .actor
+                                    .sample_eval(
+                                        state_t
+                                    )
+                                )
+                            atype = at[0].item()
+                            aparams = ap[0].numpy()
+
+                            # Action masks
+                            atype, aparams = (
+                                sac_trainer
+                                ._apply_action_masks(
+                                    atype,
+                                    aparams,
+                                    state_raw,
+                                    state,
+                                    controller,
+                                )
+                            )
+
+                        action_counts[atype] = (
+                            action_counts.get(
+                                atype, 0
+                            )
+                            + 1
+                        )
+                        total_steps += 1
+
+                        sensor = (
+                            interpreter.execute(
+                                atype, aparams
+                            )
+                        )
+                        pose = env.get_pose()
+
+                        # Update tracking
+                        next_raw = (
+                            controller
+                            ._compute_state(
+                                pose, sensor
+                            )
+                        )
+                        sac_trainer._update_controller_tracking(
+                            controller,
+                            next_raw,
+                            sensor,
+                            pose,
+                            atype,
+                        )
+
+                        dist = float(
+                            np.linalg.norm(
+                                goal_pose[:3]
+                                - pose[:3]
+                            )
+                        )
+
+                        if (
+                            dist
+                            < sac_trainer
+                            .goal_threshold
+                        ):
+                            success = True
+                            break
+
+                        depth = sensor.get(
+                            "depth", 100.0
+                        )
+                        if (
+                            depth
+                            < _COLLISION_DEPTH_THRESHOLD
+                        ):
+                            collision = True
+                            collision_counts[
+                                atype
+                            ] = (
+                                collision_counts.get(
+                                    atype, 0
+                                )
+                                + 1
+                            )
+                            break
+
+                    ep_step_count = step_idx + 1
+                    episode_steps_list.append(ep_step_count)
+                    total += 1
+                    if success:
+                        successes += 1
+                        success_steps_list.append(ep_step_count)
+                    elif collision:
+                        collisions += 1
+                    else:
+                        timeouts += 1
+
+            count = max(total, 1)
+            bounds = curriculum_levels[level_idx]
+            total_act = max(
+                sum(action_counts.values()), 1
+            )
+
+            collision_rate_per_type = {}
+            for tid, cc in collision_counts.items():
+                tc = action_counts.get(tid, 0)
+                name = type_names.get(
+                    tid, f"type_{tid}"
+                )
+                collision_rate_per_type[name] = {
+                    "collisions": cc,
+                    "total_calls": tc,
+                    "rate": round(
+                        cc / max(tc, 1), 4
+                    ),
+                }
+
+            results[f"level_{level_idx}"] = {
+                "bounds_mm": list(bounds),
+                "total_episodes": total,
+                "success_count": successes,
+                "timeout_count": timeouts,
+                "collision_count": collisions,
+                "success_rate": successes / count,
+                "timeout_rate": timeouts / count,
+                "collision_rate": collisions / count,
+                "mean_episode_steps": round(
+                    float(np.mean(episode_steps_list))
+                    if episode_steps_list else 0, 1,
+                ),
+                "mean_success_steps": round(
+                    float(np.mean(success_steps_list))
+                    if success_steps_list else 0, 1,
+                ),
+                "total_steps_per_goal": round(
+                    total_steps / max(successes, 1),
+                    1,
+                ),
+                "action_distribution": {
+                    type_names.get(
+                        k, f"type_{k}"
+                    ): {
+                        "count": v,
+                        "rate": round(
+                            v / total_act, 4
+                        ),
+                    }
+                    for k, v in sorted(
+                        action_counts.items()
+                    )
+                },
+                "collision_stats": {
+                    type_names.get(
+                        k, f"type_{k}"
+                    ): v
+                    for k, v in (
+                        collision_counts.items()
+                    )
+                },
+                "collision_rate_per_type": (
+                    collision_rate_per_type
+                ),
+            }
+
+        return results
+
+    # ══════════════════════════════════════════════════════
+    # Adaptive (generic, environment-agnostic)
+    # ══════════════════════════════════════════════════════
+
+    def _run_adaptive_generic(
+        self,
+        online_env,
+        offline_env,
+        object_name: str,
+        num_episodes: int,
+        curriculum_levels: list,
+        curriculum_filters: list,
+        adapt_q_dir: str,
+        adapt_sac_dir: str,
+        adapt_seed: int,
+        log_dir: Path,
+        mesh_path: str,
+        visualizer=None,
+    ) -> dict:
+        """Unified adaptive loop for any environment.
+
+        Online interaction uses online_env (MuJoCo, robot, trimesh).
+        Offline retrain uses offline_env (always trimesh — fast).
+        State is frame-invariant: relative features in agent's local frame.
+
+        Args:
+            online_env: Environment for online interaction.
+                Must implement RLEnvironment protocol.
+            offline_env: Fast environment for offline retrain.
+                Must have supports_offline_retrain=True.
+            object_name: Name for logging and file paths.
+            num_episodes: Total adaptive episodes.
+            curriculum_levels: Distance ranges per level.
+            curriculum_filters: Per-level filters.
+            adapt_q_dir: Save path for adaptive Q-store.
+            adapt_sac_dir: Save path for adaptive SAC.
+            adapt_seed: Random seed.
+            log_dir: Directory for logs/snapshots.
+            mesh_path: Path to mesh STL (for offline retrain).
+            visualizer: Optional EpisodeVisualizer instance.
+
+        Returns:
+            Final results dict.
+        """
+        from collections import Counter
+
+        logger.info("=" * 60)
+        logger.info(
+            "Adaptive Generic: %s (%d episodes)",
+            object_name, num_episodes,
+        )
+        logger.info("=" * 60)
+
+        np.random.seed(adapt_seed)
+        random.seed(adapt_seed)
+
+        num_types = len(ExperienceExtractor.get_type_names())
+        type_names = ExperienceExtractor.get_type_names()
+
+        adaptive_cfg = {**self.rl_config, "mode": "adaptive"}
+        adaptive_max_steps = self.rl_config.get(
+            "max_steps_per_goal", 400
+        )
+
+        # ═══ Load controller ═══
+        q_load_dir = (
+            adapt_q_dir
+            if (Path(adapt_q_dir) / "config.json").exists()
+            else self._q_model_dir(adapt_seed)
+        )
+        logger.info("Loading Q-store from: %s", q_load_dir)
+
+        controller = RLGoalApproachController.load(
+            q_load_dir,
+            agent_id=f"{object_name}_adaptive",
+            config=adaptive_cfg,
+        )
+        controller._collision_stats = {}
+
+        # ═══ Load SAC ═══
+        sac_trainer = None
+        sac_model_dir = self._sac_model_dir(self.sac_seed)
+        if (Path(sac_model_dir) / "sac_actor.pt").exists():
+            sac_trainer = PSACTrainer(
+                state_dim=self.rl_config.get("state_dim", 20),
+                num_types=num_types,
+            )
+            if (Path(adapt_sac_dir) / "sac_actor.pt").exists():
+                sac_trainer.load(adapt_sac_dir)
+                logger.info("SAC loaded from adaptive: %s", adapt_sac_dir)
+            else:
+                sac_trainer.load(sac_model_dir)
+                logger.info("SAC loaded from training: %s", sac_model_dir)
+            sac_trainer.buffer.set_current_mesh(object_name)
+
+        # ═══ Manager (uses offline_env for retrain) ═══
+        manager = AdaptiveTrainingManager(
+            controller=controller,
+            env=offline_env,
+            config=adaptive_cfg,
+            runs_dir=str(self.runs_dir),
+            mesh_path=mesh_path,
+            q_save_dir=adapt_q_dir,
+            sac_save_dir=adapt_sac_dir,
+            offline_check_window=self.config.get(
+                "offline_check_window", 50
+            ),
+            promote_threshold=self.promote_threshold,
+            promote_window=self.promote_window,
+            online_sac_update_every=100,
+            online_sac_update_steps=40,
+        )
+        manager.sac_trainer = sac_trainer
+
+        # ═══ Sliding window RunningQStats ═══
+        _ADAPTIVE_Q_STATS_WINDOW = 200_000
+        manager.arbitrator._running_q_stats_free = RunningQStats(
+            warmup=200, window=_ADAPTIVE_Q_STATS_WINDOW
+        )
+        manager.arbitrator._running_q_stats_surface = RunningQStats(
+            warmup=200, window=_ADAPTIVE_Q_STATS_WINDOW
+        )
+        manager.arbitrator._warmup_running_stats()
+
+        # ═══ Strategic SAC ═══
+        if sac_trainer is not None:
+            if sac_trainer.strategic_detach_sac is not None:
+                manager.arbitrator._sac_strategic_detach = (
+                    sac_trainer.strategic_detach_sac
+                )
+            if sac_trainer.strategic_direction_sac is not None:
+                manager.arbitrator._sac_strategic_direction = (
+                    sac_trainer.strategic_direction_sac
+                )
+
+        # ═══ Tracking state ═══
+        episode_log: list[dict[str, Any]] = []
+        snapshot_log: list[dict[str, Any]] = []
+        action_counts: dict[str, int] = {}
+        collision_counts: dict[str, int] = {}
+        source_counts: dict[str, int] = {
+            "q_store": 0, "sac": 0, "blend": 0, "heuristic": 0,
+        }
+        total_steps_adaptive = 0
+        rolling_successes: list[bool] = []
+        all_episode_steps: list[int] = []
+        all_success_steps: list[int] = []
+        level_episode_steps: dict[int, list[int]] = {}
+        level_success_steps: dict[int, list[int]] = {}
+        per_level_source_stats: dict[int, dict[str, dict]] = {}
+        ep_successes: list[bool] = []
+
+        # Curriculum state
+        adaptive_level = 0
+        adaptive_promote_window: list[bool] = []
+        collision_stats_before: dict = dict(controller._collision_stats)
+
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        def _get_level_source(lvl, src):
+            if lvl not in per_level_source_stats:
+                per_level_source_stats[lvl] = {}
+            if src not in per_level_source_stats[lvl]:
+                per_level_source_stats[lvl][src] = {
+                    "success": 0, "collision": 0, "timeout": 0,
+                    "final_distances": [], "episode_steps": [],
+                    "success_steps": [],
+                }
+            return per_level_source_stats[lvl][src]
+
+        # ═══ Main loop ═══
+        for episode in range(num_episodes):
+            online_env.reset()
+            start_pos = online_env.get_pose()[:3]
+
+            # ═══ Goal generation with filters ═══
+            min_dist, max_dist = curriculum_levels[adaptive_level]
+            level_filter = (
+                curriculum_filters[adaptive_level]
+                if adaptive_level < len(curriculum_filters)
+                else {}
+            )
+            require_same_side = level_filter.get("same_side", None)
+            require_path_blocked = level_filter.get("path_blocked", None)
+            max_goal_attempts = (
+                50
+                if (
+                    require_same_side is not None
+                    or require_path_blocked is not None
+                )
+                else 1
+            )
+
+            goal_pose = None
+            is_fallback_episode = False
+
+            for _attempt in range(max_goal_attempts):
+                online_env.reset()
+                start_pos = online_env.get_pose()[:3]
+
+                candidate = online_env.get_random_surface_point(
+                    reference_pos=start_pos,
+                    min_dist=min_dist,
+                    max_dist=max_dist,
+                    max_attempts=2000,
+                    mesh_sample=True,
+                )
+
+                if require_same_side is not None or require_path_blocked is not None:
+                    online_env.set_goal(candidate)
+                    sensor_check = online_env.get_sensor_data()
+
+                    if (
+                        require_same_side is not None
+                        and sensor_check.get("same_side", True)
+                        != require_same_side
+                    ):
+                        continue
+                    if (
+                        require_path_blocked is not None
+                        and sensor_check.get("path_blocked", False)
+                        != require_path_blocked
+                    ):
+                        continue
+
+                goal_pose = candidate
+                break
+
+            if goal_pose is None:
+                logger.warning(
+                    "Adaptive ep %d: L%d filter not satisfied, "
+                    "using unfiltered goal",
+                    episode, adaptive_level,
+                )
+                online_env.reset()
+                start_pos = online_env.get_pose()[:3]
+                goal_pose = online_env.get_random_surface_point(
+                    reference_pos=start_pos,
+                    min_dist=min_dist,
+                    max_dist=max_dist,
+                    max_attempts=2000,
+                    mesh_sample=True,
+                )
+                is_fallback_episode = True
+
+            controller.set_new_goal(goal_pose, start_pos)
+            online_env.set_goal(goal_pose)
+            manager.arbitrator.start_episode(level=adaptive_level)
+
+            goals_before = controller._total_goals_reached
+            ep_steps = 0
+            ep_sources: list[str] = []
+            current_poses: list[np.ndarray] = [online_env.get_pose().copy()]
+            action_explanations: list[str] = []
+            last_transitions: list = []
+            collision_stats_before = dict(controller._collision_stats)
+            action_short_labels: list[str] = []
+
+            # ═══ Step loop ═══
+            for step in range(adaptive_max_steps):
+                pose = online_env.get_pose()
+                sensor = online_env.get_sensor_data()
+                state = controller._compute_state(pose, sensor)
+
+                # Arbitrator decides action
+                action_type, action_params, source = (
+                    manager.get_action(state, pose, sensor)
+                )
+                controller._current_source = source
+
+                # Discrete index for Q-store learning
+                discrete_idx = sac_to_discrete(action_type, action_params)
+
+                # ═══ State debug BEFORE update_only (goal still set) ═══
+                state_debug = controller.get_state_debug_info(
+                    state, pose, sensor
+                )
+
+                # Save transitions before update_only clears them
+                last_transitions = controller._episode_transitions.copy()
+
+                # ═══ KEY: use continuous params when available ═══
+                if online_env.supports_continuous:
+                    sensor_after = online_env.step_continuous(
+                        action_type, action_params
+                    )
+                else:
+                    sensor_after = online_env.step_discrete(
+                        discrete_idx, controller.action_space
+                    )
+
+                # Q-store learns from discrete action
+                pose_after = online_env.get_pose()
+                _, done = controller.update_only(
+                    pose_after, sensor_after, discrete_idx
+                )
+
+                ep_steps += 1
+                total_steps_adaptive += 1
+                current_poses.append(online_env.get_pose().copy())
+
+                # Track action type
+                act_name = type_names.get(
+                    action_type, f"type_{action_type}"
+                )
+                action_counts[act_name] = (
+                    action_counts.get(act_name, 0) + 1
+                )
+
+                # Track source
+                if source.startswith("q_confirms_sac"):
+                    source_key = "blend"
+                elif source.startswith("q_sac_conflict"):
+                    source_key = "heuristic"
+                elif source.startswith("q_confident"):
+                    source_key = "blend"
+                elif source.startswith("heuristic"):
+                    source_key = "heuristic"
+                elif source.startswith("sac"):
+                    source_key = "sac"
+                elif source.startswith("q_"):
+                    source_key = "q_store"
+                else:
+                    source_key = "sac"
+
+                source_counts[source_key] = (
+                    source_counts.get(source_key, 0) + 1
+                )
+                ep_sources.append(source_key)
+
+                # ═══ Action explanations ═══
+                dist_to_goal = float(
+                    np.linalg.norm(goal_pose[:3] - pose[:3])
+                )
+
+                # Full debug (actions.txt)
+                params_str = self._format_action_params(
+                    action_type, action_params
+                )
+                act_full = (
+                    f"{act_name}({params_str})" if params_str
+                    else act_name
+                )
+
+                # Post-step sensor info
+                new_sensor = online_env.get_sensor_data()
+                env_pos = online_env.get_pose()[:3]
+
+                action_full = (
+                    f"{act_full} "
+                    f"{state_debug} "
+                    f"| {source} "
+                    f"|mj=[{env_pos[0]:.4f},"
+                    f"{env_pos[1]:.4f},"
+                    f"{env_pos[2]:.4f}]"
+                    f"|depth={new_sensor.get('depth', 0):.1f}"
+                    f"|on={int(new_sensor.get('on_object', False))}"
+                )
+                action_explanations.append(action_full)
+
+                # Short label (картинка/видео)
+                source_label = source_key.upper().replace("_", " ")
+                action_short_labels.append(
+                    f"Step {step + 1:03d} | dist={dist_to_goal:.1f}mm"
+                    f" | {act_name} | {source_label}"
+                )
+
+                if done:
+                    break
+
+            # ═══ Episode result ═══
+            success = (
+                controller._total_goals_reached > goals_before
+            )
+            ep_successes.append(success)
+
+            all_episode_steps.append(ep_steps)
+            if success:
+                all_success_steps.append(ep_steps)
+
+            if adaptive_level not in level_episode_steps:
+                level_episode_steps[adaptive_level] = []
+                level_success_steps[adaptive_level] = []
+            level_episode_steps[adaptive_level].append(ep_steps)
+            if success:
+                level_success_steps[adaptive_level].append(ep_steps)
+
+            # Termination type
+            if success:
+                termination = "success"
+            elif step == (adaptive_max_steps - 1):
+                termination = "timeout"
+            else:
+                termination = "collision"
+
+            # Collision tracking
+            if termination == "collision":
+                for act_name_c, count in (
+                    controller._collision_stats.items()
+                ):
+                    prev = collision_stats_before.get(act_name_c, 0)
+                    if count > prev:
+                        collision_counts[act_name_c] = (
+                            collision_counts.get(act_name_c, 0)
+                            + (count - prev)
+                        )
+
+            # Per-source per-level tracking
+            source_counter = Counter(ep_sources)
+            dominant_source_key = (
+                source_counter.most_common(1)[0][0]
+                if ep_sources
+                else "heuristic"
+            )
+
+            src_stats = _get_level_source(
+                adaptive_level, dominant_source_key
+            )
+            src_stats[termination] = (
+                src_stats.get(termination, 0) + 1
+            )
+            final_pose = online_env.get_pose()
+            final_dist = float(
+                np.linalg.norm(goal_pose[:3] - final_pose[:3])
+            )
+            src_stats["final_distances"].append(round(final_dist, 1))
+            src_stats["episode_steps"].append(ep_steps)
+            if success:
+                src_stats["success_steps"].append(ep_steps)
+
+            # Manager update (offline retrain uses offline_env)
+            manager.on_episode_complete(
+                success=success, transitions=last_transitions,
+            )
+            if manager._offline_just_completed:
+                rolling_successes.clear()
+                manager._offline_just_completed = False
+
+            # Mode change logging
+            while manager.mode_changes:
+                change = manager.mode_changes.pop(0)
+                change["recent_episodes"] = episode_log[-10:]
+                change_idx = len([
+                    f for f in log_dir.iterdir()
+                    if f.name.startswith("mode_change_")
+                ])
+                change_path = (
+                    log_dir
+                    / f"mode_change_{change_idx:04d}"
+                    f"_ep_{change['episode']:05d}.json"
+                )
+                with change_path.open("w") as f:
+                    json.dump(change, f, indent=2)
+
+            manager.arbitrator.on_episode_end(success)
+
+            # Curriculum promote
+            if not is_fallback_episode:
+                adaptive_promote_window.append(success)
+            if len(adaptive_promote_window) > self.promote_window:
+                adaptive_promote_window.pop(0)
+            if (
+                len(adaptive_promote_window) == self.promote_window
+                and adaptive_level < len(curriculum_levels) - 1
+            ):
+                promote_rate = (
+                    sum(adaptive_promote_window)
+                    / self.promote_window
+                )
+                if promote_rate >= self.promote_threshold:
+                    adaptive_level += 1
+                    adaptive_promote_window = []
+                    logger.info(
+                        "Promoted to level %d at ep %d (rate=%.3f)",
+                        adaptive_level, episode + 1, promote_rate,
+                    )
+
+            # Rolling success rate
+            rolling_successes.append(success)
+            if len(rolling_successes) > 100:
+                rolling_successes.pop(0)
+            rolling_rate = (
+                sum(rolling_successes) / len(rolling_successes)
+            )
+            total_rate = sum(ep_successes) / len(ep_successes)
+
+            # Episode log entry
+            start_dist = float(
+                np.linalg.norm(goal_pose[:3] - start_pos)
+            )
+            episode_log.append({
+                "episode": episode,
+                "success": success,
+                "termination": termination,
+                "steps": ep_steps,
+                "start_distance": round(start_dist, 1),
+                "final_distance": round(final_dist, 1),
+                "dominant_source": dominant_source_key,
+                "last_source_detail": source,
+                "rolling_success_rate": round(rolling_rate, 3),
+                "mode": manager.mode,
+                "curriculum_level": adaptive_level,
+            })
+
+            # Visualization
+            if visualizer is not None:
+                visualizer.save_episode(
+                    env=online_env,
+                    episode=episode,
+                    level=adaptive_level,
+                    result=termination,
+                    goal_pose=goal_pose,
+                    poses=current_poses,
+                    actions=action_explanations,
+                    actions_short=action_short_labels,
+                    extra_info={
+                        "object": object_name,
+                        "mode": manager.mode,
+                        "source": dominant_source_key,
+                        "rolling_rate": round(rolling_rate, 3),
+                    },
+                )
+
+            # ═══ Periodic snapshot ═══
+            if (episode + 1) % _ADAPTIVE_LOG_INTERVAL == 0:
+                stats = manager.get_stats()
+                arb_stats = manager.arbitrator.get_stats()
+                total_src = max(sum(source_counts.values()), 1)
+                total_act = max(sum(action_counts.values()), 1)
+                successes_count = sum(
+                    1 for e in episode_log if e["success"]
+                )
+
+                snapshot = self._build_adaptive_snapshot(
+                    episode=episode + 1,
+                    rolling_rate=rolling_rate,
+                    total_rate=total_rate,
+                    adaptive_level=adaptive_level,
+                    stats=stats,
+                    arb_stats=arb_stats,
+                    total_steps_adaptive=total_steps_adaptive,
+                    episode_log=episode_log,
+                    source_counts=source_counts,
+                    action_counts=action_counts,
+                    collision_counts=collision_counts,
+                    all_episode_steps=all_episode_steps,
+                    all_success_steps=all_success_steps,
+                    per_level_source_stats=per_level_source_stats,
+                )
+                snapshot_log.append(snapshot)
+
+                snap_path = (
+                    log_dir / f"snapshot_ep_{episode + 1:05d}.json"
+                )
+                with snap_path.open("w") as f:
+                    json.dump(snapshot, f, indent=2)
+
+                logger.info(
+                    "Adaptive ep %d: rate=%.3f, mode=%s",
+                    episode + 1, rolling_rate, stats["mode"],
+                )
+
+        # ═══ Save models ═══
+        controller.save(adapt_q_dir)
+        logger.info("Adaptive Q-store saved to %s", adapt_q_dir)
+
+        if manager.sac_trainer:
+            manager.sac_trainer.save(adapt_sac_dir)
+            logger.info("Adaptive SAC saved to %s", adapt_sac_dir)
+
+        # ═══ Build final results ═══
+        total_ep = len(episode_log)
+        total_src = max(sum(source_counts.values()), 1)
+        total_act = max(sum(action_counts.values()), 1)
+        successes_total = sum(
+            1 for e in episode_log if e["success"]
+        )
+        collisions_total = sum(
+            1 for e in episode_log
+            if e["termination"] == "collision"
+        )
+        timeouts_total = sum(
+            1 for e in episode_log
+            if e["termination"] == "timeout"
+        )
+
+        final_results = {
+            "object": object_name,
+            "total_episodes": total_ep,
+            "total_steps": total_steps_adaptive,
+            "success_rate": round(
+                successes_total / max(total_ep, 1), 4
+            ),
+            "collision_rate": round(
+                collisions_total / max(total_ep, 1), 4
+            ),
+            "timeout_rate": round(
+                timeouts_total / max(total_ep, 1), 4
+            ),
+            "mean_episode_steps": round(
+                float(np.mean(all_episode_steps))
+                if all_episode_steps else 0, 1,
+            ),
+            "mean_success_steps": round(
+                float(np.mean(all_success_steps))
+                if all_success_steps else 0, 1,
+            ),
+            "total_steps_per_goal": round(
+                total_steps_adaptive / max(successes_total, 1), 1,
+            ),
+            "final_level": adaptive_level,
+            "per_level_steps": {
+                f"level_{lvl}": {
+                    "mean_episode_steps": round(
+                        float(np.mean(steps_list))
+                        if steps_list else 0, 1,
+                    ),
+                    "mean_success_steps": round(
+                        float(np.mean(
+                            level_success_steps.get(lvl, [])
+                        ))
+                        if level_success_steps.get(lvl) else 0, 1,
+                    ),
+                    "episodes": len(steps_list),
+                    "successes": len(
+                        level_success_steps.get(lvl, [])
+                    ),
+                }
+                for lvl, steps_list
+                in sorted(level_episode_steps.items())
+            },
+            "source_distribution": {
+                k: round(v / total_src, 4)
+                for k, v in source_counts.items()
+            },
+            "action_distribution": {
+                k: {"count": v, "rate": round(v / total_act, 4)}
+                for k, v in sorted(
+                    action_counts.items(), key=lambda x: -x[1]
+                )
+            },
+            "collision_stats": dict(collision_counts),
+            "snapshots": snapshot_log,
+            "episode_log": episode_log,
+            "per_source_analysis": self._build_per_source_analysis(
+                per_level_source_stats
+            ),
+        }
+
+        # Save results
+        result_path = (
+            self.data_dir / f"adaptive_result_{object_name}.json"
+        )
+        with result_path.open("w") as f:
+            json.dump(final_results, f, indent=2)
+
+        self._save_meta(
+            f"adaptive_{object_name}",
+            adapt_seed,
+            {
+                "success_rate": final_results["success_rate"],
+                "total_episodes": total_ep,
+                "source_distribution": final_results[
+                    "source_distribution"
+                ],
+            },
+            [object_name],
+        )
+
+        logger.info(
+            "Adaptive %s complete: success=%.3f, "
+            "collision=%.3f, timeout=%.3f",
+            object_name,
+            final_results["success_rate"],
+            final_results["collision_rate"],
+            final_results["timeout_rate"],
+        )
+
+        return final_results
+
+    # ══════════════════════════════════════════════════════
+    # Adaptive helpers (extracted from inline code)
+    # ══════════════════════════════════════════════════════
+    @staticmethod
+    def _format_action_params(action_type: int, action_params: np.ndarray) -> str:
+        """Human-readable action parameters for logging."""
+        if action_type == 0:
+            # MoveTangentially: [sin, cos, distance]
+            sin_a = float(action_params[0])
+            cos_a = float(action_params[1])
+            angle = float(np.degrees(np.arctan2(sin_a, cos_a))) % 360
+            dist = float(np.clip(action_params[2], 0.5, 15.0))
+            return f"angle={angle:.0f}°,step={dist:.1f}mm"
+        elif action_type == 1:
+            # MoveLinear: [distance]
+            dist = float(np.clip(action_params[0], -25.0, 25.0))
+            return f"step={dist:.1f}mm"
+        elif action_type == 2:
+            # Turn (yaw): [sin, cos]
+            sin_a = float(action_params[0])
+            cos_a = float(action_params[1])
+            angle = float(np.degrees(np.arctan2(sin_a, cos_a)))
+            angle = float(np.clip(angle, -45.0, 45.0))
+            return f"yaw={angle:.1f}°"
+        elif action_type == 3:
+            # Look (pitch): [sin, cos]
+            sin_a = float(action_params[0])
+            cos_a = float(action_params[1])
+            angle = float(np.degrees(np.arctan2(sin_a, cos_a)))
+            angle = float(np.clip(angle, -45.0, 45.0))
+            return f"pitch={angle:.1f}°"
+        elif action_type == 4:
+            # Rotate (roll): [sin, cos]
+            sin_a = float(action_params[0])
+            cos_a = float(action_params[1])
+            angle = float(np.degrees(np.arctan2(sin_a, cos_a)))
+            angle = float(np.clip(angle, -45.0, 45.0))
+            return f"roll={angle:.1f}°"
+        elif action_type == 5:
+            # OrientHorizontal: [rotation, left_dist, fwd_dist]
+            return (
+                f"rot={action_params[0]:.1f}°,"
+                f"left={action_params[1]:.1f}mm,"
+                f"fwd={action_params[2]:.1f}mm"
+            )
+        elif action_type == 6:
+            # OrientVertical: [rotation, down_dist, fwd_dist]
+            return (
+                f"rot={action_params[0]:.1f}°,"
+                f"down={action_params[1]:.1f}mm,"
+                f"fwd={action_params[2]:.1f}mm"
+            )
+        elif action_type == 7:
+            return ""
+        return ""
+
+    @staticmethod
+    def _build_per_source_analysis(
+        per_level_source_stats: dict,
+    ) -> dict:
+        """Build per-source analysis dict for results JSON."""
+        result = {}
+        for lvl, level_data in sorted(
+            per_level_source_stats.items()
+        ):
+            level_key = f"level_{lvl}"
+            result[level_key] = {}
+            for src_name, src_data in level_data.items():
+                total = (
+                    src_data.get("success", 0)
+                    + src_data.get("collision", 0)
+                    + src_data.get("timeout", 0)
+                )
+                result[level_key][src_name] = {
+                    "terminations": {
+                        k: v
+                        for k, v in src_data.items()
+                        if k in ("success", "collision", "timeout")
+                    },
+                    "total_episodes": total,
+                    "success_rate": round(
+                        src_data.get("success", 0)
+                        / max(total, 1), 3,
+                    ),
+                    "mean_final_distance": round(
+                        float(np.mean(src_data["final_distances"]))
+                        if src_data["final_distances"] else 0, 1,
+                    ),
+                    "near_miss_count": sum(
+                        1 for d in src_data["final_distances"]
+                        if 2.0 < d <= 5.0
+                    ),
+                    "mean_success_steps": round(
+                        float(np.mean(
+                            src_data.get("success_steps", [])
+                        ))
+                        if src_data.get("success_steps") else 0, 1,
+                    ),
+                }
+        return result
+
+    @staticmethod
+    def _build_adaptive_snapshot(
+        episode: int,
+        rolling_rate: float,
+        total_rate: float,
+        adaptive_level: int,
+        stats: dict,
+        arb_stats: dict,
+        total_steps_adaptive: int,
+        episode_log: list,
+        source_counts: dict,
+        action_counts: dict,
+        collision_counts: dict,
+        all_episode_steps: list,
+        all_success_steps: list,
+        per_level_source_stats: dict,
+    ) -> dict:
+        """Build periodic snapshot dict."""
+        total_src = max(sum(source_counts.values()), 1)
+        total_act = max(sum(action_counts.values()), 1)
+        successes_count = sum(
+            1 for e in episode_log if e["success"]
+        )
+
+        return {
+            "episode": episode,
+            "rolling_success_rate": round(rolling_rate, 3),
+            "total_episodes_success_rate": round(total_rate, 3),
+            "curriculum_level": adaptive_level,
+            "mode": stats["mode"],
+            "total_episodes": episode,
+            "total_steps": total_steps_adaptive,
+            "success_count": successes_count,
+            "collision_count": sum(
+                1 for e in episode_log
+                if e["termination"] == "collision"
+            ),
+            "timeout_count": sum(
+                1 for e in episode_log
+                if e["termination"] == "timeout"
+            ),
+            "mean_episode_steps": round(
+                float(np.mean(all_episode_steps))
+                if all_episode_steps else 0, 1,
+            ),
+            "mean_success_steps": round(
+                float(np.mean(all_success_steps))
+                if all_success_steps else 0, 1,
+            ),
+            "total_steps_per_goal": round(
+                total_steps_adaptive
+                / max(successes_count, 1), 1,
+            ),
+            "source_distribution": {
+                k: round(v / total_src, 3)
+                for k, v in source_counts.items()
+            },
+            "action_distribution": {
+                k: {"count": v, "rate": round(v / total_act, 4)}
+                for k, v in sorted(
+                    action_counts.items(), key=lambda x: -x[1]
+                )
+            },
+            "collision_stats": dict(collision_counts),
+            "arbitrator": {
+                "q_store_rate": arb_stats.get("q_store_rate", 0),
+                "sac_rate": arb_stats.get("sac_rate", 0),
+                "blend_rate": arb_stats.get("blend_rate", 0),
+                "heuristic_rate": arb_stats.get("heuristic_rate", 0),
+                "agreement_rate": arb_stats.get("agreement_rate", 0),
+                "q_spread_mean": arb_stats.get("q_spread_mean", 0),
+                "q_confidence_mean": arb_stats.get(
+                    "q_confidence_mean", 0
+                ),
+                "q_success_rate": arb_stats.get("q_success_rate", 0),
+                "sac_success_rate": arb_stats.get(
+                    "sac_success_rate", 0
+                ),
+                "heuristic_success_rate": arb_stats.get(
+                    "heuristic_success_rate", 0
+                ),
+                "blend_success_rate": arb_stats.get(
+                    "blend_success_rate", 0
+                ),
+                "arbitrage_only": arb_stats.get(
+                    "arbitrage_only", {}
+                ),
+                "per_level_track_record": arb_stats.get(
+                    "per_level_track_record", {}
+                ),
+                "is_calibrating": arb_stats.get(
+                    "is_calibrating", False
+                ),
+            },
+            "manager": {
+                "sac_updates": stats.get("total_sac_updates", 0),
+                "offline_iterations": stats.get(
+                    "total_offline_iterations", 0
+                ),
+            },
+            "per_source_analysis": (
+                RLGoalApproachExperiment._build_per_source_analysis(
+                    per_level_source_stats
+                )
+            ),
+        }
+
+    # ══════════════════════════════════════════════════════
+    # Adaptive wrappers (delegate to _run_adaptive_generic)
+    # ══════════════════════════════════════════════════════
+
+    def _run_adaptive(self) -> None:
+        """Run adaptive mode on trimesh (LightweightEnv).
+
+        Both online and offline use the same trimesh env
+        since it's fast enough for both.
+        """
+        logger.info("=" * 60)
+        logger.info("Adaptive (trimesh): %s", self.adaptive_mesh)
+        logger.info("=" * 60)
+
+        mesh_path = str(
+            self.data_dir / f"{self.adaptive_mesh}.stl"
+        )
+        adapt_seed = self.train_seeds[0]
+
+        np.random.seed(self.adapt_seed)
+        random.seed(self.adapt_seed)
+
+        env = LightweightEnv(mesh_path, seed=adapt_seed)
+
+        adapt_q_dir = str(
+            self.runs_dir
+            / f"adaptive_q_seed_{adapt_seed}"
+        )
+        adapt_sac_dir = str(
+            self.runs_dir
+            / f"adaptive_sac_seed_{self.sac_seed}"
+        )
+        log_dir = (
+            self.data_dir
+            / f"adaptive_logs_{self.adaptive_mesh}"
+        )
+
+        # Visualizer
+        visualizer = None
+        if self.visualise:
+            from tbp.hybrid_rl.visualize_env import EpisodeVisualizer
+            visualizer = EpisodeVisualizer(
+                output_dir=self.data_dir,
+                mesh_name=self.adaptive_mesh,
+                stage="adaptive",
+                max_per_type_per_level=5,
+                num_levels=len(self.curriculum_levels),
+                visualize_mode=self.visualise,
+            )
+
+        self._run_adaptive_generic(
+            online_env=env,
+            offline_env=env,  # trimesh is fast — same env for both
+            object_name=self.adaptive_mesh,
+            num_episodes=self.adaptive_episodes,
+            curriculum_levels=self.curriculum_levels,
+            curriculum_filters=self.curriculum_filters,
+            adapt_q_dir=adapt_q_dir,
+            adapt_sac_dir=adapt_sac_dir,
+            adapt_seed=adapt_seed,
+            log_dir=log_dir,
+            mesh_path=mesh_path,
+            visualizer=visualizer,
+        )
+
+    def _run_ycb_mujoco_adaptive(self) -> None:
+        """Run adaptive mode on YCB objects using MuJoCo environment.
+
+        Online loop runs in MuJoCo (realistic sensor data).
+        Offline retrain runs in trimesh (fast, already works).
+        """
+        # Suppress MuJoCo Renderer cleanup error at exit
+        import mujoco as _mj
+        if hasattr(_mj.Renderer, '__del__'):
+            _orig_del = _mj.Renderer.__del__
+
+            def _safe_del(self):
+                try:
+                    _orig_del(self)
+                except (AttributeError, Exception):
+                    pass
+
+            _mj.Renderer.__del__ = _safe_del
+
+        logger.info("=" * 60)
+        logger.info("YCB MuJoCo Adaptive")
+        logger.info("=" * 60)
+
+        adapt_cfg = self.ycb_mujoco_adaptive_config
+        if not adapt_cfg:
+            adapt_cfg = self.ycb_mujoco_config
+
+        ycb_src_dir = adapt_cfg.get("ycb_src_dir")
+        if not ycb_src_dir:
+            logger.error(
+                "ycb_mujoco_adaptive_config.ycb_src_dir not set"
+            )
+            return
+        ycb_src_dir = Path(ycb_src_dir).expanduser()
+        if not ycb_src_dir.exists():
+            logger.error(
+                "YCB source dir not found: %s", ycb_src_dir
+            )
+            return
+
+        mujoco_data_path_raw = adapt_cfg.get("mujoco_data_path")
+        mujoco_data_path = (
+            str(Path(mujoco_data_path_raw).expanduser())
+            if mujoco_data_path_raw
+            else str(ycb_src_dir)
+        )
+
+        ycb_objects = adapt_cfg.get("objects", {})
+        adaptive_episodes = adapt_cfg.get(
+            "adaptive_episodes", 2000
+        )
+
+        ycb_data_dir = self.data_dir / "ycb"
+        ycb_data_dir.mkdir(parents=True, exist_ok=True)
+
+        curriculum_levels = [
+            tuple(level)
+            for level in adapt_cfg.get(
+                "curriculum_levels", self.curriculum_levels
+            )
+        ]
+        curriculum_filters = adapt_cfg.get(
+            "curriculum_filters", self.curriculum_filters
+        )
+
+        adapt_seed = self.train_seeds[0]
+        np.random.seed(adapt_seed)
+        random.seed(adapt_seed)
+
+        q_dir = self._q_model_dir(adapt_seed)
+        if not (Path(q_dir) / "config.json").exists():
+            logger.error("Q-store not found at %s", q_dir)
+            return
+
+        for local_name, obj_config in ycb_objects.items():
+            # ═══ Parse object config ═══
+            if isinstance(obj_config, dict):
+                mujoco_name = obj_config["mujoco_name"]
+                glb_name = obj_config.get(
+                    "glb_name", mujoco_name
+                )
+            else:
+                mujoco_name = obj_config
+                glb_name = obj_config
+
+            logger.info("-" * 40)
+            logger.info(
+                "YCB MuJoCo Adaptive: %s", local_name
+            )
+
+            # ═══ Verify MuJoCo object data ═══
+            obj_path = (
+                Path(mujoco_data_path)
+                / mujoco_name
+                / "textured.obj"
+            )
+            if not obj_path.exists():
+                logger.warning(
+                    "SKIP %s: %s not found",
+                    mujoco_name, obj_path,
+                )
+                continue
+
+            # ═══ Convert to mm STL ═══
+            stl_path = ycb_data_dir / f"{local_name}.stl"
+            if not stl_path.exists():
+                glb_path = (
+                    ycb_src_dir
+                    / glb_name
+                    / "google_16k"
+                    / "textured.glb"
+                )
+                src_mesh_path = (
+                    str(glb_path)
+                    if glb_path.exists()
+                    else str(obj_path)
+                )
+                import trimesh as _trimesh
+                mesh = _trimesh.load(
+                    src_mesh_path, force="mesh"
+                )
+                mesh_mm = mesh.copy()
+                mesh_mm.vertices *= 1000.0
+                mesh_mm.export(str(stl_path))
+                logger.info(
+                    "Converted: extents_m=%s, extents_mm=%s",
+                    mesh.extents.round(4).tolist(),
+                    mesh_mm.extents.round(1).tolist(),
+                )
+
+            # ═══ Create environments ═══
+            try:
+                mj_env = MuJoCoEnvAdapter(
+                    mesh_path_mm=str(stl_path),
+                    mujoco_object_name=mujoco_name,
+                    mujoco_data_path=mujoco_data_path,
+                    seed=adapt_seed,
+                )
+            except Exception as e:
+                logger.error(
+                    "SKIP %s: init failed: %s",
+                    local_name, e, exc_info=True,
+                )
+                continue
+
+            trimesh_env = LightweightEnv(
+                str(stl_path), seed=adapt_seed
+            )
+
+            # ═══ Paths ═══
+            adapt_q_dir = str(
+                self.runs_dir
+                / f"adaptive_q_ycb_{local_name}"
+                f"_seed_{adapt_seed}"
+            )
+            adapt_sac_dir = str(
+                self.runs_dir
+                / f"adaptive_sac_ycb_{local_name}"
+                f"_seed_{self.sac_seed}"
+            )
+            log_dir = (
+                ycb_data_dir
+                / f"adaptive_logs_{local_name}"
+            )
+
+            # ═══ Visualizer ═══
+            visualizer = None
+            if self.visualise:
+                from tbp.hybrid_rl.visualize_env import (
+                    EpisodeVisualizer,
+                )
+                visualizer = EpisodeVisualizer(
+                    output_dir=ycb_data_dir,
+                    mesh_name=local_name,
+                    stage="ycb_mujoco_adaptive",
+                    max_per_type_per_level=5,
+                    num_levels=len(curriculum_levels),
+                    visualize_mode=self.visualise,
+                )
+
+            # ═══ Run unified adaptive loop ═══
+            try:
+                self._run_adaptive_generic(
+                    online_env=mj_env,
+                    offline_env=trimesh_env,
+                    object_name=local_name,
+                    num_episodes=adaptive_episodes,
+                    curriculum_levels=curriculum_levels,
+                    curriculum_filters=curriculum_filters,
+                    adapt_q_dir=adapt_q_dir,
+                    adapt_sac_dir=adapt_sac_dir,
+                    adapt_seed=adapt_seed,
+                    log_dir=log_dir,
+                    mesh_path=str(stl_path),
+                    visualizer=visualizer,
+                )
+            finally:
+                mj_env.close()
+
+        logger.info("YCB MuJoCo Adaptive complete")
+
+    # ══════════════════════════════════════════════════════
+    # YCB Evaluation
+    # ══════════════════════════════════════════════════════
+
+    def _run_ycb_eval(self) -> None:
+        """Evaluate trained agent on YCB objects.
+
+        Converts YCB .glb → .stl (mm), then runs eval using
+        LightweightEnv (same as standard eval).
+        """
+        logger.info("=" * 60)
+        logger.info("YCB Evaluation")
+        logger.info("=" * 60)
+
+        ycb_src_dir = self.ycb_config.get("ycb_src_dir")
+        if not ycb_src_dir:
+            logger.error(
+                "ycb_config.ycb_src_dir not set. "
+                "Set path to YCB meshes directory."
+            )
+            return
+
+        ycb_src_dir = Path(ycb_src_dir).expanduser()
+        if not ycb_src_dir.exists():
+            logger.error("YCB source dir not found: %s", ycb_src_dir)
+            return
+
+        # Parse which objects to evaluate
+        ycb_objects = self.ycb_config.get("objects", None)
+        # Format: {local_name: ycb_folder_name}
+        # e.g. {"ycb_mug": "025_mug", "ycb_bowl": "024_bowl"}
+
+        ycb_episodes_per_level = self.ycb_config.get(
+            "episodes_per_level", 100
+        )
+        ycb_curriculum_levels = [
+            tuple(level)
+            for level in self.ycb_config.get(
+                "curriculum_levels", self.curriculum_levels
+            )
+        ]
+        ycb_curriculum_filters = self.ycb_config.get(
+            "curriculum_filters", self.curriculum_filters
+        )
+
+        # Convert YCB objects
+        ycb_data_dir = self.data_dir / "ycb"
+        logger.info("Converting YCB objects from %s", ycb_src_dir)
+        converted = convert_ycb_objects(
+            ycb_src_dir=str(ycb_src_dir),
+            output_dir=str(ycb_data_dir),
+            objects=ycb_objects,
+        )
+
+        if not converted:
+            logger.error("No YCB objects converted, aborting")
+            return
+
+        logger.info("Converted %d YCB objects", len(converted))
+
+        # Eval config
+        eval_cfg = {
+            **self.rl_config,
+            "mode": "eval",
+        }
+
+        all_ycb_results = {}
+
+        for mesh_name, stl_path in converted.items():
+            mesh_path = str(stl_path)
+            logger.info(
+                "YCB Eval: %s (%s)", mesh_name, stl_path
+            )
+
+            # Generate episode pools
+            eval_pools = get_or_generate_pools(
+                mesh_path=mesh_path,
+                seeds=self.eval_seeds,
+                episodes_per_level=ycb_episodes_per_level,
+                scripts_dir=self.scripts_dir,
+                curriculum_levels=ycb_curriculum_levels,
+                regenerate=self.regenerate_scripts,
+                prefix=f"ycb_eval_{mesh_name}",
+                curriculum_filters=ycb_curriculum_filters,
+            )
+
+            # Run eval
+            eval_results, _ = run_eval_per_seed(
+                data_dir=self.data_dir,
+                runs_dir=self.runs_dir,
+                mesh_path=mesh_path,
+                train_seeds=self.train_seeds,
+                eval_seeds=self.eval_seeds,
+                variant="q_store",
+                eval_cfg=eval_cfg,
+                eval_pools=eval_pools,
+                collect_bc=False,
+                episodes_per_level=ycb_episodes_per_level,
+                mesh_name=mesh_name,
+                visualise=self.visualise,
+            )
+
+            all_ycb_results[mesh_name] = eval_results
+
+            # Log per-level results
+            for level_key, level_data in eval_results.items():
+                if level_key == "overall":
+                    continue
+                logger.info(
+                    "  %s %s: success=%.3f, timeout=%.3f, collision=%.3f",
+                    mesh_name,
+                    level_key,
+                    level_data.get("mean_success_rate", 0),
+                    level_data.get("mean_timeout_rate", 0),
+                    level_data.get("mean_collision_rate", 0),
+                )
+
+            if "overall" in eval_results:
+                logger.info(
+                    "  %s OVERALL: success=%.3f",
+                    mesh_name,
+                    eval_results["overall"].get("mean_success_rate", 0),
+                )
+
+            # Save per-mesh result
+            mesh_result_path = (
+                self.data_dir / f"ycb_eval_result_{mesh_name}.json"
+            )
+            with mesh_result_path.open("w") as f:
+                json.dump(eval_results, f, indent=2)
+
+        # Save combined results
+        ycb_result_path = self.data_dir / "ycb_eval_result_all.json"
+        with ycb_result_path.open("w") as f:
+            json.dump(all_ycb_results, f, indent=2)
+
+        # Summary table
+        logger.info("\n" + "=" * 60)
+        logger.info("YCB EVALUATION SUMMARY")
+        logger.info("=" * 60)
+        logger.info("%-20s %10s %10s %10s", "Object", "Success", "Timeout", "Collision")
+        logger.info("-" * 60)
+        for mesh_name, results in all_ycb_results.items():
+            overall = results.get("overall", {})
+            logger.info(
+                "%-20s %10.3f %10.3f %10.3f",
+                mesh_name,
+                overall.get("mean_success_rate", 0),
+                overall.get("mean_timeout_rate", 0),
+                overall.get("mean_collision_rate", 0),
+            )
+        logger.info("=" * 60)
+
+        logger.info("YCB eval results saved to %s", ycb_result_path)
+
+    # ══════════════════════════════════════════════════════
+    # YCB MuJoCo Evaluation
+    # ══════════════════════════════════════════════════════
+
+    def _run_ycb_mujoco_eval(self) -> None:
+        """Evaluate trained agent on YCB objects using MuJoCo rendering."""
+        # Suppress MuJoCo Renderer cleanup error at exit
+        import mujoco as _mj
+        if hasattr(_mj.Renderer, '__del__'):
+            _orig_del = _mj.Renderer.__del__
+            def _safe_del(self):
+                try:
+                    _orig_del(self)
+                except (AttributeError, Exception):
+                    pass
+            _mj.Renderer.__del__ = _safe_del
+
+        logger.info("=" * 60)
+        logger.info("YCB MuJoCo Evaluation")
+        logger.info("=" * 60)
+
+        ycb_src_dir = self.ycb_mujoco_config.get("ycb_src_dir")
+        if not ycb_src_dir:
+            logger.error("ycb_mujoco_config.ycb_src_dir not set")
+            return
+
+        ycb_src_dir = Path(ycb_src_dir).expanduser()
+        if not ycb_src_dir.exists():
+            logger.error("YCB source dir not found: %s", ycb_src_dir)
+            return
+
+        ycb_objects = self.ycb_mujoco_config.get("objects", {})
+        episodes_per_level = self.ycb_mujoco_config.get(
+            "episodes_per_level", 10
+        )
+        max_steps = self.ycb_mujoco_config.get("max_steps", 500)
+
+        mujoco_data_path_raw = self.ycb_mujoco_config.get(
+            "mujoco_data_path"
+        )
+        if mujoco_data_path_raw:
+            mujoco_data_path = str(
+                Path(mujoco_data_path_raw).expanduser()
+            )
+        else:
+            mujoco_data_path = str(ycb_src_dir)
+
+        ycb_data_dir = self.data_dir / "ycb"
+        ycb_data_dir.mkdir(parents=True, exist_ok=True)
+
+        seed = self.train_seeds[0]
+        q_dir = self._q_model_dir(seed)
+        if not (Path(q_dir) / "config.json").exists():
+            logger.error("Q-store not found at %s", q_dir)
+            return
+
+        eval_cfg = {**self.rl_config, "mode": "eval"}
+
+        curriculum_levels = [
+            tuple(level)
+            for level in self.ycb_mujoco_config.get(
+                "curriculum_levels", self.curriculum_levels
+            )
+        ]
+
+        all_results = {}
+
+        for local_name, obj_config in ycb_objects.items():
+            # ═══ Parse object config ═══
+            if isinstance(obj_config, dict):
+                mujoco_name = obj_config["mujoco_name"]
+                glb_name = obj_config.get("glb_name", mujoco_name)
+            else:
+                mujoco_name = obj_config
+                glb_name = obj_config
+
+            logger.info("-" * 40)
+            logger.info(
+                "YCB MuJoCo Eval: %s (mujoco=%s, glb=%s)",
+                local_name, mujoco_name, glb_name,
+            )
+
+            # ═══ Verify MuJoCo object data ═══
+            obj_path = (
+                Path(mujoco_data_path) / mujoco_name / "textured.obj"
+            )
+            if not obj_path.exists():
+                logger.warning(
+                    "  SKIP %s: %s not found", mujoco_name, obj_path,
+                )
+                continue
+
+            # ═══ Convert to mm STL ═══
+            stl_path = ycb_data_dir / f"{local_name}.stl"
+            if not stl_path.exists():
+                glb_path = (
+                    ycb_src_dir / glb_name
+                    / "google_16k" / "textured.glb"
+                )
+                src_mesh_path = (
+                    str(glb_path) if glb_path.exists()
+                    else str(obj_path)
+                )
+                import trimesh as _trimesh
+                mesh = _trimesh.load(src_mesh_path, force="mesh")
+                mesh_mm = mesh.copy()
+                mesh_mm.vertices *= 1000.0
+                mesh_mm.export(str(stl_path))
+                logger.info(
+                    "  Converted: extents_m=%s, extents_mm=%s",
+                    mesh.extents.round(4).tolist(),
+                    mesh_mm.extents.round(1).tolist(),
+                )
+
+            # ═══ Create MuJoCo adapter ═══
+            from tbp.hybrid_rl.mujoco_env_adapter import MuJoCoEnvAdapter
+
+            try:
+                env = MuJoCoEnvAdapter(
+                    mesh_path_mm=str(stl_path),
+                    mujoco_object_name=mujoco_name,
+                    mujoco_data_path=mujoco_data_path,
+                    seed=self.eval_seeds[0],
+                )
+            except Exception as e:
+                logger.error(
+                    "  SKIP %s: init failed: %s",
+                    local_name, e, exc_info=True,
+                )
+                continue
+
+            # ═══ Debug: scene info ═══
+            logger.info(
+                "  Scene: ngeom=%d, nbody=%d, MJ_center=%s, "
+                "MJ_extents=%s, up=%s",
+                env._sim.model.ngeom,
+                env._sim.model.nbody,
+                env._mj_center_mm.round(1).tolist(),
+                env._mj_extents_mm.round(1).tolist(),
+                env.up_direction.round(3).tolist(),
+            )
+
+            # ═══ Load controller ═══
+            controller = RLGoalApproachController.load(
+                q_dir,
+                agent_id=f"ycb_mujoco_{local_name}",
+                config=eval_cfg,
+            )
+            action_space = controller.action_space
+            np.random.seed(self.eval_seeds[0])
+
+            # ═══ Create visualizer ═══
+            viz = None
+            if self.visualise:
+                from tbp.hybrid_rl.visualize_env import EpisodeVisualizer
+                viz = EpisodeVisualizer(
+                    output_dir=ycb_data_dir,
+                    mesh_name=local_name,
+                    stage="ycb_mujoco_eval",
+                    max_per_type_per_level=5,
+                    num_levels=len(curriculum_levels),
+                    visualize_mode=self.visualise,
+                )
+
+            level_results = {}
+
+            for level_idx, (min_dist, max_dist) in enumerate(
+                curriculum_levels
+            ):
+                successes = 0
+                timeouts = 0
+                collisions = 0
+                episode_steps_list = []
+                success_steps_list = []
+
+                for ep in range(episodes_per_level):
+                    env.reset()
+                    start_pos = env.get_pose()[:3]
+
+                    # ═══ Goal generation with filters ═══
+                    level_filter = {}
+                    curriculum_filters = self.ycb_mujoco_config.get(
+                        "curriculum_filters", self.curriculum_filters
+                    )
+                    if level_idx < len(curriculum_filters):
+                        level_filter = curriculum_filters[level_idx]
+
+                    require_same_side = level_filter.get(
+                        "same_side", None
+                    )
+                    require_path_blocked = level_filter.get(
+                        "path_blocked", None
+                    )
+
+                    goal_pose = None
+                    for _attempt in range(50):
+                        candidate = env.get_random_surface_point(
+                            reference_pos=start_pos,
+                            min_dist=min_dist,
+                            max_dist=max_dist,
+                            max_attempts=2000,
+                        )
+
+                        if (
+                            require_same_side is not None
+                            or require_path_blocked is not None
+                        ):
+                            env.set_goal(candidate)
+                            sensor = env.get_sensor_data()
+
+                            if require_same_side is not None:
+                                if (
+                                    sensor["same_side"]
+                                    != require_same_side
+                                ):
+                                    continue
+                            if require_path_blocked is not None:
+                                if (
+                                    sensor["path_blocked"]
+                                    != require_path_blocked
+                                ):
+                                    continue
+
+                        goal_pose = candidate
+                        break
+
+                    if goal_pose is None:
+                        goal_pose = candidate
+
+                    env.set_goal(goal_pose)
+                    controller.set_new_goal(goal_pose, start_pos)
+
+                    goals_before = controller._total_goals_reached
+                    ep_steps = 0
+
+                    # ═══ Collect trajectory ═══
+                    current_poses = [env.get_pose().copy()]
+                    action_explanations = []
+
+                    for step in range(max_steps):
+                        pose = env.get_pose()
+                        sensor_data = env.get_sensor_data()
+
+                        _, explanation = controller.step(
+                            pose, sensor_data
+                        )
+
+                        if controller._current_goal is None:
+                            break
+
+                        env.step(
+                            controller._last_action, action_space
+                        )
+                        ep_steps += 1
+
+                        # ═══ Collect action info ═══
+                        new_pose = env.get_pose()
+                        current_poses.append(new_pose.copy())
+
+                        if explanation is not None:
+                            interp = explanation["interpretation"]
+                        else:
+                            interp = "done"
+
+                        new_sensor = env.get_sensor_data()
+                        mj_pos = list(env._embodiment.position)
+                        interp += (
+                            f" |mj=[{mj_pos[0]:.4f},"
+                            f"{mj_pos[1]:.4f},"
+                            f"{mj_pos[2]:.4f}]"
+                            f"|depth={new_sensor['depth']:.1f}"
+                            f"|on={int(new_sensor['on_object'])}"
+                        )
+                        action_explanations.append(interp)
+
+                    # ═══ Determine result ═══
+                    success = (
+                        controller._total_goals_reached
+                        > goals_before
+                    )
+                    episode_steps_list.append(ep_steps)
+
+                    if success:
+                        successes += 1
+                        success_steps_list.append(ep_steps)
+                        ep_result = "success"
+                    elif ep_steps >= max_steps - 1:
+                        timeouts += 1
+                        ep_result = "timeout"
+                    else:
+                        collisions += 1
+                        ep_result = "collision"
+
+                    # ═══ Unified visualization ═══
+                    if viz:
+                        viz.save_episode(
+                            env=env,
+                            episode=ep,
+                            level=level_idx,
+                            result=ep_result,
+                            goal_pose=goal_pose,
+                            poses=current_poses,
+                            actions=action_explanations,
+                            extra_info={
+                                "object": f"{local_name} ({mujoco_name})",
+                                "level_bounds": f"[{min_dist}-{max_dist}mm]",
+                                "mj_center": env._mj_center_mm.tolist(),
+                                "mj_extents": env._mj_extents_mm.tolist(),
+                                "up_direction": env.up_direction.tolist(),
+                                "embodiment_pos": list(
+                                    env._embodiment.position
+                                ),
+                                "embodiment_rot": list(
+                                    env._embodiment.rotation
+                                ),
+                            },
+                        )
+
+                    # ═══ Log episode ═══
+                    final_dist = float(np.linalg.norm(
+                        goal_pose[:3] - env.get_pose()[:3]
+                    ))
+                    logger.info(
+                        "    ep %d: %s, steps=%d, "
+                        "start_dist=%.1f, final_dist=%.1f",
+                        ep, ep_result, ep_steps,
+                        float(np.linalg.norm(
+                            goal_pose[:3] - start_pos
+                        )),
+                        final_dist,
+                    )
+
+                total = max(episodes_per_level, 1)
+                level_results[f"level_{level_idx}"] = {
+                    "bounds_mm": list(
+                        curriculum_levels[level_idx]
+                    ),
+                    "episodes": episodes_per_level,
+                    "success_rate": round(
+                        successes / total, 4
+                    ),
+                    "timeout_rate": round(
+                        timeouts / total, 4
+                    ),
+                    "collision_rate": round(
+                        collisions / total, 4
+                    ),
+                    "mean_episode_steps": round(
+                        float(np.mean(episode_steps_list))
+                        if episode_steps_list else 0, 1,
+                    ),
+                    "mean_success_steps": round(
+                        float(np.mean(success_steps_list))
+                        if success_steps_list else 0, 1,
+                    ),
+                }
+
+                logger.info(
+                    "  L%d [%.0f-%.0f mm]: success=%.3f, "
+                    "timeout=%.3f, collision=%.3f",
+                    level_idx, min_dist, max_dist,
+                    level_results[f"level_{level_idx}"][
+                        "success_rate"
+                    ],
+                    level_results[f"level_{level_idx}"][
+                        "timeout_rate"
+                    ],
+                    level_results[f"level_{level_idx}"][
+                        "collision_rate"
+                    ],
+                )
+
+            all_success = [
+                v["success_rate"]
+                for k, v in level_results.items()
+                if k.startswith("level_")
+            ]
+            level_results["overall"] = {
+                "mean_success_rate": round(
+                    float(np.mean(all_success))
+                    if all_success else 0, 4,
+                ),
+            }
+
+            all_results[local_name] = level_results
+            logger.info(
+                "  %s OVERALL: success=%.3f",
+                local_name,
+                level_results["overall"][
+                    "mean_success_rate"
+                ],
+            )
+
+            env.close()
+            # ═══ Save intermediate results ═══
+            intermediate_path = ycb_data_dir / f"ycb_mujoco_result_{local_name}.json"
+            with intermediate_path.open("w") as f:
+                json.dump(level_results, f, indent=2)
+            logger.info("  Intermediate results saved to %s", intermediate_path)
+
+        # ═══ Save results ═══
+        result_path = (
+            self.data_dir / "ycb_mujoco_eval_result.json"
+        )
+        with result_path.open("w") as f:
+            json.dump(all_results, f, indent=2)
+
+        # ═══ Summary ═══
+        logger.info("\n" + "=" * 60)
+        logger.info("YCB MUJOCO EVALUATION SUMMARY")
+        logger.info("=" * 60)
+        logger.info("%-20s %10s", "Object", "Success")
+        logger.info("-" * 35)
+        for name, results in all_results.items():
+            overall = results.get("overall", {})
+            logger.info(
+                "%-20s %10.3f", name,
+                overall.get("mean_success_rate", 0),
+            )
+        logger.info("=" * 60)
+        logger.info("Results saved to %s", result_path)
+
+    # ═════════════════════════════════════════════════════
+    # Utilities
+    # ═════════════════════════════════════════════════════
+
+    @staticmethod
+    def _filter_bc_transitions(
+        transitions: list,
+        total_target: int = 100000,
+        min_samples_to_keep: int = 50,
+    ) -> list:
+        """Balance BC transitions by (mesh, level).
+
+        Distributes total_target equally across groups.
+        Groups with fewer samples are oversampled,
+        groups with more are undersampled.
+
+        Args:
+            transitions: All BC transitions.
+            total_target: Total desired transitions.
+            min_samples_to_keep: Minimum for inclusion.
+
+        Returns:
+            Balanced transitions.
+        """
+        type_names = (
+            ExperienceExtractor.get_type_names()
+        )
+        mesh_id_to_name = {
+            v: k
+            for k, v in (
+                ExperienceExtractor
+                .MESH_NAME_TO_ID.items()
+            )
+        }
+
+        # Group by (mesh_id, level)
+        groups: dict[tuple[int, int], list] = {}
+        for tr in transitions:
+            key = (
+                getattr(tr, "mesh_id", -1),
+                getattr(tr, "level", 0),
+            )
+            if key not in groups:
+                groups[key] = []
+            groups[key].append(tr)
+
+        # Calculate target per group
+        num_groups = max(len(groups), 1)
+        target_per_group = total_target // num_groups
+
+        # Log before
+        logger.info("BC balance BEFORE:")
+        for (mid, level), trs in sorted(
+            groups.items()
+        ):
+            mname = mesh_id_to_name.get(
+                mid, f"mesh_{mid}"
+            )
+            type_counts: dict[str, int] = {}
+            for tr in trs:
+                tname = type_names.get(
+                    tr.action_type,
+                    f"type_{tr.action_type}",
+                )
+                type_counts[tname] = (
+                    type_counts.get(tname, 0) + 1
+                )
+            logger.info(
+                "  %s L%d: %d transitions, "
+                "actions: %s",
+                mname,
+                level,
+                len(trs),
+                type_counts,
+            )
+
+        # Balance
+        balanced: list = []
+        for (mid, level), trs in groups.items():
+            mname = mesh_id_to_name.get(
+                mid, f"mesh_{mid}"
+            )
+
+            if len(trs) < min_samples_to_keep:
+                balanced.extend(trs)
+                logger.info(
+                    "  %s L%d: kept all %d "
+                    "(too few)",
+                    mname,
+                    level,
+                    len(trs),
+                )
+            elif len(trs) >= target_per_group:
+                indices = (
+                    np.random.permutation(
+                        len(trs)
+                    )[:target_per_group]
+                )
+                balanced.extend(
+                    [trs[i] for i in indices]
+                )
+                logger.info(
+                    "  %s L%d: undersampled "
+                    "%d → %d",
+                    mname,
+                    level,
+                    len(trs),
+                    target_per_group,
+                )
+            else:
+                indices = np.random.choice(
+                    len(trs),
+                    target_per_group,
+                    replace=True,
+                )
+                balanced.extend(
+                    [trs[i] for i in indices]
+                )
+                logger.info(
+                    "  %s L%d: oversampled "
+                    "%d → %d",
+                    mname,
+                    level,
+                    len(trs),
+                    target_per_group,
+                )
+
+        np.random.shuffle(balanced)
+
+        # Log after
+        after_groups: dict[str, int] = {}
+        for tr in balanced:
+            mname = mesh_id_to_name.get(
+                getattr(tr, "mesh_id", -1),
+                "unknown",
+            )
+            key = (
+                f"{mname}_L"
+                f"{getattr(tr, 'level', 0)}"
+            )
+            after_groups[key] = (
+                after_groups.get(key, 0) + 1
+            )
+
+        logger.info("BC balance AFTER:")
+        for key in sorted(after_groups.keys()):
+            logger.info(
+                "  %s: %d transitions (%.1f%%)",
+                key,
+                after_groups[key],
+                100.0 * after_groups[key]
+                / max(len(balanced), 1),
+            )
+
+        logger.info(
+            "BC filter: %d → %d transitions",
+            len(transitions),
+            len(balanced),
+        )
+        return balanced
