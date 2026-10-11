@@ -1,0 +1,133 @@
+# Copyright 2026 [Aleksey Isaev]
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""ActionInterpreter: converts P-SAC (type, params) to LightweightEnv commands.
+"""
+
+import numpy as np
+
+from .experience_extractor import ExperienceExtractor
+
+
+class ActionInterpreter:
+
+    def __init__(self, env):
+        self.env = env
+        self.type_names = ExperienceExtractor.get_type_names()
+        self.param_dims = ExperienceExtractor.get_param_dims()
+
+    def execute(
+        self,
+        action_type: int,
+        action_params: np.ndarray,
+    ) -> dict:
+        if action_type == 0:
+            sin_a = float(action_params[0])
+            cos_a = float(action_params[1])
+            angle_deg = float(
+                np.degrees(
+                    np.arctan2(sin_a, cos_a)
+                )
+            )
+            distance = float(
+                np.clip(
+                    action_params[2], 0.5, 15.0
+                )
+            )
+            self.env._move_tangentially(
+                angle_deg, distance
+            )
+
+        elif action_type == 1:
+            distance = float(
+                np.clip(
+                    action_params[0], -25.0, 25.0
+                )
+            )
+            self.env._move_forward(distance)
+
+        elif action_type == 2:
+            sin_a = float(action_params[0])
+            cos_a = float(action_params[1])
+            rotation = float(
+                np.degrees(
+                    np.arctan2(sin_a, cos_a)
+                )
+            )
+            rotation = float(
+                np.clip(rotation, -45.0, 45.0)
+            )
+            self.env.agent_rot[1] += rotation
+
+        elif action_type == 3:
+            sin_a = float(action_params[0])
+            cos_a = float(action_params[1])
+            rotation = float(
+                np.degrees(
+                    np.arctan2(sin_a, cos_a)
+                )
+            )
+            rotation = float(
+                np.clip(rotation, -45.0, 45.0)
+            )
+            self.env.agent_rot[0] += rotation
+
+        elif action_type == 4:
+            sin_a = float(action_params[0])
+            cos_a = float(action_params[1])
+            rotation = float(
+                np.degrees(
+                    np.arctan2(sin_a, cos_a)
+                )
+            )
+            rotation = float(
+                np.clip(rotation, -45.0, 45.0)
+            )
+            self.env.agent_rot[2] += rotation
+
+        elif action_type == 5:
+            rotation = float(action_params[0])
+            left_dist = float(action_params[1])
+            fwd_dist = float(action_params[2])
+            self.env._orient_horizontal(
+                rotation, fwd_dist, left_dist
+            )
+
+        elif action_type == 6:
+            rotation = float(action_params[0])
+            down_dist = float(action_params[1])
+            fwd_dist = float(action_params[2])
+            self.env._orient_vertical(
+                rotation, fwd_dist, down_dist
+            )
+
+        elif action_type == 7:
+            if (
+                hasattr(self.env, "_current_goal")
+                and self.env._current_goal
+                is not None
+            ):
+                self.env._detach_simple(
+                    goal_pose=(
+                        self.env._current_goal
+                    ),
+                )
+
+        self.env.agent_rot = (
+            self.env._normalize_euler(
+                self.env.agent_rot
+            )
+        )
+
+        return self.env.get_sensor_data()

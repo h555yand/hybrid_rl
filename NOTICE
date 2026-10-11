@@ -1,0 +1,16 @@
+Bio-Inspired Hybrid RL for Object Navigation
+Copyright 2026 [Aleksey Isaev]
+
+This product was designed and implemented by [Aleksey Isaev].
+
+Original research and implementation includes:
+- Episodic Memory Q-Store with HNSW nearest-neighbor search and Gaussian
+  kernel Q-value approximation
+- Soft Actor-Critic (SAC) parametric policy with Behavioral Cloning warm-start
+- Adaptive Arbitrator with confidence × track record action source selection
+- Phase-driven navigation system with six behavioral phases and strategic/
+  tactical decision hierarchy
+- Frame-invariant state representation enabling zero-shot
+  sim-to-sim transfer
+- Environment-agnostic protocol for deployment on any simulator or robot
+

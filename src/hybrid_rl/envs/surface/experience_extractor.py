@@ -1,0 +1,285 @@
+# Copyright 2026 [Aleksey Isaev]
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""ExperienceExtractor: converts Q-learning discrete trajectories
+to P-SAC parameterized format for Behavioral Cloning.
+"""
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+
+
+@dataclass
+class PSACTransition:
+    state: np.ndarray
+    action_type: int
+    action_params: np.ndarray
+    reward: float
+    next_state: Optional[np.ndarray] = None
+    done: bool = False
+    mesh_id: int = 0
+    level: int = 0  # curriculum level
+
+
+class ExperienceExtractor:
+
+    MAX_PARAMS = 3
+
+    # 24-action space (no detach_edge)
+    DISCRETE_TO_PSAC = {
+        0:  (0, lambda cfg: [
+            np.sin(np.radians(0.0)),
+            np.cos(np.radians(0.0)),
+            cfg["surface_step"],
+        ]),
+        1:  (0, lambda cfg: [
+            np.sin(np.radians(45.0)),
+            np.cos(np.radians(45.0)),
+            cfg["surface_step"],
+        ]),
+        2:  (0, lambda cfg: [
+            np.sin(np.radians(90.0)),
+            np.cos(np.radians(90.0)),
+            cfg["surface_step"],
+        ]),
+        3:  (0, lambda cfg: [
+            np.sin(np.radians(135.0)),
+            np.cos(np.radians(135.0)),
+            cfg["surface_step"],
+        ]),
+        4:  (0, lambda cfg: [
+            np.sin(np.radians(180.0)),
+            np.cos(np.radians(180.0)),
+            cfg["surface_step"],
+        ]),
+        5:  (0, lambda cfg: [
+            np.sin(np.radians(225.0)),
+            np.cos(np.radians(225.0)),
+            cfg["surface_step"],
+        ]),
+        6:  (0, lambda cfg: [
+            np.sin(np.radians(270.0)),
+            np.cos(np.radians(270.0)),
+            cfg["surface_step"],
+        ]),
+        7:  (0, lambda cfg: [
+            np.sin(np.radians(315.0)),
+            np.cos(np.radians(315.0)),
+            cfg["surface_step"],
+        ]),
+        8:  (1, lambda cfg: [cfg["free_step"]]),
+        9:  (1, lambda cfg: [-cfg["free_step"]]),
+        10: (2, lambda cfg: [
+            np.sin(np.radians(
+                cfg["rotation_step"]
+            )),
+            np.cos(np.radians(
+                cfg["rotation_step"]
+            )),
+        ]),
+        11: (2, lambda cfg: [
+            np.sin(np.radians(
+                -cfg["rotation_step"]
+            )),
+            np.cos(np.radians(
+                -cfg["rotation_step"]
+            )),
+        ]),
+        12: (3, lambda cfg: [
+            np.sin(np.radians(
+                cfg["rotation_step"]
+            )),
+            np.cos(np.radians(
+                cfg["rotation_step"]
+            )),
+        ]),
+        13: (3, lambda cfg: [
+            np.sin(np.radians(
+                -cfg["rotation_step"]
+            )),
+            np.cos(np.radians(
+                -cfg["rotation_step"]
+            )),
+        ]),
+        14: (4, lambda cfg: [
+            np.sin(np.radians(
+                cfg["rotation_step"]
+            )),
+            np.cos(np.radians(
+                cfg["rotation_step"]
+            )),
+        ]),
+        15: (4, lambda cfg: [
+            np.sin(np.radians(
+                -cfg["rotation_step"]
+            )),
+            np.cos(np.radians(
+                -cfg["rotation_step"]
+            )),
+        ]),
+        16: (5, lambda cfg: [
+            cfg["rotation_step"],
+            cfg.get("orient_left_distance", 0.02),
+            cfg.get(
+                "orient_forward_distance", 0.05
+            ),
+        ]),
+        17: (6, lambda cfg: [
+            cfg["rotation_step"],
+            cfg.get(
+                "orient_down_distance", 0.02
+            ),
+            cfg.get(
+                "orient_forward_distance", 0.05
+            ),
+        ]),
+        18: (7, lambda cfg: []),
+        19: (1, lambda cfg: [
+            cfg.get("free_step_small", 2.0),
+        ]),
+        20: (3, lambda cfg: [
+            np.sin(np.radians(
+                cfg.get("rotation_step_big", 15.0)
+            )),
+            np.cos(np.radians(
+                cfg.get("rotation_step_big", 15.0)
+            )),
+        ]),
+        21: (3, lambda cfg: [
+            np.sin(np.radians(
+                -cfg.get(
+                    "rotation_step_big", 15.0
+                )
+            )),
+            np.cos(np.radians(
+                -cfg.get(
+                    "rotation_step_big", 15.0
+                )
+            )),
+        ]),
+        22: (2, lambda cfg: [
+            np.sin(np.radians(
+                cfg.get("rotation_step_big", 15.0)
+            )),
+            np.cos(np.radians(
+                cfg.get("rotation_step_big", 15.0)
+            )),
+        ]),
+        23: (2, lambda cfg: [
+            np.sin(np.radians(
+                -cfg.get(
+                    "rotation_step_big", 15.0
+                )
+            )),
+            np.cos(np.radians(
+                -cfg.get(
+                    "rotation_step_big", 15.0
+                )
+            )),
+        ]),
+    }
+
+    MESH_NAME_TO_ID = {
+        "cube": 0,
+        "cylinder": 1,
+        "mug": 2,
+        "cup": 3,
+        "vase": 4,
+        "thin_cylinder": 5,
+        "flat_square": 6,
+        "sphere": 7,
+        "cone": 8,
+    }
+
+    def __init__(self, config: Dict[str, Any], mesh_name: str = ""):
+        self.config = config
+        self.mesh_name = mesh_name
+        self.mesh_id = self.MESH_NAME_TO_ID.get(mesh_name, -1)
+
+    def convert_action(self, discrete_action: int):
+        action_type, params_fn = self.DISCRETE_TO_PSAC[discrete_action]
+        raw_params = params_fn(self.config)
+        padded_params = np.zeros(self.MAX_PARAMS, dtype=np.float32)
+        padded_params[:len(raw_params)] = raw_params
+        return action_type, padded_params
+
+    def convert_trajectory(
+        self,
+        transitions: List[Dict[str, Any]],
+        level: int = 0,
+    ) -> List[PSACTransition]:
+        result = []
+        for i, tr in enumerate(transitions):
+            action_type, action_params = self.convert_action(tr["action"])
+            next_state = (
+                transitions[i + 1]["state"]
+                if i + 1 < len(transitions)
+                else None
+            )
+            done = (i == len(transitions) - 1)
+            result.append(PSACTransition(
+                state=np.array(tr["state"], dtype=np.float32),
+                action_type=action_type,
+                action_params=action_params,
+                reward=float(tr["reward"]),
+                next_state=(
+                    np.array(next_state, dtype=np.float32)
+                    if next_state is not None
+                    else None
+                ),
+                done=done,
+                mesh_id=self.mesh_id,
+                level=level,
+            ))
+        return result
+
+    def convert_all_trajectories(
+        self,
+        all_trails: List[List[Dict[str, Any]]],
+        level: int = 0,
+    ) -> List[PSACTransition]:
+        all_transitions = []
+        for trail in all_trails:
+            all_transitions.extend(
+                self.convert_trajectory(trail, level=level)
+            )
+        return all_transitions
+    
+    @staticmethod
+    def get_param_dims() -> Dict[int, int]:
+        return {
+            0: 3,  # MoveTangentially: sin, cos, distance
+            1: 1,  # MoveLinear: distance
+            2: 2,  # Turn: sin, cos
+            3: 2,  # Look: sin, cos
+            4: 2,  # SensorRotate: sin, cos
+            5: 3,  # OrientHorizontal: rotation, left, forward
+            6: 3,  # OrientVertical: rotation, down, forward
+            7: 0,  # Detach: no params
+        }
+    
+    @staticmethod
+    def get_type_names() -> Dict[int, str]:
+        return {
+            0: "MoveTangentially",
+            1: "MoveLinear",
+            2: "Turn",
+            3: "Look",
+            4: "SensorRotate",
+            5: "OrientHorizontal",
+            6: "OrientVertical",
+            7: "Detach",
+        }

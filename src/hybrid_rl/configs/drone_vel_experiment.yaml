@@ -1,0 +1,335 @@
+experiment:
+  config:
+    seed: 42
+    do_train: true
+    do_eval: true
+    do_generate_demos: true
+
+    # ═══════════════════════════════════════════
+    # Environment
+    # ═══════════════════════════════════════════
+    flight_dome_size: 30.0
+    initial_altitude: 1.0
+    ctrl_freq: 48
+    pyb_freq: 240
+    render: false
+
+    # ═══════════════════════════════════════════
+    # Controller defaults (can be overridden per stage)
+    # ═══════════════════════════════════════════
+    rl_config:
+      gamma: 0.99
+      alpha: 0.1
+      cruise_speed: 0.8
+      slow_speed: 0.3
+      goal_reach_distance: 0.5
+      max_steps_per_goal: 6000
+      td_max_weight: 1.0
+
+      # Running Q stats for confidence adjustment
+      running_q_warmup: 500
+      running_q_window: 10000
+      v_boost_strength: 0.15
+      v_penalty_strength: 0.3
+      v_boost_max: 0.3
+      v_penalty_max: 0.5
+
+      # HNSW Q-store
+      max_points: 500000
+      k_neighbors: 7
+      insert_threshold: 0.50
+      norm_min_std: 0.1
+      norm_warmup_steps: 50000
+
+      feature_weights_go:
+        0: 2.0
+        1: 2.0
+        2: 2.0
+        3: 1.5
+        4: 0.3
+        5: 0.3
+        6: 0.5
+        7: 0.2
+        8: 0.2
+        9: 0.1
+        10: 1.0
+        11: 0.5
+        12: 2.0
+        13: 1.0
+        14: 0.5
+        15: 1.0
+        16: 1.0
+        17: 0.5
+        18: 0.5
+        19: 0.3
+        20: 0.5
+        21: 0.5
+        22: 0.5
+        23: 0.5
+        24: 0.5
+        25: 0.5
+        26: 0.5
+        27: 0.5
+
+      feature_weights_avoid:
+        0: 0.3
+        1: 0.3
+        2: 0.3
+        3: 0.3
+        4: 0.3
+        5: 0.3
+        6: 0.5
+        7: 0.2
+        8: 0.2
+        9: 0.1
+        10: 0.5
+        11: 0.5
+        12: 1.0
+        13: 0.3
+        14: 0.5
+        15: 1.0
+        16: 4.0
+        17: 3.0
+        18: 3.0
+        19: 1.0
+        20: 3.0
+        21: 2.5
+        22: 3.0
+        23: 2.5
+        24: 2.0
+        25: 2.5
+        26: 3.0
+        27: 2.5
+
+      # Heuristic
+      heuristic_approach_strength: 10.0
+      heuristic_altitude_strength: 8.0
+      heuristic_stabilize_strength: 5.0
+      heuristic_avoid_strength: 10.0
+      warmup_episodes: 30
+
+      # Obstacle avoidance
+      avoid_enter_dist: 1.5
+      avoid_exit_dist: 2.0
+      ray_max_dist: 3.0
+      ray_count: 8
+      phase_min_steps: 30
+      avoid_proximity_ratio: 0.35
+      avoid_max_steps: 500
+
+      # Potential field
+      potential_field_attract: 0.3
+      potential_field_repulse: 1.0
+      potential_field_tangent: 0.8
+      repulse_max_boost: 2.0
+      vertical_escape_strength: 0.5
+
+      # Rewards
+      reward_goal_reached: 100.0
+      reward_collision: -100.0
+      reward_out_of_bounds: -50.0
+      reward_timeout: -20.0
+      reward_progress: 5.0
+      reward_alignment: 0.3
+      reward_step_penalty: -0.1
+      reward_hover_bonus: 0.5
+      reward_obstacle_proximity: -2.0
+      reward_avoid_alignment: 0.3
+      reward_progress_in_avoid: 0.0
+      reward_obstacle_cleared: 5.0
+      reward_obstacle_progress: 0.5
+      reward_altitude_penalty: -1.0
+      reward_oscillation_penalty: -0.3
+      reward_stuck_penalty: -0.5
+      oscillation_threshold: 5
+
+      # Stuck detection
+      stuck_window: 200
+      stuck_efficiency_threshold: 0.15
+      stuck_min_path: 0.5
+      stuck_max_steps: 200
+      stuck_random_base: 0.15
+      stuck_random_growth: 0.001
+      stuck_random_max: 0.5
+
+      # Backup
+      success_backup_steps: 50
+      success_backup_alpha_multiplier: 2.0
+      success_backup_lambda: 0.95
+      collision_backup_steps: 50
+      collision_backup_alpha_multiplier: 1.5
+      collision_backup_lambda: 0.95
+
+      # HER
+      do_her: false
+      her_virtual_goals: 3
+      her_backup_steps: 15
+      her_alpha: 0.3
+      her_goal_reward: 0.5
+
+      # Eval
+      eval_epsilon: 0.3
+      eval_alpha_multiplier: 0.1
+
+    # ═══════════════════════════════════════════
+    # Demonstrations
+    # ═══════════════════════════════════════════
+    demo_config:
+      output_dir: demos
+      demo_path: demos/trap_demonstrations.npz
+      demo_learning_rate: 0.8
+      demo_reward_bonus: 0.5
+      repeats: 5
+
+    # ═══════════════════════════════════════════
+    # Training stages
+    # Each stage = fixed environment + learning params
+    # Stages run sequentially, Q-store carries over
+    # ═══════════════════════════════════════════
+    training_stages:
+      # ── Phase 1: Learn to fly ──
+      #- name: short_no_obs
+      #  episodes: 100
+      #  epsilon_start: 1.0
+      #  epsilon_min: 0.15
+      #  warmup_episodes: 50
+      #  load_mode: null
+      #  # Goal generation
+      #  min_dist: 2.0
+      #  max_dist: 4.0
+      #  min_altitude: 1.0
+      #  max_altitude: 3.0
+      #  # Obstacles
+      #  obstacles: false
+      #  num_obstacles: 0
+      #  trap_ratio: 0.0
+
+      #- name: medium_no_obs
+      #  episodes: 300
+      #  epsilon_start: 0.5
+      #  epsilon_min: 0.10
+      #  warmup_episodes: 30
+      #  load_mode: auto
+      #  min_dist: 4.0
+      #  max_dist: 6.0
+      #  min_altitude: 0.3
+      #  max_altitude: 4.0
+      #  obstacles: false
+      #  num_obstacles: 0
+      #  trap_ratio: 0.0
+
+      # ── Phase 2: Learn obstacles ──
+      #- name: short_with_obs
+      #  episodes: 300
+      #  epsilon_start: 1.0
+      #  epsilon_min: 0.10
+      #  warmup_episodes: 50
+      #  load_mode: null
+      #  min_dist: 2.0
+      #  max_dist: 4.0
+      #  min_altitude: 0.3
+      #  max_altitude: 3.0
+      #  obstacles: true
+      #  num_obstacles: 3
+      #  trap_ratio: 0.10
+
+      - name: medium_with_obs
+        episodes: 300
+        epsilon_start: 1.0
+        epsilon_min: 0.5
+        warmup_episodes: 50
+        load_mode: null
+        min_dist: 4.0
+        max_dist: 8.0
+        min_altitude: 0.3
+        max_altitude: 4.0
+        obstacles: true
+        num_obstacles: 3
+        trap_ratio: 0.1
+
+      # ── Phase 3: Hard scenarios ──
+      - name: far_dense_obs
+        episodes: 300
+        epsilon_start: 1.0
+        epsilon_min: 0.5
+        warmup_episodes: 50
+        load_mode: auto
+        min_dist: 6.0
+        max_dist: 10.0
+        min_altitude: 0.3
+        max_altitude: 5.0
+        obstacles: true
+        num_obstacles: 5
+        trap_ratio: 0.2
+
+      # ── Phase 4: Hardening with traps ──
+      - name: hardening_traps
+        episodes: 300
+        epsilon_start: 0.5
+        epsilon_min: 0.1
+        warmup_episodes: 0
+        load_mode: auto
+        min_dist: 3.0
+        max_dist: 8.0
+        min_altitude: 0.3
+        max_altitude: 4.0
+        obstacles: true
+        num_obstacles: 5
+        trap_ratio: 0.20
+
+    # ═══════════════════════════════════════════
+    # Evaluation
+    # ═══════════════════════════════════════════
+    eval_stages:
+      #- name: eval_short_no_obs
+      #  episodes: 100
+      #  min_dist: 2.0
+      #  max_dist: 4.0
+      #  min_altitude: 0.3
+      #  max_altitude: 3.0
+      #  obstacles: false
+      #  num_obstacles: 0
+      #  trap_ratio: 0.0
+
+      - name: eval_medium_with_obs
+        episodes: 100
+        min_dist: 4.0
+        max_dist: 8.0
+        min_altitude: 0.3
+        max_altitude: 4.0
+        obstacles: true
+        num_obstacles: 3
+        trap_ratio: 0.1
+
+      - name: eval_far_dense
+        episodes: 100
+        min_dist: 6.0
+        max_dist: 10.0
+        min_altitude: 0.3
+        max_altitude: 5.0
+        obstacles: true
+        num_obstacles: 5
+        trap_ratio: 0.2
+
+      #- name: eval_traps_only
+      #  episodes: 100
+      #  min_dist: 3.0
+      #  max_dist: 8.0
+      #  min_altitude: 0.3
+      #  max_altitude: 4.0
+      #  obstacles: true
+      #  num_obstacles: 5
+      #  trap_ratio: 1.0
+
+    eval_seeds: [44]
+
+    # ═══════════════════════════════════════════
+    # Logging
+    # ═══════════════════════════════════════════
+    logging:
+      run_name: drone-vel-baseline
+      output_dir: results/drone_vel
+      checkpoint_dir: checkpoints/drone_vel
+      save_every: 100
+      log_every: 50
+      debug: true
