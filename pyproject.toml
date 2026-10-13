@@ -1,9 +1,4 @@
-[build-system]
-requires = ["setuptools>=61.0.0", "wheel"]
-build-backend = "setuptools.build_meta"
-
-[project]
-name = "hybrid-rl"
+name = "hybrid_rl"
 version = "0.1.0"
 description = "Bio-inspired hybrid RL system for goal-directed 3D navigation"
 readme = "README.md"
@@ -28,41 +23,41 @@ classifiers = [
 ]
 
 dependencies = [
-    "numpy>=1.24",
+    "numpy>=1.21",
+    "scipy>=1.10",
+    "torch",
     "hnswlib>=0.7",
     "trimesh>=4.0",
     "pyyaml>=6.0",
-    "pybullet",
-    # Прямая ссылка на Git-репозиторий оформляется через @ и ключевое слово git+
-    "gym-pybullet-drones @ git+https://github.com/utiasDSL/gym-pybullet-drones.git",
     "rtree",
-    "manifold3d",
-    "pyrender",
-    "omegaconf"
+    "omegaconf",
 ]
 
 [project.optional-dependencies]
+drones = [
+    "pybullet",
+    "gym-pybullet-drones @ git+https://github.com/utiasDSL/gym-pybullet-drones.git",
+]
+viz = [
+    "pyrender",
+    "manifold3d",
+]
 dev = [
-    # Check for undeclared dependencies
     "deptry",
-
-    # Python static type checker
     "mypy==1.11.2",
-
-    # Testing, code style, etc...
     "pytest==7.1.1",
     "pytest-xdist==2.5.0",
     "pytest-cov==3.0.0",
-
-    # Python linter and formatter
     "ruff==0.14.2",
+]
+all = [
+    "hybrid_rl[drones,viz,dev]",
 ]
 
 [project.urls]
-Homepage = "https://github.com/h555yand/hybrid-rl"
-Documentation = "https://github.com/h555yand/hybrid-rl"
-Repository = "https://github.com/h555yand/hybrid-rl"
-Issues = "https://github.com/h555yand/hybrid-rl/issues"
+Homepage = "https://github.com/h555yand/hybrid_rl"
+Repository = "https://github.com/h555yand/hybrid_rl"
+Issues = "https://github.com/h555yand/hybrid_rl/issues"
 
 [tool.setuptools.packages.find]
 include = ["hybrid_rl*"]
