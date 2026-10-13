@@ -1,4 +1,19 @@
 # Bio-Inspired Hybrid RL for goal-directed 3D Navigation
+We present a hybrid reinforcement learning system for goal-directed navigation on 3D environemnt. The system combines three complementary learning mechanisms 
+ - **episodic memory** (kernel-based Q-learning with HNSW nearest-neighbor search)
+ - **learned skills** (Soft Actor-Critic with continuous actions)
+ - **geometric heuristics** (hand-crafted domain knowledge).
+
+**Adaptive arbitrator** selects the best action source per step based on confidence and track record.
+
+The architecture is inspired by biological memory systems: 
+- episodic memory provides one-shot learning and fast adaptation (hippocampal analogy)
+- parametric policy captures generalized skills through repetition (procedural memory analogy)
+- arbitrator implements a metacognitive switching mechanism between behavior modes.
+
+We validate the approach for:
+- [3D object surfaces navigation](# Bio-Inspired Hybrid RL for 3D Object Navigation)
+- drone air navigation
 
 # Bio-Inspired Hybrid RL for 3D Object Navigation
 ## Abstract
