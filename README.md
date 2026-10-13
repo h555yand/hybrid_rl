@@ -12,8 +12,13 @@ The architecture is inspired by biological memory systems:
 - arbitrator implements a metacognitive switching mechanism between behavior modes.
 
 We validate the approach for:
-- [3D object surfaces navigation](# Bio-Inspired Hybrid RL for 3D Object Navigation)
-- drone air navigation
+- [3D object surfaces navigation](#bio-inspired-hybrid-rl-for-3d-object-navigation)
+- [drone air navigation](#bio-inspired-hybrid-rl-for-drone-air-navigation)
+
+
+---
+---
+---
 
 # Bio-Inspired Hybrid RL for 3D Object Navigation
 ## Abstract
@@ -888,7 +893,7 @@ The case study with Monty demonstrates that replacing teleportation with realist
 The architecture is designed for extensibility: new environments implement a minimal protocol, new knowledge sources feed into the universal Q-store interface, and the adaptive arbitrator self-regulates without manual intervention. The path from simulation to real robot deployment requires only a new environment adapter — the learning system, state representation, and arbitration logic remain unchanged.
 
 
-# Bio-Inspired Hybrid RL for Drone Navigation
+# Bio-Inspired Hybrid RL for Drone Air Navigation
 
 ## Abstract
 
