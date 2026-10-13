@@ -727,6 +727,8 @@ Conservative hyperparameters that prevent catastrophic forgetting also prevent f
 
 The Thousand Brains Project's **Monty** system recognizes objects by accumulating evidence for hypotheses (object identity × pose) as a sensor agent explores object surfaces. The standard approach uses **teleportation** (`JumpToGoalState`) to instantly move the agent to target points selected by the Goal State Generator (GSG). We replaced teleportation with our RL surface navigation system, preserving Monty's recognition pipeline while adding biologically plausible movement.
 
+[Monty fork](https://github.com/h555yand/tbp.monty/tree/hybrid_rl)
+
 ### Integration Architecture
 
 ```
