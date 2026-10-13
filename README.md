@@ -1452,7 +1452,7 @@ The body-frame state representation is designed for transfer. A real drone needs
 If you use this code in your research, please cite:
 
 ```bibtex
-@software{yourname2025hybridrl,
+@software{AlekseyIsaev2026hybridrl,
   author = {Aleksey Isaev},
   title = {Bio-Inspired Hybrid RL for 3D Navigation},
   year = {2026},
