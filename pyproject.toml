@@ -65,4 +65,5 @@ Repository = "https://github.com/h555yand/hybrid_rl"
 Issues = "https://github.com/h555yand/hybrid_rl/issues"
 
 [tool.setuptools.packages.find]
+where = ["src"]
 include = ["hybrid_rl*"]
