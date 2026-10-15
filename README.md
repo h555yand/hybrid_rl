@@ -13,7 +13,7 @@ The architecture is inspired by biological memory systems:
 
 We validate the approach for:
 - [3D object surfaces navigation](#bio-inspired-hybrid-rl-for-3d-object-navigation)
-- [drone air navigation](#bio-inspired-hybrid-rl-for-drone-air-navigation)
+- [Drone air navigation](#bio-inspired-hybrid-rl-for-drone-air-navigation)
 
 
 ---
@@ -892,9 +892,13 @@ The case study with Monty demonstrates that replacing teleportation with realist
 
 The architecture is designed for extensibility: new environments implement a minimal protocol, new knowledge sources feed into the universal Q-store interface, and the adaptive arbitrator self-regulates without manual intervention. The path from simulation to real robot deployment requires only a new environment adapter — the learning system, state representation, and arbitration logic remain unchanged.
 
+## 17. Getting Started
+- modify src/hybrid_rl/configs/rl_goal_approach.yaml
+- run src/hybrid_rl/envs/run_experiment_surf.py
 
+---
 # Bio-Inspired Hybrid RL for Drone Air Navigation
-
+---
 ## Abstract
 
 We extend the hybrid reinforcement learning architecture originally developed for 
@@ -1446,7 +1450,11 @@ Replace hand-crafted waypoints with RRT path planning through procedurally gener
 ### Sim-to-Real Transfer
 The body-frame state representation is designed for transfer. A real drone needs only to provide the same 28D state vector from its sensors (IMU for velocity/angular rates, depth camera for obstacle rays, GPS/SLAM for goal direction). The parent project demonstrated 74% success on YCB objects in MuJoCo without retraining — the same transfer mechanism applies.
 
+## 13. Getting Started
+- modify src/hybrid_rl/configs/drone_vel_experiment.yaml
+- run src/hybrid_rl/envs/run_experiment_drone.py
 
+---
 ## Citation
 
 If you use this code in your research, please cite:
