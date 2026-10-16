@@ -1076,8 +1076,8 @@ class RLGoalApproachExperiment:
             "eval_epsilon": 1.0,
             "temperature_override": 0.01,
             "strategic_eval_epsilon": 1.0,
-            "air_start_enabled": True,
-            "air_start_in_eval": True,
+            "air_start_enabled": False,
+            "air_start_in_eval": False,
         }
 
         all_heuristic_results: dict[str, Any] = {}

@@ -4592,15 +4592,17 @@ class RLGoalApproachController:
     ) -> Optional[np.ndarray]:
         """Compute surface-tangent direction toward edge when path is blocked.
 
-        Projects goal direction onto tangent plane. This naturally points
-        toward the nearest edge/corner that leads around the obstacle
-        to the goal.
+        When same_side=False: always crawl toward rim (open edge).
+        The rim is the only surface path to the other side.
+        Goal direction is misleading — goal is behind the wall.
 
-        When projection degenerates (alignment ≈ -1.0, goal directly behind
-        normal), falls back to crawling toward the nearest edge along the
-        height axis on the goal's side. This prevents oscillation at the
-        "equator" of curved objects (cylinders, cones) where goal_dir
-        is parallel to the surface normal.
+        When same_side=True: project goal direction onto tangent plane.
+        This naturally points toward the nearest edge/corner that
+        leads around the obstacle to the goal.
+
+        When projection degenerates (alignment ≈ -1.0, goal directly
+        behind normal), falls back to crawling toward the nearest
+        edge along the height axis.
 
         Args:
             current_pose: Agent pose.
@@ -4618,27 +4620,54 @@ class RLGoalApproachController:
             return None
         n /= n_len
 
-        # Project goal direction onto tangent plane
+        same_side = sensor_data.get("same_side", True)
+
+        # ═══ Different sides — always crawl toward rim ═══
+        if not same_side:
+            up_dir = np.asarray(
+                sensor_data.get("up_direction", [0, 1, 0]),
+                dtype=float,
+            )
+            # Always toward rim — the only surface path
+            # to the other side. same_side will flip to True
+            # once agent crosses onto the other side's surface.
+            edge_dir = up_dir
+
+            # Project onto tangent plane
+            crawl_dir = edge_dir - np.dot(edge_dir, n) * n
+            crawl_len = np.linalg.norm(crawl_dir)
+
+            if crawl_len < 1e-8:
+                # Normal is parallel to up (horizontal surface
+                # like bottom) — crawl away from center toward
+                # the nearest wall
+                center = np.asarray(
+                    sensor_data.get(
+                        "object_center", [0, 0, 0]
+                    ),
+                    dtype=float,
+                )
+                away = current_pose[:3] - center
+                crawl_dir = away - np.dot(away, n) * n
+                crawl_len = np.linalg.norm(crawl_dir)
+                if crawl_len < 1e-8:
+                    return None
+
+            return crawl_dir / crawl_len
+
+        # ═══ Same side — project goal direction ═══
         goal_dir = self._current_goal[:3] - current_pose[:3]
         crawl_dir = goal_dir - np.dot(goal_dir, n) * n
 
         crawl_len = np.linalg.norm(crawl_dir)
         distance = float(np.linalg.norm(goal_dir))
 
-        # ═══ Degenerate case: goal directly behind normal ═══
-        # CHANGED: use relative threshold (crawl_len / distance < 0.15)
-        # instead of absolute. On curved surfaces near the "equator"
-        # (where goal_dir is nearly parallel to normal), the tangent
-        # projection can be small but non-zero (e.g., 4.6mm at dist=38mm).
-        # Absolute threshold misses these cases; relative threshold
-        # catches them reliably across all object sizes.
-        #
-        # crawl_len < 1.0: absolute minimum (complete degeneration)
-        # ratio < 0.15: projection is < 15% of distance = unstable
-        # distance > 10.0: don't apply ratio when very close to goal
         degenerate = (
             crawl_len < 1.0
-            or (distance > 10.0 and crawl_len / max(distance, 1e-8) < 0.15)
+            or (
+                distance > 10.0
+                and crawl_len / max(distance, 1e-8) < 0.15
+            )
         )
 
         if degenerate:
@@ -4651,12 +4680,17 @@ class RLGoalApproachController:
                 dtype=float,
             )
 
-            # Which edge is on the goal's side?
             goal_height = float(
-                np.dot(self._current_goal[:3] - center, up_dir)
+                np.dot(
+                    self._current_goal[:3] - center,
+                    up_dir,
+                )
             )
             agent_height = float(
-                np.dot(current_pose[:3] - center, up_dir)
+                np.dot(
+                    current_pose[:3] - center,
+                    up_dir,
+                )
             )
 
             if abs(goal_height - agent_height) < 1.0:
@@ -4664,12 +4698,21 @@ class RLGoalApproachController:
                 extents = sensor_data.get(
                     "object_extents", [84, 84, 84]
                 )
-                height_axis = int(np.argmax(np.abs(up_dir)))
-                half_height = extents[height_axis] / 2.0
-                dist_to_top = half_height - agent_height
-                dist_to_bottom = agent_height + half_height
+                height_axis = int(
+                    np.argmax(np.abs(up_dir))
+                )
+                half_height = (
+                    extents[height_axis] / 2.0
+                )
+                dist_to_top = (
+                    half_height - agent_height
+                )
+                dist_to_bottom = (
+                    agent_height + half_height
+                )
                 edge_dir = (
-                    -up_dir if dist_to_bottom < dist_to_top
+                    -up_dir
+                    if dist_to_bottom < dist_to_top
                     else up_dir
                 )
             elif goal_height < agent_height:
@@ -4689,56 +4732,6 @@ class RLGoalApproachController:
                     return None
 
         return crawl_dir / crawl_len
-
-    def _compute_crawl_to_edge_direction_old(
-        self,
-        current_pose: np.ndarray,
-        sensor_data: Dict[str, Any],
-    ) -> Optional[np.ndarray]:
-        """Compute surface-tangent direction toward edge when path is blocked.
-
-        Projects goal direction onto tangent plane. This naturally points
-        toward the nearest edge/corner that leads around the obstacle
-        to the goal.
-
-        If goal projection is degenerate (goal directly behind normal),
-        crawls away from object center toward nearest edge.
-
-        Args:
-            current_pose: Agent pose.
-            sensor_data: Current sensor readings.
-
-        Returns:
-            Unit vector in world space (tangent to surface), or None.
-        """
-        normal = sensor_data.get("point_normal")
-        if normal is None:
-            return None
-        n = np.asarray(normal, dtype=float)
-        n_len = np.linalg.norm(n)
-        if n_len < 1e-8:
-            return None
-        n /= n_len
-
-        # Project goal direction onto tangent plane
-        goal_dir = self._current_goal[:3] - current_pose[:3]
-        crawl_dir = goal_dir - np.dot(goal_dir, n) * n
-
-        crawl_len = np.linalg.norm(crawl_dir)
-        if crawl_len < 1e-8:
-            # Goal directly behind normal — crawl away from center
-            center = np.asarray(
-                sensor_data.get("object_center", [0, 0, 0]),
-                dtype=float,
-            )
-            away = current_pose[:3] - center
-            crawl_dir = away - np.dot(away, n) * n
-            crawl_len = np.linalg.norm(crawl_dir)
-            if crawl_len < 1e-8:
-                return None
-
-        return crawl_dir / crawl_len
-
 
     def _compute_detach_fly_direction(
         self,
