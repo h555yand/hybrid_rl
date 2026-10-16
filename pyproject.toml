@@ -36,6 +36,8 @@ dependencies = [
     "pyyaml>=6.0",
     "rtree",
     "omegaconf",
+    "pyglet<2",
+    "opencv-python"
 ]
 
 [project.optional-dependencies]

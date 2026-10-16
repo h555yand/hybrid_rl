@@ -2143,7 +2143,7 @@ class LightweightEnv:
 
             merged.save(filepath, format="PNG")
 
-        except Exception:
+        except Exception as exc:
             # Fallback: save text file
             txt_path = _Path(filepath).with_suffix(".txt")
             with txt_path.open("w") as f:

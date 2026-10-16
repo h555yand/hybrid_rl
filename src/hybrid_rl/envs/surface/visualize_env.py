@@ -264,7 +264,7 @@ def create_video_from_frames(
                 writer.write(cv2.imread(p))
             writer.release()
             return output_path
-        except Exception:
+        except Exception as exc:
             logger.warning("Video creation skipped: %s", episode_dir)
             return None
 
