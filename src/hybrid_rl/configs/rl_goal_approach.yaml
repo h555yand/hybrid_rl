@@ -1,10 +1,10 @@
 seed: 42
 # Visualization: null | text | pictures | video
-visualise: video
+visualise: text
 regenerate_scripts: true
-do_train: true
+do_train: false
 do_eval: false
-do_heur_eval: false
+do_heur_eval: true
 do_bc_train: false
 do_sac_train: false
 do_sac_eval: false
@@ -163,37 +163,37 @@ eval_meshes:
       - {same_side: true, path_blocked: false}
       - {same_side: true, path_blocked: true}
       - {}
-  #- mesh: sphere
-  #  curriculum_filters:
-  #    - {same_side: true, path_blocked: false}
-  #    - {same_side: true, path_blocked: true}
-  #    - {}
-  #- mesh: cylinder
-  #  curriculum_filters:
-  #    - {same_side: true, path_blocked: false}
-  #    - {same_side: true, path_blocked: true}
-  #    - {}
-  #- mesh: flat_square
-  #  curriculum_filters:
-  #    - {same_side: true, path_blocked: false}
-  #    - {same_side: true, path_blocked: true}
-  #    - {}
-  #- mesh: cone
-  #  curriculum_filters:
-  #    - {same_side: true, path_blocked: false}
-  #    - {same_side: true, path_blocked: true}
-  #    - {}
-  #- mesh: thin_cylinder
-  #  curriculum_filters:
-  #    - {same_side: true, path_blocked: false}
-  #    - {same_side: true, path_blocked: true}
-  #    - {}
+  - mesh: sphere
+    curriculum_filters:
+      - {same_side: true, path_blocked: false}
+      - {same_side: true, path_blocked: true}
+      - {}
+  - mesh: cylinder
+    curriculum_filters:
+      - {same_side: true, path_blocked: false}
+      - {same_side: true, path_blocked: true}
+      - {}
+  - mesh: flat_square
+    curriculum_filters:
+      - {same_side: true, path_blocked: false}
+      - {same_side: true, path_blocked: true}
+      - {}
+  - mesh: cone
+    curriculum_filters:
+      - {same_side: true, path_blocked: false}
+      - {same_side: true, path_blocked: true}
+      - {}
+  - mesh: thin_cylinder
+    curriculum_filters:
+      - {same_side: true, path_blocked: false}
+      - {same_side: true, path_blocked: true}
+      - {}
   # Train set — hollow
-  #- vase
-  #- mug
+  - vase
+  - mug
   # Held-out — hollow
-  #- mesh: cup
-  #  pool_seed: 57
+  - mesh: cup
+    pool_seed: 57
 
 eval_episodes_per_level: 100
 
