@@ -89,9 +89,12 @@ def run_eval_per_seed(  # noqa: PLR0913
 
     for train_seed, eval_seed in zip(train_seeds, eval_seeds):
         seed_results: dict[str, Any] = {}
-        load_dir = str(
-            runs_dir / f"{variant.lower()}_seed_{train_seed}"
-        )
+        if log_prefix == "heuristic":
+            load_dir = None
+        else:
+            load_dir = str(
+                runs_dir / f"{variant.lower()}_seed_{train_seed}"
+            )
 
         for level_idx in range(num_levels):
             level_pool = eval_pools[eval_seed]["levels"][level_idx]
