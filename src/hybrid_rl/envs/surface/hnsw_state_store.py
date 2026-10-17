@@ -963,6 +963,29 @@ class HNSWStateStore:
 
         return result
 
+    def get_nearest_visits(self, state: np.ndarray) -> int:
+        """Get visit count of nearest neighbor.
+        
+        Used by strategic blend to estimate Q-value confidence.
+        Returns 0 if store is empty or no close neighbor found.
+        """
+        if self.next_id == 0:
+            return 0
+        
+        norm_state = self._normalize(state)
+        labels, distances = self._index.knn_query(
+            norm_state.reshape(1, -1), k=1
+        )
+        
+        label = labels[0][0]
+        dist_sq = distances[0][0]
+        
+        # Only count visits if neighbor is reasonably close
+        if dist_sq > (self.insert_threshold * 3.0) ** 2:
+            return 0
+        
+        return self.points[label].visit_count
+
     # ══════════════════════════════════════════════════════════
     # PERSISTENCE
     # ══════════════════════════════════════════════════════════

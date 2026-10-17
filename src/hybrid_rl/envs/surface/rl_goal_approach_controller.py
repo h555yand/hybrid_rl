@@ -2170,18 +2170,16 @@ class RLGoalApproachController:
                     current_phase, on_object=True
                 )
 
-                has_data = (
-                    self.strategic_detach.next_id > 0
-                    and np.max(np.abs(strategic_q)) > 1e-6
+                strategic_combined, blend_debug = self._strategic_blend(
+                    q_values=strategic_q,
+                    h_values=strategic_h,
+                    epsilon=s_eps,
+                    store=self.strategic_detach,
+                    t_state=t_state,
+                    q_scale=0.3,
+                    h_scale=3.0,
+                    min_visits=15,
                 )
-                if has_data:
-                    sq_norm = self._normalize_values(strategic_q)
-                    sh_norm = self._normalize_values(strategic_h)
-                    strategic_combined = (
-                        (1 - s_eps) * sq_norm + s_eps * sh_norm
-                    )
-                else:
-                    strategic_combined = strategic_h.copy()
 
                 should_switch = (
                     strategic_combined[1] > strategic_combined[0]
@@ -2190,22 +2188,22 @@ class RLGoalApproachController:
                 if (
                     should_switch
                     and self._can_detach(state)
-                    and (path_blocked)
+                    and path_blocked
                 ):
-                    action_index = (
-                        self.action_space.IDX_DETACH
-                    )
+                    action_index = self.action_space.IDX_DETACH
                     strategic_source = (
                         f"detach_switch("
                         f"q=[{strategic_q[0]:.2f},"
                         f"{strategic_q[1]:.2f}],"
                         f"h=[{strategic_h[0]:.1f},"
                         f"{strategic_h[1]:.1f}],"
+                        f"vis={blend_debug['nn_visits']},"
+                        f"qw={blend_debug['q_weight']:.2f},"
+                        f"bm={blend_debug['blended_margin']:.3f},"
                         f"eps={s_eps:.2f})"
                     )
                     self._strategic_stats["detach_memory_triggered"] += 1
 
-                    # ═══ CHANGED: сохраняем контекст для ретроспективного обучения ═══
                     self._pending_strategic_detach.append({
                         "state": t_state.copy(),
                         "step": len(self._episode_transitions),
@@ -2222,6 +2220,9 @@ class RLGoalApproachController:
                             f"detach_stay("
                             f"q=[{strategic_q[0]:.2f},"
                             f"{strategic_q[1]:.2f}],"
+                            f"vis={blend_debug['nn_visits']},"
+                            f"qw={blend_debug['q_weight']:.2f},"
+                            f"bm={blend_debug['blended_margin']:.3f},"
                             f"eps={s_eps:.2f})"
                         )
                         self._strategic_stats[
@@ -2236,7 +2237,6 @@ class RLGoalApproachController:
                     d_state
                 )
 
-                # Fixed semantics: action=0=fly_to_goal, action=1=bypass
                 path_blocked = sensor_data.get("path_blocked", False)
 
                 strategic_h = np.zeros(2)
@@ -2247,18 +2247,16 @@ class RLGoalApproachController:
                     strategic_h[0] += 3.0
                     strategic_h[1] -= 3.0
 
-                has_data = (
-                    self.strategic_direction.next_id > 0
-                    and np.max(np.abs(strategic_q)) > 1e-6
+                dir_combined, dir_blend_debug = self._strategic_blend(
+                    q_values=strategic_q,
+                    h_values=strategic_h,
+                    epsilon=s_eps,
+                    store=self.strategic_direction,
+                    t_state=d_state,
+                    q_scale=0.2,
+                    h_scale=3.0,
+                    min_visits=10,
                 )
-                if has_data:
-                    sq_norm = self._normalize_values(strategic_q)
-                    sh_norm = self._normalize_values(strategic_h)
-                    dir_combined = (
-                        (1 - s_eps) * sq_norm + s_eps * sh_norm
-                    )
-                else:
-                    dir_combined = strategic_h.copy()
 
                 should_bypass = dir_combined[1] > dir_combined[0]
 
@@ -2271,6 +2269,9 @@ class RLGoalApproachController:
                         f"{strategic_q[1]:.2f}],"
                         f"h=[{strategic_h[0]:.1f},"
                         f"{strategic_h[1]:.1f}],"
+                        f"vis={dir_blend_debug['nn_visits']},"
+                        f"qw={dir_blend_debug['q_weight']:.2f},"
+                        f"bm={dir_blend_debug['blended_margin']:.3f},"
                         f"eps={s_eps:.2f})"
                     )
                     self._strategic_stats[
@@ -2286,6 +2287,9 @@ class RLGoalApproachController:
                         f"{strategic_q[1]:.2f}],"
                         f"h=[{strategic_h[0]:.1f},"
                         f"{strategic_h[1]:.1f}],"
+                        f"vis={dir_blend_debug['nn_visits']},"
+                        f"qw={dir_blend_debug['q_weight']:.2f},"
+                        f"bm={dir_blend_debug['blended_margin']:.3f},"
                         f"eps={s_eps:.2f})"
                     )
                     self._strategic_stats[
@@ -2312,7 +2316,6 @@ class RLGoalApproachController:
                 valid_mask = np.ones(
                     self.num_actions, dtype=bool
                 )
-                # Apply same mask logic
                 masked_check = self.apply_action_mask(
                     np.zeros(self.num_actions), state
                 )
@@ -2358,9 +2361,9 @@ class RLGoalApproachController:
                     "phase_was_detach_needed": (
                         current_phase == "DETACH_NEEDED"
                     ),
-                    "same_side_before": same_side,           # NEW
-                    "path_blocked_before": path_blocked,     # NEW
-                    "dist_before": float(state[13]),         # NEW
+                    "same_side_before": same_side,
+                    "path_blocked_before": path_blocked,
+                    "dist_before": float(state[13]),
                 })
 
         self._prev_phase = current_phase
@@ -2474,7 +2477,6 @@ class RLGoalApproachController:
             f"{current_pose[2]:.1f}]"
         )
 
-        # ═══ Fly debug ═══
         fly_debug_str = ""
         if current_phase == "FLY_TO_EDGE":
             if hasattr(self, '_fly_edge_debug') and self._fly_edge_debug:
@@ -2520,7 +2522,60 @@ class RLGoalApproachController:
             and not last_was_detach
             and not close_to_goal
         )
-    
+
+    def _strategic_blend(
+        self,
+        q_values: np.ndarray,      # [q_stay, q_switch] raw from store
+        h_values: np.ndarray,      # [h_stay, h_switch] from heuristic
+        epsilon: float,             # strategic epsilon
+        store: HNSWStateStore,      # for visit count
+        t_state: np.ndarray,        # query state (5D)
+        q_scale: float = 0.3,      # typical Q margin magnitude
+        h_scale: float = 3.0,      # typical H margin magnitude
+        min_visits: int = 15,       # visits needed for full Q trust
+    ) -> Tuple[np.ndarray, dict]:
+        """Blend Q and heuristic for binary strategic decision.
+        
+        Solves two problems:
+        1. Scale mismatch: Q in [-1,+1], H in [-3,+3] — tanh normalizes both
+        2. Low data: visit-based confidence gates Q influence
+        
+        At low visits: pure heuristic (safe default)
+        At high visits + low epsilon: Q dominates (learned behavior)
+        """
+        q_margin = float(q_values[1] - q_values[0])
+        h_margin = float(h_values[1] - h_values[0])
+        
+        # Normalize margins to [-1, +1] via tanh
+        q_signal = float(np.tanh(q_margin / max(q_scale, 1e-8)))
+        h_signal = float(np.tanh(h_margin / max(h_scale, 1e-8)))
+        
+        # Visit-based confidence: 0 at 0 visits, 1.0 at min_visits
+        nn_visits = store.get_nearest_visits(t_state)
+        q_confidence = float(np.clip(nn_visits / max(min_visits, 1), 0.0, 1.0))
+        
+        # Weights: Q gets weight only when confident AND epsilon allows
+        q_weight = (1.0 - epsilon) * q_confidence
+        h_weight = 1.0 - q_weight
+        
+        blended_margin = q_weight * q_signal + h_weight * h_signal
+        
+        result = np.array([-blended_margin / 2.0, blended_margin / 2.0])
+        
+        debug = {
+            "q_margin": round(q_margin, 4),
+            "h_margin": round(h_margin, 4),
+            "q_signal": round(q_signal, 3),
+            "h_signal": round(h_signal, 3),
+            "nn_visits": nn_visits,
+            "q_confidence": round(q_confidence, 3),
+            "q_weight": round(q_weight, 3),
+            "h_weight": round(h_weight, 3),
+            "blended_margin": round(blended_margin, 4),
+        }
+        
+        return result, debug
+
     def _is_making_orbit_progress(self, window: int = 5) -> bool:
         """Check if agent is making progress while orbiting.
 
