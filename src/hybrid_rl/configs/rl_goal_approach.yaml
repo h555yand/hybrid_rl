@@ -2,13 +2,13 @@ seed: 42
 # Visualization: null | text | pictures | video
 visualise: text
 regenerate_scripts: true
-do_train: true
-do_eval: true
+do_train: false
+do_eval: false
 do_heur_eval: false
 do_bc_train: false
 do_sac_train: false
 do_sac_eval: false
-do_adaptive: false
+do_adaptive: true
 do_ycb_eval: false
 
 train_seeds: [11]
@@ -333,20 +333,20 @@ sac_config:
   use_cql: true
   cql_alpha: 1.0
 
-#sac_episodes_per_mesh:
-  #cube: 500
-  #sphere: 500
-  #cylinder: 500
-  #flat_square: 500
-  #cone: 500
-  #thin_cylinder: 500
-  #vase: 1000
-  #mug: 1000
-
 sac_episodes_per_mesh:
-  mug:
-    episodes: 3000
-    pool_seed: 301
+  cube: 500
+  sphere: 500
+  cylinder: 500
+  flat_square: 500
+  cone: 500
+  thin_cylinder: 500
+  vase: 1000
+  mug: 1000
+
+#sac_episodes_per_mesh:
+#  mug:
+#    episodes: 3000
+#    pool_seed: 301
 
 sac_eval_episodes_per_level: 200
 

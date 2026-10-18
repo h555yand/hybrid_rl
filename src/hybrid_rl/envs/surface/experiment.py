@@ -61,6 +61,8 @@ from .episode_pools import _is_reachable_by_surface
 from .arbitrator import sac_to_discrete
 from .action_interpreter import ActionInterpreter
 from .ycb_utils import convert_ycb_objects
+from .visualize_env import EpisodeVisualizer
+
 
 logger = logging.getLogger(__name__)
 
@@ -2769,18 +2771,26 @@ class RLGoalApproachExperiment:
                 )
 
                 # Track source
-                if source.startswith("q_confirms_sac"):
+                if source.startswith("blend_agree"):
                     source_key = "blend"
-                elif source.startswith("q_sac_conflict"):
-                    source_key = "heuristic"
-                elif source.startswith("q_confident"):
-                    source_key = "blend"
-                elif source.startswith("heuristic"):
-                    source_key = "heuristic"
-                elif source.startswith("sac"):
-                    source_key = "sac"
-                elif source.startswith("q_"):
+                elif source.startswith("q_moderate_fresh"):
                     source_key = "q_store"
+                elif source.startswith("sac_moderate_stale"):
+                    source_key = "sac"
+                elif source.startswith("q_override_disagree"):
+                    source_key = "q_store"
+                elif source.startswith("sac_override_disagree"):
+                    source_key = "sac"
+                elif source.startswith("heuristic_disagree"):
+                    source_key = "heuristic"
+                elif source.startswith("heuristic_low_ml"):
+                    source_key = "heuristic"
+                elif source.startswith("sac_default"):
+                    source_key = "sac"
+                elif source.startswith("q_fallback"):
+                    source_key = "q_store"
+                elif source.startswith("forced_heuristic"):
+                    source_key = "heuristic"
                 else:
                     source_key = "sac"
 
@@ -3333,6 +3343,15 @@ class RLGoalApproachExperiment:
                 "is_calibrating": arb_stats.get(
                     "is_calibrating", False
                 ),
+                "agreement_analysis": arb_stats.get(
+                    "agreement_analysis", {}
+                ),
+                "disagreement_summary": arb_stats.get(
+                    "disagreement_summary", {}
+                ),
+                "recent_disagreements": arb_stats.get(
+                    "recent_disagreements", {}
+                ),
             },
             "manager": {
                 "sac_updates": stats.get("total_sac_updates", 0),
@@ -3387,7 +3406,6 @@ class RLGoalApproachExperiment:
         # Visualizer
         visualizer = None
         if self.visualise:
-            from tbp.hybrid_rl.visualize_env import EpisodeVisualizer
             visualizer = EpisodeVisualizer(
                 output_dir=self.data_dir,
                 mesh_name=self.adaptive_mesh,
