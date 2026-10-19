@@ -54,6 +54,7 @@ class LightweightEnv:
         self._compute_up_direction()
         self._mesh_centroid = np.array(self.mesh.centroid, dtype=float)
         self._wrong_side_outward = None
+        self._edge_traversed = None
 
     @staticmethod
     def _normalize_euler(angles):
