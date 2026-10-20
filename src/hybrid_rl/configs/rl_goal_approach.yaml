@@ -314,7 +314,7 @@ rl_config:
 
 # SAC (not used in Q-only pipeline)
 sac_config:
-  load_mode: auto
+  load_mode: null
   goal_threshold: 4.0
   gamma: 0.99
   tau: 0.005
@@ -348,7 +348,7 @@ sac_episodes_per_mesh:
 #    episodes: 3000
 #    pool_seed: 301
 
-sac_eval_episodes_per_level: 200
+sac_eval_episodes_per_level: 100
 
 adaptive_mesh: cup
 adaptive_episodes: 2000
