@@ -1,7 +1,7 @@
 seed: 42
 # Visualization: null | text | pictures | video
 visualise: video
-regenerate_scripts: true
+regenerate_scripts: false
 do_train: false
 do_eval: false
 do_heur_eval: true
@@ -22,13 +22,13 @@ promote_window: 100
 
 curriculum_levels:
   - [10.0, 60.0]    # L0: same_side, no path_blocked
-  - [10.0, 80.0]    # L1: same_side, path_blocked
-  - [10.0, 120.0]   # L2: different sides
+  #- [10.0, 80.0]    # L1: same_side, path_blocked
+  #- [10.0, 120.0]   # L2: different sides
 
 curriculum_filters:
   - {same_side: true, path_blocked: false}
-  - {same_side: true, path_blocked: true}
-  - {same_side: false}
+  #- {same_side: true, path_blocked: true}
+  #- {same_side: false}
 
 # ═══════════════════════════════════════════
 # PHASE 1: Primitives (from scratch)
