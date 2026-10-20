@@ -747,6 +747,7 @@ class LightweightEnv:
 
                     need_flip = False
                     nf_info = "none"
+                    gr_len = 0.0
 
                     if from_bottom:
                         from_inner_bottom = (

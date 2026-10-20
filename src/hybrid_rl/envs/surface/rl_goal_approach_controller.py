@@ -4689,19 +4689,12 @@ class RLGoalApproachController:
 
         return orbit_dir
 
-    def _compute_crawl_to_edge_direction(
+    def _compute_crawl_to_edge_direction_old(
         self,
         current_pose: np.ndarray,
         sensor_data: Dict[str, Any],
     ) -> Optional[np.ndarray]:
-        """Compute surface-tangent direction toward edge when path is blocked.
-
-        Handles three cases:
-        1. same_side=False, on rim → crawl along rim toward goal (FIX 7)
-        2. same_side=False, not on rim → crawl toward nearest edge (FIX 6)
-        3. same_side=True → project goal direction onto tangent plane,
-           with curvature-aware degenerate fallback (FIX 3, 4)
-        """
+        """Compute surface-tangent direction toward edge when path is blocked."""
         normal = sensor_data.get("point_normal")
         if normal is None:
             return None
@@ -4721,11 +4714,6 @@ class RLGoalApproachController:
             )
             height_axis = int(np.argmax(np.abs(up_dir)))
 
-            # ═══ FIX 7: On-rim detection ═══
-            # If agent is on a horizontal surface near the open
-            # edge or bottom edge, it has already reached an edge.
-            # Crawl along the edge toward goal instead of
-            # "toward rim" (which would be zero projection).
             is_on_horizontal = (
                 abs(float(np.dot(n, up_dir))) > 0.85
             )
@@ -4758,14 +4746,15 @@ class RLGoalApproachController:
                     + extents[height_axis] / 2.0
                 )
 
-                # Check proximity to rim or bottom edge
                 agent_h = current_pose[height_axis]
                 near_top = (
                     open_edge_height is not None
                     and abs(agent_h - open_edge_height)
                     < 5.0
                 )
-                near_bottom = abs(agent_h - bbox_min_h) < 5.0
+                near_bottom = (
+                    abs(agent_h - bbox_min_h) < 5.0
+                )
                 if up_sign < 0:
                     near_bottom = (
                         abs(agent_h - bbox_max_h) < 5.0
@@ -4775,55 +4764,100 @@ class RLGoalApproachController:
 
                 if on_edge:
                     if near_top:
-                        # On rim: crawl along rim toward goal
                         goal_dir = (
                             self._current_goal[:3]
                             - current_pose[:3]
                         )
-                        crawl_dir = (
-                            goal_dir
-                            - np.dot(goal_dir, n) * n
+                        goal_dist = float(
+                            np.linalg.norm(goal_dir)
                         )
-                        crawl_len = np.linalg.norm(crawl_dir)
-                        if crawl_len > 1e-8:
-                            return crawl_dir / crawl_len
-                        away = current_pose[:3] - center
-                        crawl_dir = (
-                            away - np.dot(away, n) * n
+                        al = (
+                            float(
+                                np.dot(
+                                    goal_dir
+                                    / max(
+                                        goal_dist,
+                                        1e-8,
+                                    ),
+                                    n,
+                                )
+                            )
+                            if goal_dist > 1e-8
+                            else 0.0
                         )
-                        crawl_len = np.linalg.norm(crawl_dir)
+
+                        if al > -0.85:
+                            crawl_dir = (
+                                goal_dir
+                                - np.dot(goal_dir, n)
+                                * n
+                            )
+                            crawl_len = (
+                                np.linalg.norm(
+                                    crawl_dir
+                                )
+                            )
+                            if crawl_len > 1e-8:
+                                return (
+                                    crawl_dir
+                                    / crawl_len
+                                )
+
+                        away = (
+                            current_pose[:3] - center
+                        )
+                        crawl_dir = (
+                            away
+                            - np.dot(away, n) * n
+                        )
+                        crawl_len = np.linalg.norm(
+                            crawl_dir
+                        )
                         if crawl_len > 1e-8:
-                            return crawl_dir / crawl_len
+                            return (
+                                crawl_dir / crawl_len
+                            )
                         return None
                     else:
-                        # On bottom: crawl to edge (away from center)
-                        away = current_pose[:3] - center
-                        crawl_dir = (
-                            away - np.dot(away, n) * n
+                        away = (
+                            current_pose[:3] - center
                         )
-                        crawl_len = np.linalg.norm(crawl_dir)
+                        crawl_dir = (
+                            away
+                            - np.dot(away, n) * n
+                        )
+                        crawl_len = np.linalg.norm(
+                            crawl_dir
+                        )
                         if crawl_len > 1e-8:
-                            return crawl_dir / crawl_len
+                            return (
+                                crawl_dir / crawl_len
+                            )
                         return None
 
-            # ═══ FIX 6 REVISED: Crawl toward correct edge ═══
+            # ═══ FIX 6 REVISED ═══
             goal_pos = self._current_goal[:3]
             extents = np.asarray(
-                sensor_data.get("object_extents", [84, 84, 84]),
+                sensor_data.get(
+                    "object_extents", [84, 84, 84]
+                ),
                 dtype=float,
             )
             center = np.asarray(
-                sensor_data.get("object_center", [0, 0, 0]),
+                sensor_data.get(
+                    "object_center", [0, 0, 0]
+                ),
                 dtype=float,
             )
             bbox_min_h = (
-                center[height_axis] - extents[height_axis] / 2.0
+                center[height_axis]
+                - extents[height_axis] / 2.0
             )
             bbox_max_h = (
-                center[height_axis] + extents[height_axis] / 2.0
+                center[height_axis]
+                + extents[height_axis] / 2.0
             )
 
-            # Detect if agent is inside or outside
             from_center = current_pose[:3] - center
             from_center[height_axis] = 0.0
             n_horiz = n.copy()
@@ -4832,32 +4866,45 @@ class RLGoalApproachController:
             agent_outside = True
             if np.linalg.norm(n_horiz) > 0.3:
                 agent_outside = (
-                    float(np.dot(n_horiz, from_center)) > 0
+                    float(
+                        np.dot(n_horiz, from_center)
+                    )
+                    > 0
                 )
             else:
-                dist_fc = float(np.linalg.norm(from_center))
+                dist_fc = float(
+                    np.linalg.norm(from_center)
+                )
                 horiz_extents = [
-                    extents[i] for i in range(3)
+                    extents[i]
+                    for i in range(3)
                     if i != height_axis
                 ]
-                approx_radius = max(horiz_extents) / 2.0
-                agent_outside = dist_fc > approx_radius * 0.8
+                approx_radius = (
+                    max(horiz_extents) / 2.0
+                )
+                agent_outside = (
+                    dist_fc > approx_radius * 0.8
+                )
 
-            # Detect if goal is inside
             goal_from_center = goal_pos - center
             goal_from_center[height_axis] = 0.0
             goal_dist_fc = float(
                 np.linalg.norm(goal_from_center)
             )
             horiz_extents = [
-                extents[i] for i in range(3)
+                extents[i]
+                for i in range(3)
                 if i != height_axis
             ]
             approx_radius = max(horiz_extents) / 2.0
-            # Goal is inside only if on wall (not on bottom/rim)
             goal_h = goal_pos[height_axis]
-            goal_near_bottom = abs(goal_h - bbox_min_h) < 2.5
-            goal_near_top = abs(goal_h - bbox_max_h) < 2.5
+            goal_near_bottom = (
+                abs(goal_h - bbox_min_h) < 2.5
+            )
+            goal_near_top = (
+                abs(goal_h - bbox_max_h) < 2.5
+            )
 
             goal_inside = (
                 goal_dist_fc < approx_radius * 0.85
@@ -4865,29 +4912,28 @@ class RLGoalApproachController:
                 and not goal_near_top
             )
 
-            # Choose edge direction
             if not agent_outside:
-                # Agent inside → only exit is rim
                 edge_dir = up_dir
             elif goal_inside:
-                # Agent outside, goal inside → rim is the only path
                 edge_dir = up_dir
             else:
-                # Both outside → choose edge closest to goal
                 goal_dist_to_top = abs(
                     goal_pos[height_axis] - bbox_max_h
                 )
                 goal_dist_to_bottom = abs(
                     goal_pos[height_axis] - bbox_min_h
                 )
-                if goal_dist_to_top < goal_dist_to_bottom:
+                if (
+                    goal_dist_to_top
+                    < goal_dist_to_bottom
+                ):
                     edge_dir = up_dir
                 else:
                     edge_dir = -up_dir
 
-            # Project onto tangent plane
             crawl_dir = (
-                edge_dir - np.dot(edge_dir, n) * n
+                edge_dir
+                - np.dot(edge_dir, n) * n
             )
             crawl_len = np.linalg.norm(crawl_dir)
 
@@ -4902,16 +4948,17 @@ class RLGoalApproachController:
 
             return crawl_dir / crawl_len
 
-        # ═══ Same side — project goal direction ═══
+        # ═══ Same side ═══
         goal_dir = (
             self._current_goal[:3] - current_pose[:3]
         )
-        crawl_dir = goal_dir - np.dot(goal_dir, n) * n
+        crawl_dir = (
+            goal_dir - np.dot(goal_dir, n) * n
+        )
 
         crawl_len = np.linalg.norm(crawl_dir)
         distance = float(np.linalg.norm(goal_dir))
 
-        # ═══ FIX 3: Curvature-aware degenerate ═══
         alignment = float(
             np.dot(
                 goal_dir / max(distance, 1e-8), n
@@ -4919,7 +4966,27 @@ class RLGoalApproachController:
         )
         k1 = float(sensor_data.get("k1", 0.0))
         k2 = float(sensor_data.get("k2", 0.0))
-        is_flat = abs(k1) < 0.01 and abs(k2) < 0.01
+        is_on_horizontal = (
+            abs(
+                float(
+                    np.dot(
+                        n,
+                        np.asarray(
+                            sensor_data.get(
+                                "up_direction",
+                                [0, 1, 0],
+                            ),
+                            dtype=float,
+                        ),
+                    )
+                )
+            )
+            > 0.85
+        )
+        is_flat = (
+            (abs(k1) < 0.01 and abs(k2) < 0.01)
+            or is_on_horizontal
+        )
 
         if is_flat:
             degenerate_threshold = 0.15
@@ -4942,7 +5009,6 @@ class RLGoalApproachController:
         )
 
         if degenerate:
-            # ═══ FIX 4: Bbox-edge fallback ═══
             center = np.asarray(
                 sensor_data.get(
                     "object_center", [0, 0, 0]
@@ -4973,7 +5039,10 @@ class RLGoalApproachController:
                     goal_pos[axis] - bbox_min[axis]
                 )
 
-                if goal_dist_to_max < goal_dist_to_min:
+                if (
+                    goal_dist_to_max
+                    < goal_dist_to_min
+                ):
                     target_boundary = bbox_max[axis]
                     sign = 1.0
                 else:
@@ -5016,7 +5085,8 @@ class RLGoalApproachController:
                 )
 
             crawl_dir = (
-                edge_dir - np.dot(edge_dir, n) * n
+                edge_dir
+                - np.dot(edge_dir, n) * n
             )
             crawl_len = np.linalg.norm(crawl_dir)
 
@@ -5031,31 +5101,25 @@ class RLGoalApproachController:
 
         return crawl_dir / crawl_len
 
-    def _compute_crawl_to_edge_direction_old1(
+    def _compute_crawl_to_edge_direction(
         self,
         current_pose: np.ndarray,
         sensor_data: Dict[str, Any],
     ) -> Optional[np.ndarray]:
         """Compute surface-tangent direction toward edge when path is blocked.
 
-        When same_side=False: always crawl toward rim (open edge).
-        The rim is the only surface path to the other side.
-        Goal direction is misleading — goal is behind the wall.
+        When same_side=False:
+        - On horizontal surface at edge (rim/bottom): smart direction
+            based on goal position and inside/outside detection.
+        - On horizontal surface NOT at edge: crawl to nearest bbox edge.
+            Simple and reliable for flat objects (flat_square) and
+            large horizontal surfaces (mug bottom far from wall).
+        - On vertical surface: FIX 6 REVISED logic with inside/outside
+            detection to choose up vs down.
 
-        When same_side=True: project goal direction onto tangent plane.
-        This naturally points toward the nearest edge/corner that
-        leads around the obstacle to the goal.
-
-        When projection degenerates (alignment ≈ -1.0, goal directly
-        behind normal), falls back to crawling toward the nearest
-        edge along the height axis.
-
-        Args:
-            current_pose: Agent pose.
-            sensor_data: Current sensor readings.
-
-        Returns:
-            Unit vector in world space (tangent to surface), or None.
+        When same_side=True:
+        - Project goal direction onto tangent plane.
+        - Degenerate fallback: nearest bbox edge toward goal.
         """
         normal = sensor_data.get("point_normal")
         if normal is None:
@@ -5068,111 +5132,504 @@ class RLGoalApproachController:
 
         same_side = sensor_data.get("same_side", True)
 
-        # ═══ Different sides — always crawl toward rim ═══
+        # ═══ Different sides ═══
         if not same_side:
             up_dir = np.asarray(
                 sensor_data.get("up_direction", [0, 1, 0]),
                 dtype=float,
             )
-            # Always toward rim — the only surface path
-            # to the other side. same_side will flip to True
-            # once agent crosses onto the other side's surface.
-            edge_dir = up_dir
+            height_axis = int(np.argmax(np.abs(up_dir)))
 
-            # Project onto tangent plane
-            crawl_dir = edge_dir - np.dot(edge_dir, n) * n
-            crawl_len = np.linalg.norm(crawl_dir)
+            is_on_horizontal = (
+                abs(float(np.dot(n, up_dir))) > 0.85
+            )
 
-            if crawl_len < 1e-8:
-                # Normal is parallel to up (horizontal surface
-                # like bottom) — crawl away from center toward
-                # the nearest wall
+            if is_on_horizontal:
+                open_edge_height = sensor_data.get(
+                    "open_edge_height", None
+                )
+                extents = np.asarray(
+                    sensor_data.get(
+                        "object_extents", [84, 84, 84]
+                    ),
+                    dtype=float,
+                )
                 center = np.asarray(
                     sensor_data.get(
                         "object_center", [0, 0, 0]
                     ),
                     dtype=float,
                 )
+                up_sign = float(
+                    np.sign(up_dir[height_axis])
+                )
+                bbox_min_h = (
+                    center[height_axis]
+                    - extents[height_axis] / 2.0
+                )
+                bbox_max_h = (
+                    center[height_axis]
+                    + extents[height_axis] / 2.0
+                )
+                # ═══ Thin object detection ═══
+                # For thin objects (flat_square: 100×100×3), the entire
+                # horizontal surface IS the edge. Normal crawl-to-edge
+                # logic (rim/bottom detection) doesn't apply.
+                # Just crawl to nearest horizontal bbox boundary.
+                height_extent = extents[height_axis]
+                horiz_extents = [
+                    extents[i] for i in range(3) if i != height_axis
+                ]
+                max_horiz = max(horiz_extents)
+                
+                is_thin_object = height_extent < max_horiz * 0.15  # 3mm vs 100mm = 0.03
+                
+                if is_thin_object:
+                    # Crawl to nearest horizontal edge — same as "not on_edge" logic
+                    bbox_min = center - extents / 2.0
+                    bbox_max = center + extents / 2.0
+
+                    best_edge_dir = None
+                    best_edge_dist = float('inf')
+
+                    for axis in range(3):
+                        if axis == height_axis:
+                            continue
+
+                        dist_to_max = abs(current_pose[axis] - bbox_max[axis])
+                        dist_to_min = abs(current_pose[axis] - bbox_min[axis])
+
+                        if dist_to_max < best_edge_dist:
+                            best_edge_dist = dist_to_max
+                            d = np.zeros(3)
+                            d[axis] = 1.0
+                            best_edge_dir = d
+
+                        if dist_to_min < best_edge_dist:
+                            best_edge_dist = dist_to_min
+                            d = np.zeros(3)
+                            d[axis] = -1.0
+                            best_edge_dir = d
+
+                    if best_edge_dir is not None:
+                        crawl_dir = best_edge_dir - np.dot(best_edge_dir, n) * n
+                        crawl_len = np.linalg.norm(crawl_dir)
+                        if crawl_len > 1e-8:
+                            return crawl_dir / crawl_len
+
+                    away = current_pose[:3] - center
+                    crawl_dir = away - np.dot(away, n) * n
+                    crawl_len = np.linalg.norm(crawl_dir)
+                    if crawl_len > 1e-8:
+                        return crawl_dir / crawl_len
+                    return None
+
+                # ═══ Normal hollow object logic (on_edge check) ═══
+                agent_h = current_pose[height_axis]
+                near_top = (
+                    open_edge_height is not None
+                    and abs(agent_h - open_edge_height)
+                    < 5.0
+                )
+                near_bottom = (
+                    abs(agent_h - bbox_min_h) < 5.0
+                )
+                if up_sign < 0:
+                    near_bottom = (
+                        abs(agent_h - bbox_max_h) < 5.0
+                    )
+
+                on_edge = near_top or near_bottom
+
+                if on_edge:
+                    if near_top:
+                        goal_dir = (
+                            self._current_goal[:3]
+                            - current_pose[:3]
+                        )
+                        goal_dist = float(
+                            np.linalg.norm(goal_dir)
+                        )
+                        al = (
+                            float(
+                                np.dot(
+                                    goal_dir
+                                    / max(
+                                        goal_dist,
+                                        1e-8,
+                                    ),
+                                    n,
+                                )
+                            )
+                            if goal_dist > 1e-8
+                            else 0.0
+                        )
+
+                        if al > -0.85:
+                            crawl_dir = (
+                                goal_dir
+                                - np.dot(goal_dir, n)
+                                * n
+                            )
+                            crawl_len = (
+                                np.linalg.norm(
+                                    crawl_dir
+                                )
+                            )
+                            if crawl_len > 1e-8:
+                                return (
+                                    crawl_dir
+                                    / crawl_len
+                                )
+
+                        away = (
+                            current_pose[:3] - center
+                        )
+                        crawl_dir = (
+                            away
+                            - np.dot(away, n) * n
+                        )
+                        crawl_len = np.linalg.norm(
+                            crawl_dir
+                        )
+                        if crawl_len > 1e-8:
+                            return (
+                                crawl_dir / crawl_len
+                            )
+                        return None
+                    else:
+                        # near_bottom
+                        away = (
+                            current_pose[:3] - center
+                        )
+                        crawl_dir = (
+                            away
+                            - np.dot(away, n) * n
+                        )
+                        crawl_len = np.linalg.norm(
+                            crawl_dir
+                        )
+                        if crawl_len > 1e-8:
+                            return (
+                                crawl_dir / crawl_len
+                            )
+                        return None
+                else:
+                    # ═══ NOT on edge — crawl to nearest bbox edge ═══
+                    # For flat objects (flat_square) and horizontal
+                    # surfaces far from rim/bottom: just crawl to the
+                    # nearest edge. Don't try to be smart about goal
+                    # direction — goal is on the other side, any edge
+                    # will do. Once at edge, _move_tangentially will
+                    # handle the edge transition.
+                    bbox_min = center - extents / 2.0
+                    bbox_max = center + extents / 2.0
+
+                    best_edge_dir = None
+                    best_edge_dist = float('inf')
+
+                    for axis in range(3):
+                        if axis == height_axis:
+                            continue  # skip vertical axis
+
+                        dist_to_max = abs(
+                            current_pose[axis] - bbox_max[axis]
+                        )
+                        dist_to_min = abs(
+                            current_pose[axis] - bbox_min[axis]
+                        )
+
+                        if dist_to_max < best_edge_dist:
+                            best_edge_dist = dist_to_max
+                            d = np.zeros(3)
+                            d[axis] = 1.0
+                            best_edge_dir = d
+
+                        if dist_to_min < best_edge_dist:
+                            best_edge_dist = dist_to_min
+                            d = np.zeros(3)
+                            d[axis] = -1.0
+                            best_edge_dir = d
+
+                    if best_edge_dir is not None:
+                        crawl_dir = (
+                            best_edge_dir
+                            - np.dot(best_edge_dir, n) * n
+                        )
+                        crawl_len = np.linalg.norm(crawl_dir)
+                        if crawl_len > 1e-8:
+                            return crawl_dir / crawl_len
+
+                    # Fallback: away from center
+                    away = current_pose[:3] - center
+                    crawl_dir = (
+                        away - np.dot(away, n) * n
+                    )
+                    crawl_len = np.linalg.norm(crawl_dir)
+                    if crawl_len > 1e-8:
+                        return crawl_dir / crawl_len
+                    return None
+
+            # ═══ FIX 6 REVISED (vertical wall, not same_side) ═══
+            goal_pos = self._current_goal[:3]
+            extents = np.asarray(
+                sensor_data.get(
+                    "object_extents", [84, 84, 84]
+                ),
+                dtype=float,
+            )
+            center = np.asarray(
+                sensor_data.get(
+                    "object_center", [0, 0, 0]
+                ),
+                dtype=float,
+            )
+            bbox_min_h = (
+                center[height_axis]
+                - extents[height_axis] / 2.0
+            )
+            bbox_max_h = (
+                center[height_axis]
+                + extents[height_axis] / 2.0
+            )
+
+            from_center = current_pose[:3] - center
+            from_center[height_axis] = 0.0
+            n_horiz = n.copy()
+            n_horiz[height_axis] = 0.0
+
+            agent_outside = True
+            if np.linalg.norm(n_horiz) > 0.3:
+                agent_outside = (
+                    float(
+                        np.dot(n_horiz, from_center)
+                    )
+                    > 0
+                )
+            else:
+                dist_fc = float(
+                    np.linalg.norm(from_center)
+                )
+                horiz_extents = [
+                    extents[i]
+                    for i in range(3)
+                    if i != height_axis
+                ]
+                approx_radius = (
+                    max(horiz_extents) / 2.0
+                )
+                agent_outside = (
+                    dist_fc > approx_radius * 0.8
+                )
+
+            goal_from_center = goal_pos - center
+            goal_from_center[height_axis] = 0.0
+            goal_dist_fc = float(
+                np.linalg.norm(goal_from_center)
+            )
+            horiz_extents = [
+                extents[i]
+                for i in range(3)
+                if i != height_axis
+            ]
+            approx_radius = max(horiz_extents) / 2.0
+            goal_h = goal_pos[height_axis]
+            goal_near_bottom = (
+                abs(goal_h - bbox_min_h) < 2.5
+            )
+            goal_near_top = (
+                abs(goal_h - bbox_max_h) < 2.5
+            )
+
+            goal_inside = (
+                goal_dist_fc < approx_radius * 0.85
+                and not goal_near_bottom
+                and not goal_near_top
+            )
+
+            if not agent_outside:
+                edge_dir = up_dir
+            elif goal_inside:
+                edge_dir = up_dir
+            else:
+                goal_dist_to_top = abs(
+                    goal_pos[height_axis] - bbox_max_h
+                )
+                goal_dist_to_bottom = abs(
+                    goal_pos[height_axis] - bbox_min_h
+                )
+                if (
+                    goal_dist_to_top
+                    < goal_dist_to_bottom
+                ):
+                    edge_dir = up_dir
+                else:
+                    edge_dir = -up_dir
+
+            crawl_dir = (
+                edge_dir
+                - np.dot(edge_dir, n) * n
+            )
+            crawl_len = np.linalg.norm(crawl_dir)
+
+            if crawl_len < 1e-8:
                 away = current_pose[:3] - center
-                crawl_dir = away - np.dot(away, n) * n
+                crawl_dir = (
+                    away - np.dot(away, n) * n
+                )
                 crawl_len = np.linalg.norm(crawl_dir)
                 if crawl_len < 1e-8:
                     return None
 
             return crawl_dir / crawl_len
 
-        # ═══ Same side — project goal direction ═══
-        goal_dir = self._current_goal[:3] - current_pose[:3]
-        crawl_dir = goal_dir - np.dot(goal_dir, n) * n
+        # ═══ Same side ═══
+        goal_dir = (
+            self._current_goal[:3] - current_pose[:3]
+        )
+        crawl_dir = (
+            goal_dir - np.dot(goal_dir, n) * n
+        )
 
         crawl_len = np.linalg.norm(crawl_dir)
         distance = float(np.linalg.norm(goal_dir))
+
+        alignment = float(
+            np.dot(
+                goal_dir / max(distance, 1e-8), n
+            )
+        )
+        k1 = float(sensor_data.get("k1", 0.0))
+        k2 = float(sensor_data.get("k2", 0.0))
+        is_on_horizontal = (
+            abs(
+                float(
+                    np.dot(
+                        n,
+                        np.asarray(
+                            sensor_data.get(
+                                "up_direction",
+                                [0, 1, 0],
+                            ),
+                            dtype=float,
+                        ),
+                    )
+                )
+            )
+            > 0.85
+        )
+        is_flat = (
+            (abs(k1) < 0.01 and abs(k2) < 0.01)
+            or is_on_horizontal
+        )
+
+        if is_flat:
+            degenerate_threshold = 0.15
+            degenerate_alignment = -0.85
+        else:
+            degenerate_threshold = 0.02
+            degenerate_alignment = -0.998
 
         degenerate = (
             crawl_len < 1.0
             or (
                 distance > 10.0
-                and crawl_len / max(distance, 1e-8) < 0.15
+                and crawl_len / max(distance, 1e-8)
+                < degenerate_threshold
+            )
+            or (
+                is_flat
+                and alignment < degenerate_alignment
             )
         )
 
         if degenerate:
             center = np.asarray(
-                sensor_data.get("object_center", [0, 0, 0]),
+                sensor_data.get(
+                    "object_center", [0, 0, 0]
+                ),
                 dtype=float,
             )
-            up_dir = np.asarray(
-                sensor_data.get("up_direction", [0, 1, 0]),
-                dtype=float,
-            )
-
-            goal_height = float(
-                np.dot(
-                    self._current_goal[:3] - center,
-                    up_dir,
-                )
-            )
-            agent_height = float(
-                np.dot(
-                    current_pose[:3] - center,
-                    up_dir,
-                )
-            )
-
-            if abs(goal_height - agent_height) < 1.0:
-                # Same height — pick closer edge (tiebreaker)
-                extents = sensor_data.get(
+            extents = np.asarray(
+                sensor_data.get(
                     "object_extents", [84, 84, 84]
+                ),
+                dtype=float,
+            )
+            bbox_min = center - extents / 2.0
+            bbox_max = center + extents / 2.0
+            goal_pos = self._current_goal[:3]
+
+            best_edge_dir = None
+            best_edge_dist = float('inf')
+
+            for axis in range(3):
+                if abs(n[axis]) > 0.7:
+                    continue
+
+                goal_dist_to_max = abs(
+                    goal_pos[axis] - bbox_max[axis]
                 )
-                height_axis = int(
-                    np.argmax(np.abs(up_dir))
+                goal_dist_to_min = abs(
+                    goal_pos[axis] - bbox_min[axis]
                 )
-                half_height = (
-                    extents[height_axis] / 2.0
+
+                if (
+                    goal_dist_to_max
+                    < goal_dist_to_min
+                ):
+                    target_boundary = bbox_max[axis]
+                    sign = 1.0
+                else:
+                    target_boundary = bbox_min[axis]
+                    sign = -1.0
+
+                agent_dist = abs(
+                    current_pose[axis]
+                    - target_boundary
                 )
-                dist_to_top = (
-                    half_height - agent_height
+
+                if agent_dist < best_edge_dist:
+                    best_edge_dist = agent_dist
+                    edge_dir_candidate = np.zeros(3)
+                    edge_dir_candidate[axis] = sign
+                    best_edge_dir = edge_dir_candidate
+
+            if best_edge_dir is not None:
+                edge_dir = best_edge_dir
+            else:
+                up_dir = np.asarray(
+                    sensor_data.get(
+                        "up_direction", [0, 1, 0]
+                    ),
+                    dtype=float,
                 )
-                dist_to_bottom = (
-                    agent_height + half_height
+                goal_height = float(
+                    np.dot(goal_pos - center, up_dir)
+                )
+                agent_height = float(
+                    np.dot(
+                        current_pose[:3] - center,
+                        up_dir,
+                    )
                 )
                 edge_dir = (
-                    -up_dir
-                    if dist_to_bottom < dist_to_top
-                    else up_dir
+                    up_dir
+                    if goal_height >= agent_height
+                    else -up_dir
                 )
-            elif goal_height < agent_height:
-                edge_dir = -up_dir
-            else:
-                edge_dir = up_dir
 
-            # Project edge direction onto tangent plane
-            crawl_dir = edge_dir - np.dot(edge_dir, n) * n
+            crawl_dir = (
+                edge_dir
+                - np.dot(edge_dir, n) * n
+            )
             crawl_len = np.linalg.norm(crawl_dir)
 
             if crawl_len < 1e-8:
                 away = current_pose[:3] - center
-                crawl_dir = away - np.dot(away, n) * n
+                crawl_dir = (
+                    away - np.dot(away, n) * n
+                )
                 crawl_len = np.linalg.norm(crawl_dir)
                 if crawl_len < 1e-8:
                     return None
