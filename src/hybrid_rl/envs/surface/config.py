@@ -44,7 +44,7 @@ DEFAULT_CONFIG = {
     "goal_threshold": 2.0,  # mm
     "max_steps_per_goal": 200,
     # Collision detection
-    "min_valid_depth": 0.5,    # mm — below = inside object
+    "min_valid_depth": 0.3,    # mm — below = inside object
     "max_sensor_range": 100.0,  # mm — max depth reading
     "normal_flip_threshold": -0.5,  # dot product for pass-through
     # Reward weights

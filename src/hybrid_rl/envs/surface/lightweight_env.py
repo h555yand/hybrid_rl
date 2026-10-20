@@ -725,25 +725,15 @@ class LightweightEnv:
 
                 if hn_len > 1e-8:
                     old_h = old_pos[self.height_axis]
-                    bmin_h = self.mesh.bounds[0][
-                        self.height_axis
-                    ]
-                    bmax_h = self.mesh.bounds[1][
-                        self.height_axis
-                    ]
+                    bmin_h = self.mesh.bounds[0][self.height_axis]
+                    bmax_h = self.mesh.bounds[1][self.height_axis]
 
                     from_rim = abs(old_h - bmax_h) < 5.0
-                    from_bottom = (
-                        abs(old_h - bmin_h) < 5.0
-                    )
+                    from_bottom = abs(old_h - bmin_h) < 5.0
 
-                    snap_radial = (
-                        closest[0] - self._mesh_centroid
-                    )
+                    snap_radial = closest[0] - self._mesh_centroid
                     snap_radial[self.height_axis] = 0.0
-                    sr_len = float(
-                        np.linalg.norm(snap_radial)
-                    )
+                    sr_len = float(np.linalg.norm(snap_radial))
 
                     need_flip = False
                     nf_info = "none"
@@ -752,129 +742,100 @@ class LightweightEnv:
                     if from_bottom:
                         from_inner_bottom = (
                             old_normal[self.height_axis]
-                            * self.up_sign
-                            > 0
+                            * self.up_sign > 0
                         )
                         if sr_len > 1e-8:
                             normal_is_outward = (
-                                float(
-                                    np.dot(
-                                        hit_n_h / hn_len,
-                                        snap_radial
-                                        / sr_len,
-                                    )
-                                )
-                                > 0
+                                float(np.dot(
+                                    hit_n_h / hn_len,
+                                    snap_radial / sr_len,
+                                )) > 0
                             )
                             if from_inner_bottom:
-                                need_flip = (
-                                    normal_is_outward
-                                )
+                                need_flip = normal_is_outward
                             else:
-                                need_flip = (
-                                    not normal_is_outward
-                                )
+                                need_flip = not normal_is_outward
                         nf_info = (
-                            f"bot"
-                            f"|ib={int(from_inner_bottom)}"
+                            f"bot|ib={int(from_inner_bottom)}"
                             f"|nio={int(normal_is_outward if sr_len > 1e-8 else -1)}"
                         )
 
                     elif from_rim:
-                        goal_radial = (
-                            self._current_goal[:3]
-                            - self._mesh_centroid
-                        )
-                        goal_radial[
-                            self.height_axis
-                        ] = 0.0
-                        gr_len = float(
-                            np.linalg.norm(goal_radial)
-                        )
-
-                        if (
-                            gr_len > 1e-8
-                            and sr_len > 1e-8
-                        ):
-                            goal_h = self._current_goal[
-                                self.height_axis
-                            ]
-                            goal_near_bottom = (
-                                abs(goal_h - bmin_h)
-                                < 2.5
-                            )
-                            goal_near_top = (
-                                abs(goal_h - bmax_h)
-                                < 2.5
-                            )
-
+                        agent_radial = old_pos - self._mesh_centroid
+                        agent_radial[self.height_axis] = 0.0
+                        ar_len = float(np.linalg.norm(agent_radial))
+                        
+                        if sr_len > 1e-8 and ar_len > 1e-8:
                             normal_is_outward = (
-                                float(
-                                    np.dot(
-                                        hit_n_h / hn_len,
-                                        snap_radial
-                                        / sr_len,
-                                    )
-                                )
-                                > 0
+                                float(np.dot(
+                                    hit_n_h / hn_len,
+                                    snap_radial / sr_len,
+                                )) > 0
                             )
-
-                            WALL_MARGIN = 3.0
-                            diff = gr_len - sr_len
-
-                            if goal_near_top:
-                                nf_info = "rim|gt"
-                            elif goal_near_bottom:
-                                need_flip = (
-                                    not normal_is_outward
-                                )
-                                nf_info = (
-                                    f"rim|gb"
-                                    f"|nio={int(normal_is_outward)}"
-                                )
+                            
+                            radial_dir = agent_radial / ar_len
+                            
+                            # ═══ Probe OUTWARD to find outer wall at rim level ═══
+                            probe_out = old_pos.copy()
+                            probe_out += radial_dir * 5.0
+                            cl_out, _, _ = self.mesh.nearest.on_surface([probe_out])
+                            out_radial = cl_out[0] - self._mesh_centroid
+                            out_radial[self.height_axis] = 0.0
+                            outer_radius = float(np.linalg.norm(out_radial))
+                            
+                            # ═══ Probe INWARD to find inner wall at rim level ═══
+                            probe_in = old_pos.copy()
+                            probe_in -= radial_dir * 5.0
+                            cl_in, _, _ = self.mesh.nearest.on_surface([probe_in])
+                            in_radial = cl_in[0] - self._mesh_centroid
+                            in_radial[self.height_axis] = 0.0
+                            inner_radius = float(np.linalg.norm(in_radial))
+                            
+                            # Wall midline at rim height
+                            wall_midline = (outer_radius + inner_radius) / 2.0
+                            
+                            # Agent on inner edge if closer to center than midline
+                            agent_on_inner_edge = ar_len < wall_midline
+                            
+                            # Goal analysis (for debug, not used in decision)
+                            goal_radial = (
+                                self._current_goal[:3] - self._mesh_centroid
+                            )
+                            goal_radial[self.height_axis] = 0.0
+                            gr_len = float(np.linalg.norm(goal_radial))
+                            
+                            # ═══ KEY LOGIC ═══
+                            # Agent crawled UP to rim from one side,
+                            # now falls DOWN the OTHER side.
+                            # inner edge → came from inside → wants OUTSIDE
+                            # outer edge → came from outside → wants INSIDE
+                            
+                            if agent_on_inner_edge:
+                                # Came from inside → want outer wall
+                                need_flip = not normal_is_outward
                             else:
-                                if (
-                                    abs(diff)
-                                    < WALL_MARGIN
-                                ):
-                                    need_flip = False
-                                    nf_info = (
-                                        f"rim|same"
-                                        f"|d={diff:.1f}"
-                                    )
-                                elif diff > 0:
-                                    need_flip = (
-                                        not normal_is_outward
-                                    )
-                                    nf_info = (
-                                        f"rim|out"
-                                        f"|d={diff:.1f}"
-                                        f"|nio={int(normal_is_outward)}"
-                                    )
-                                else:
-                                    need_flip = (
-                                        normal_is_outward
-                                    )
-                                    nf_info = (
-                                        f"rim|in"
-                                        f"|d={diff:.1f}"
-                                        f"|nio={int(normal_is_outward)}"
-                                    )
+                                # Came from outside → want inner wall  
+                                need_flip = normal_is_outward
+                            
+                            nf_info = (
+                                f"rim|ar={ar_len:.1f}"
+                                f"|sr={sr_len:.1f}"
+                                f"|or={outer_radius:.1f}"
+                                f"|ir={inner_radius:.1f}"
+                                f"|mid={wall_midline:.1f}"
+                                f"|inner={int(agent_on_inner_edge)}"
+                                f"|nio={int(normal_is_outward)}"
+                                f"|flip={int(need_flip)}"
+                            )
                         else:
                             nf_info = (
                                 f"rim|skip"
-                                f"|gr={gr_len:.1f}"
                                 f"|sr={sr_len:.1f}"
+                                f"|ar={ar_len:.1f}"
                             )
-                    else:
-                        nf_info = "neither"
 
-                    # Always set debug
-                    gdc_str = (
-                        f"|gdc={gr_len:.1f}"
-                        if from_rim
-                        else ""
-                    )
+                    # Debug
+                    gdc_str = f"|gdc={gr_len:.1f}" if from_rim else ""
                     self._wall_side_debug = (
                         f"nf={int(need_flip)}"
                         f"|{nf_info}"
@@ -946,7 +907,18 @@ class LightweightEnv:
                                                 opp_outward
                                             )
                                     else:
-                                        ok = True
+                                        # from_rim: crossing
+                                        # to other side
+                                        if (
+                                            agent_on_inner_edge
+                                        ):
+                                            ok = (
+                                                opp_outward
+                                            )
+                                        else:
+                                            ok = (
+                                                not opp_outward
+                                            )
                                     if ok:
                                         hit_n = n_opp
                                         closest = (
@@ -956,6 +928,7 @@ class LightweightEnv:
                     self._wall_side_debug = "hn0"
             else:
                 self._wall_side_debug = "nogoal"
+
 
         # Recompute is_new_horiz after edge traversal
         # (edge traversal may have changed hit_n)

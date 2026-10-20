@@ -1,6 +1,6 @@
 seed: 42
 # Visualization: null | text | pictures | video
-visualise: video
+visualise: text
 regenerate_scripts: true
 do_train: false
 do_eval: false
@@ -21,13 +21,13 @@ promote_threshold: 0.5
 promote_window: 100
 
 curriculum_levels:
-  #- [10.0, 60.0]    # L0: same_side, no path_blocked
-  #- [10.0, 80.0]    # L1: same_side, path_blocked
+  - [10.0, 60.0]    # L0: same_side, no path_blocked
+  - [10.0, 80.0]    # L1: same_side, path_blocked
   - [10.0, 120.0]   # L2: different sides
 
 curriculum_filters:
-  #- {same_side: true, path_blocked: false}
-  #- {same_side: true, path_blocked: true}
+  - {same_side: true, path_blocked: false}
+  - {same_side: true, path_blocked: true}
   - {same_side: false}
 
 # ═══════════════════════════════════════════
@@ -158,42 +158,42 @@ training_stages:
 # ═══════════════════════════════════════════
 eval_meshes:
   # Train set — primitives
-  #- mesh: cube
-  #  curriculum_filters:
-  #    - {same_side: true, path_blocked: false}
-  #    - {same_side: true, path_blocked: true}
-  #    - {}
-  #- mesh: sphere
-  #  curriculum_filters:
-  #    - {same_side: true, path_blocked: false}
-  #    - {same_side: true, path_blocked: true}
-  #    - {}
-  #- mesh: cylinder
-  #  curriculum_filters:
-  #    - {same_side: true, path_blocked: false}
-  #    - {same_side: true, path_blocked: true}
-  #    - {}
-  #- mesh: flat_square
-  #  curriculum_filters:
-      #- {same_side: true, path_blocked: false}
-      #- {same_side: true, path_blocked: true}
-  #    - {}
-  #- mesh: cone
-  #  curriculum_filters:
-  #    - {same_side: true, path_blocked: false}
-  #    - {same_side: true, path_blocked: true}
-  #    - {}
-  #- mesh: thin_cylinder
-  #  curriculum_filters:
-  #    - {same_side: true, path_blocked: false}
-  #    - {same_side: true, path_blocked: true}
-  #    - {}
+  - mesh: cube
+    curriculum_filters:
+      - {same_side: true, path_blocked: false}
+      - {same_side: true, path_blocked: true}
+      - {}
+  - mesh: sphere
+    curriculum_filters:
+      - {same_side: true, path_blocked: false}
+      - {same_side: true, path_blocked: true}
+      - {}
+  - mesh: cylinder
+    curriculum_filters:
+      - {same_side: true, path_blocked: false}
+      - {same_side: true, path_blocked: true}
+      - {}
+  - mesh: flat_square
+    curriculum_filters:
+      - {same_side: true, path_blocked: false}
+      - {same_side: true, path_blocked: true}
+      - {}
+  - mesh: cone
+    curriculum_filters:
+      - {same_side: true, path_blocked: false}
+      - {same_side: true, path_blocked: true}
+      - {}
+  - mesh: thin_cylinder
+    curriculum_filters:
+      - {same_side: true, path_blocked: false}
+      - {same_side: true, path_blocked: true}
+      - {}
   # Train set — hollow
   - vase
-  #- mug
+  - mug
   # Held-out — hollow
-  #- mesh: cup
-  #  pool_seed: 57
+  - mesh: cup
+    pool_seed: 57
 
 eval_episodes_per_level: 100
 

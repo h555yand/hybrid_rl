@@ -144,7 +144,7 @@ rl_config = {
     "goal_threshold": 4.0,
     "max_steps_per_goal": 500,
     "max_sensor_range": 100.0,
-    "min_valid_depth": 0.5,
+    "min_valid_depth": 0.3,
     "normal_flip_threshold": -0.5,
     "reward_progress": 3.0,
     "reward_goal_reached": 30.0,
