@@ -33,7 +33,7 @@ import numpy as np
 from .config import DEFAULT_CONFIG
 from .experience_extractor import ExperienceExtractor
 from .lightweight_env import LightweightEnv
-from .rl_goal_approach_controller import RLGoalApproachController
+from .rl_goal_approach_controller import RLGoalApproachController, RunningQStats
 from .visualize_env import save_episode_frames, visualize_agent_goal
 from .episode_pools import _is_reachable_by_surface
 
@@ -545,6 +545,7 @@ def _maybe_save_visualization(  # noqa: PLR0913
         if vis_counts:
             vis_counts[ep_result] += 1
 
+
 def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
     mesh_dir: str,
     save_dir: str,
@@ -563,57 +564,9 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
     level_idx=0,
     save_on_exit: bool = True,
 ) -> int | dict[str, Any]:
-    """Run Q-learning episodes in train or eval mode.
-
-    Executes episodes where an RL agent navigates on 3D object surfaces
-    toward goal positions. The mode is determined by ``config["mode"]``:
-    - ``"train"`` / ``"train_adapt_epsilon"``: agent learns via Q-updates,
-      epsilon decays over episodes, curriculum promotes to harder levels.
-    - ``"eval"``: agent uses learned Q-values with fixed low epsilon,
-      no Q-updates, collects success trajectories for BC data.
-
-    Episode sourcing:
-    - **Fixed script**: a flat list of (start, goal) pairs executed
-      sequentially. Used for eval on specific episode pools.
-    - **Fixed pools**: per-level lists of episodes. Curriculum tracker
-      selects the current level and advances when success rate exceeds
-      the promotion threshold.
-    - **Random**: start and goal are sampled from the mesh surface.
-      Optional curriculum constrains goal distance range per level.
-
-    Args:
-        mesh_dir: Directory containing mesh files (.obj, .stl, .ply).
-        save_dir: Directory to save the trained controller.
-        num_episodes: Number of episodes to run.
-        config: Configuration overrides merged with DEFAULT_CONFIG.
-        mesh_path: Path to a specific mesh file. If None, a random
-            mesh from mesh_dir is used each episode.
-        load_dir: Directory to load a pretrained controller from.
-        agent_id: Agent identifier string.
-        seed: Random seed for reproducibility.
-        return_metrics: If True, return a dict with detailed metrics
-            instead of just the goal count.
-        curriculum_config: Curriculum configuration dict with keys
-            ``levels`` (list of (min_dist, max_dist) tuples),
-            ``promote_threshold`` (float), ``promote_window`` (int).
-        episode_script: Fixed list of episode dicts, each containing
-            ``start_pos``, ``start_rot``, ``goal_pos``, ``goal_rot``.
-        episode_pools: List of per-level episode lists for curriculum.
-        visualise: If True, save PNG frames for filtered episodes.
-        episodes_per_level: Cap on episodes per curriculum level.
-
-    Returns:
-        Number of goals reached if return_metrics is False,
-        otherwise a dict with keys: ``goals_reached``, ``num_episodes``,
-        ``success_rate``, ``stats``, ``curriculum_stats``,
-        ``success_trails``, ``success_actions``, ``q_calibration``.
-
-    Raises:
-        ValueError: If both episode_script and episode_pools are provided,
-            or if num_episodes is missing when using episode_pools.
-    """
+    """Run Q-learning episodes in train or eval mode."""
     if seed is not None:
-        np.random.seed(seed)  # noqa: NPY002
+        np.random.seed(seed)
         random.seed(seed)
 
     if num_episodes is not None:
@@ -627,14 +580,13 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
     visualizer = None
     if visualise:
         from .visualize_env import EpisodeVisualizer
-
         mesh_label = Path(mesh_path).stem if mesh_path else "multi"
         stage_label = "eval" if cfg.get("mode") == "eval" else "train"
         visualizer = EpisodeVisualizer(
             output_dir=Path(save_dir),
             mesh_name=mesh_label,
             stage=stage_label,
-            visualize_mode=visualise
+            visualize_mode=visualise,
         )
 
     # Validate episode sources
@@ -657,11 +609,16 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
     controller = _init_controller(cfg, load_dir, agent_id, config)
     action_space = controller.action_space
 
-    # ═══ NEW: Q confidence calibration (eval only) ═══
+    # ═══ Q confidence calibration (eval only) ═══
     q_calibration = None
+    _running_best_q = None
     if cfg.get("mode") == "eval":
         from .q_confidence_calibration import QConfidenceCalibration
         q_calibration = QConfidenceCalibration()
+        _running_best_q = {
+            "surface": RunningQStats(warmup=50),
+            "free": RunningQStats(warmup=50),
+        }
 
     # Curriculum setup
     use_curriculum = curriculum_config is not None
@@ -670,14 +627,10 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
         curriculum = _CurriculumTracker(
             levels=curriculum_config["levels"],
             promote_threshold=float(
-                curriculum_config.get(
-                    "promote_threshold", 0.20
-                )
+                curriculum_config.get("promote_threshold", 0.20)
             ),
             promote_window=int(
-                curriculum_config.get(
-                    "promote_window", 50
-                )
+                curriculum_config.get("promote_window", 50)
             ),
             warmup_per_level=int(
                 cfg.get("warmup_episodes", 40)
@@ -702,7 +655,7 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
         if episodes_per_level is not None and episode >= episodes_per_level:
             break
 
-        ep_mesh_path = mesh_path or np.random.choice(mesh_files)  # noqa: NPY002
+        ep_mesh_path = mesh_path or np.random.choice(mesh_files)
         env = LightweightEnv(ep_mesh_path, seed=seed)
         goals_before = controller._total_goals_reached
 
@@ -745,7 +698,10 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
                 require_path_blocked = level_filter.get("path_blocked", None)
                 max_goal_attempts = (
                     50
-                    if (require_same_side is not None or require_path_blocked is not None)
+                    if (
+                        require_same_side is not None
+                        or require_path_blocked is not None
+                    )
                     else 1
                 )
 
@@ -787,16 +743,13 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
 
         # Set warmup flag for controller
         if curriculum is not None:
-            was_warmup = getattr(
-                controller, '_force_warmup', False
-            )
+            was_warmup = getattr(controller, '_force_warmup', False)
             controller._force_warmup = curriculum.is_warmup
 
             if curriculum.is_warmup:
                 controller.epsilon = 1.0
                 controller.strategic_epsilon = 1.0
             elif was_warmup and not curriculum.is_warmup:
-                # Warmup just ended — reset to epsilon_start
                 eps_start = cfg.get("epsilon_start", 0.5)
                 eps_min = cfg.get("epsilon_min", 0.05)
                 controller.epsilon = eps_start
@@ -804,29 +757,20 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
                     "strategic_epsilon_start", eps_start
                 )
 
-                # Recalculate decay for remaining episodes
                 remaining = num_episodes - episode - 1
                 remaining_warmup = (
                     curriculum.warmup_per_level
-                    * (len(curriculum.levels)
-                    - curriculum.level_idx - 1)
+                    * (len(curriculum.levels) - curriculum.level_idx - 1)
                 )
-                effective_remaining = max(
-                    1, remaining - remaining_warmup
-                )
+                effective_remaining = max(1, remaining - remaining_warmup)
 
                 if eps_start > eps_min:
-                    new_decay = (
-                        eps_min / eps_start
-                    ) ** (1.0 / effective_remaining)
+                    new_decay = (eps_min / eps_start) ** (
+                        1.0 / effective_remaining
+                    )
                     controller.epsilon_decay = new_decay
-                    if (
-                        controller.strategic_epsilon_decay
-                        is not None
-                    ):
-                        controller.strategic_epsilon_decay = (
-                            new_decay
-                        )
+                    if controller.strategic_epsilon_decay is not None:
+                        controller.strategic_epsilon_decay = new_decay
 
                 logger.info(
                     "Warmup ended at ep %d: epsilon=%.3f, "
@@ -845,16 +789,10 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
 
         # ═══ Air start: every 3rd training episode ═══
         is_training = "train" in cfg.get("mode", "")
-        air_start_enabled = cfg.get(
-            "air_start_enabled", False
-        )
-        air_start_in_eval = cfg.get(
-            "air_start_in_eval", False
-        )
+        air_start_in_eval = cfg.get("air_start_in_eval", False)
 
         if (
             (is_training or air_start_in_eval)
-            # and air_start_enabled
             and episode % 3 == 2
         ):
             sensor = env.get_sensor_data()
@@ -864,31 +802,22 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
                 n_len = np.linalg.norm(n)
                 if n_len > 1e-8:
                     n /= n_len
-                    detach_dist = (
-                        action_space.free_step * 3
-                    )
-                    air_pos = (
-                        env.agent_pos + n * detach_dist
-                    )
+                    detach_dist = action_space.free_step * 3
+                    air_pos = env.agent_pos + n * detach_dist
 
                     goal_dir = goal_pose[:3] - air_pos
                     goal_dist = np.linalg.norm(goal_dir)
                     if goal_dist > 1e-8:
-                        air_rot = (
-                            env._look_at_direction(
-                                goal_dir / goal_dist
-                            )
-                        )
+                        air_rot = env._look_at_direction(goal_dir / goal_dist)
                     else:
                         air_rot = env.agent_rot.copy()
 
                     env.agent_pos = air_pos
                     env.agent_rot = air_rot
                     start_pos = air_pos.copy()
-                    controller.set_new_goal(
-                        goal_pose, start_pos
-                    )
+                    controller.set_new_goal(goal_pose, start_pos)
                     controller._total_episodes -= 1
+
         controller.temperature_override = cfg.get("temperature_override")
 
         # Per-episode tracking
@@ -909,9 +838,7 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
                     air_steps = _step - ep_detach_start_step
                     land_pose = env.get_pose()
                     land_dist = float(
-                        np.linalg.norm(
-                            goal_pose[:3] - land_pose[:3]
-                        )
+                        np.linalg.norm(goal_pose[:3] - land_pose[:3])
                     )
                     dist_impr = ep_detach_start_dist - land_dist
                     _detach_outcomes.append({
@@ -922,7 +849,7 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
                     ep_detach_start_step = None
                     ep_detach_start_dist = None
 
-            # ═══ NEW: record Q confidence for calibration ═══
+            # ═══ Record Q confidence for calibration ═══
             if q_calibration is not None:
                 _cal_pose = env.get_pose()
                 _cal_sensor = env.get_sensor_data()
@@ -932,22 +859,37 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
                 _cal_on_obj = _cal_state[11] > 0.5
                 _cal_store = controller._select_store(_cal_state)
                 if _cal_store.next_id > 0:
-                    _, _cal_conf = (
+                    _cal_q, _cal_conf = (
                         _cal_store.get_q_values_with_confidence(
                             _cal_state
                         )
                     )
+
+                    # best_Q_norm: normalized best Q-value
+                    _cal_best_q = float(np.max(_cal_q))
+                    _cal_store_key = (
+                        "surface" if _cal_on_obj else "free"
+                    )
+                    _running_best_q[_cal_store_key].update(
+                        np.array([_cal_best_q])
+                    )
+                    if _running_best_q[_cal_store_key].is_warmed_up:
+                        _cal_conf["best_q_norm"] = (
+                            _running_best_q[_cal_store_key]
+                            .normalize_value(_cal_best_q)
+                        )
+                    else:
+                        _cal_conf["best_q_norm"] = 0.0
+
                     q_calibration.record_step(
-                        confidence=_cal_conf["overall"],
+                        confidence_info=_cal_conf,
                         on_object=_cal_on_obj,
                     )
 
             # ═══ 2. Controller decides action ═══
             current_pose = env.get_pose()
             sensor_data = env.get_sensor_data()
-            _, explanation = controller.step(
-                current_pose, sensor_data
-            )
+            _, explanation = controller.step(current_pose, sensor_data)
             if explanation is not None:
                 action_explanations.append(
                     explanation["interpretation"]
@@ -969,7 +911,6 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
                 _phase_transitions[t_key] = (
                     _phase_transitions.get(t_key, 0) + 1
                 )
-                # Track orbit age when leaving FLY_TO_EDGE
                 if ep_prev_phase == "FLY_TO_EDGE":
                     o_age = getattr(
                         controller, "_orbit_direction_age", 0
@@ -986,10 +927,7 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
                 break
 
             # ═══ 5. Execute action in environment ═══
-            env.step(
-                controller._last_action,
-                action_space,
-            )
+            env.step(controller._last_action, action_space)
 
             # ═══ 6. Record detach AFTER env executed it ═══
             if (
@@ -999,7 +937,6 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
                 ).name == "detach"
             ):
                 post_detach_sensor = env.get_sensor_data()
-                # Only record if agent actually left surface
                 if not post_detach_sensor.get("on_object", True):
                     post_detach_pose = env.get_pose()
                     ep_detach_start_step = _step
@@ -1014,7 +951,7 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
             controller._total_goals_reached > goals_before
         )
 
-        # ═══ NEW: record episode end for calibration ═══
+        # Record episode end for calibration
         if q_calibration is not None:
             q_calibration.record_episode_end(episode_success)
 
@@ -1055,7 +992,10 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
             level = (
                 curriculum.level_idx if curriculum else level_idx
             )
-            if ((episode + 1) % _LOG_INTERVAL_VIS) <= 0 and (episode + 1) >= _LOG_INTERVAL_VIS:
+            if (
+                ((episode + 1) % _LOG_INTERVAL_VIS) <= 0
+                and (episode + 1) >= _LOG_INTERVAL_VIS
+            ):
                 visualizer.save_episode(
                     env=env,
                     episode=episode,
@@ -1068,8 +1008,7 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
 
         if curriculum is not None:
             curriculum.on_episode_end(
-                episode_success, controller,
-                episode,
+                episode_success, controller, episode
             )
 
         if (episode + 1) % _LOG_INTERVAL == 0:
@@ -1087,13 +1026,14 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
         "Final: %d/%d goals reached", goals_reached, num_episodes
     )
 
-    # ═══ NEW: save calibration ═══
+    # Save calibration
     if q_calibration is not None:
         cal_path = str(Path(save_dir) / "q_calibration.json")
         q_calibration.save(cal_path)
         logger.info(
             "Q calibration saved to %s (%d episodes)",
-            cal_path, q_calibration._total_episodes,
+            cal_path,
+            q_calibration._total_episodes,
         )
 
     if not return_metrics:
@@ -1154,19 +1094,14 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
             "max_air_steps": int(np.max(air_steps_list)),
             "landed_count": len(landed),
             "landed_rate": round(
-                len(landed)
-                / max(len(_detach_outcomes), 1),
-                3,
+                len(landed) / max(len(_detach_outcomes), 1), 3
             ),
             "mean_dist_improvement": (
                 round(
                     float(
-                        np.mean(
-                            [
-                                d["dist_improvement"]
-                                for d in landed
-                            ]
-                        )
+                        np.mean([
+                            d["dist_improvement"] for d in landed
+                        ])
                     ),
                     1,
                 )
@@ -1184,12 +1119,12 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
         "success_trails": success_trails,
         "success_actions": success_actions,
         "phase_metrics": phase_metrics,
-        # ═══ NEW ═══
         "q_calibration": (
             q_calibration.get_calibration()
             if q_calibration else None
         ),
     }
+
 
 def run_episodes_old(  # noqa: PLR0913, C901, PLR0912, PLR0915
     mesh_dir: str,

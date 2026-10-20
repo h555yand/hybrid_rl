@@ -329,6 +329,9 @@ class HNSWStateStore:
             "experience": 0.0,
             "consistency": 0.0,
             "overall": 0.0,
+            "v_mean": 0.0,
+            "v_max": 0.0,
+            "v_spread": 0.0,
         }
 
         if self.next_id == 0:
@@ -355,6 +358,9 @@ class HNSWStateStore:
                 "experience": visit_conf,
                 "consistency": 1.0,
                 "overall": visit_conf,
+                "v_mean": float(np.mean(point.q_values)), 
+                "v_max": float(np.max(point.q_values)),
+                "v_spread": float(np.max(point.q_values) - np.min(point.q_values)),
             }
 
         # ═══ Kernel weights ═══
@@ -418,10 +424,16 @@ class HNSWStateStore:
 
         # Overall: proximity и recency — главные
         overall = float(
-            0.4 * proximity
-            + 0.3 * experience
-            + 0.3 * consistency
+            0.6 * proximity
+            + 0.4 * experience
+            + 0.0 * consistency
         )
+
+        # ═══ Q-value interpolation (same as get_q_values) ═══
+        weights /= weight_sum
+        q_values = np.zeros(self.num_actions)
+        for i, label in enumerate(labels):
+            q_values += weights[i] * self.points[label].q_values
 
         confidence_info = {
             "proximity": proximity,
@@ -429,12 +441,10 @@ class HNSWStateStore:
             "consistency": consistency,
             "recency": recency,
             "overall": overall,
+            "v_mean": float(np.mean(q_values)),
+            "v_max": float(np.max(q_values)),
+            "v_spread": float(np.max(q_values) - np.min(q_values)),
         }
-        # ═══ Q-value interpolation (same as get_q_values) ═══
-        weights /= weight_sum
-        q_values = np.zeros(self.num_actions)
-        for i, label in enumerate(labels):
-            q_values += weights[i] * self.points[label].q_values
 
         return q_values, confidence_info
     

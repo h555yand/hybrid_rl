@@ -325,7 +325,7 @@ class EpisodeVisualizer:
         output_dir: Path,
         mesh_name: str = "",
         stage: str = "eval",
-        max_per_type_per_level: int = 3,
+        max_per_type_per_level: int = 5,
         num_levels: int = 3,
         timeout_frame_interval: int = _FRAME_INTERVAL,
         visualize_mode: str = "text",
