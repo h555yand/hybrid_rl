@@ -4856,8 +4856,8 @@ class RLGoalApproachController:
             approx_radius = max(horiz_extents) / 2.0
             # Goal is inside only if on wall (not on bottom/rim)
             goal_h = goal_pos[height_axis]
-            goal_near_bottom = abs(goal_h - bbox_min_h) < 5.0
-            goal_near_top = abs(goal_h - bbox_max_h) < 5.0
+            goal_near_bottom = abs(goal_h - bbox_min_h) < 2.5
+            goal_near_top = abs(goal_h - bbox_max_h) < 2.5
 
             goal_inside = (
                 goal_dist_fc < approx_radius * 0.85

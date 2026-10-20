@@ -577,7 +577,7 @@ class LightweightEnv:
             )
         else:
             self.agent_pos = old_pos
-            self._last_snap_debug = "blocked"
+            self._last_snap_debug = f"blocked|ws={getattr(self, '_wall_side_debug', '')}"
 
     def _compute_tangent_move(self, direction_degrees, step_size):
         """Compute tangent direction and move agent.
@@ -800,11 +800,11 @@ class LightweightEnv:
                             ]
                             goal_near_bottom = (
                                 abs(goal_h - bmin_h)
-                                < 5.0
+                                < 2.5
                             )
                             goal_near_top = (
                                 abs(goal_h - bmax_h)
-                                < 5.0
+                                < 2.5
                             )
 
                             normal_is_outward = (
@@ -1088,11 +1088,14 @@ class LightweightEnv:
         """Check if surface is horizontal (rim, bottom, top)."""
         return abs(float(np.dot(normal, self.up_direction))) > 0.85
 
-
     def _align_normal(self, hit_n, old_normal, is_from_horiz):
         """Align snap normal with agent's current orientation."""
         if np.dot(hit_n, old_normal) < 0:
             if not is_from_horiz:
+                hit_n = -hit_n
+            elif self._is_horizontal(hit_n):
+                # horizontal→horizontal: flip to match
+                # (outer bottom snap finds inner bottom)
                 hit_n = -hit_n
         return hit_n
 
