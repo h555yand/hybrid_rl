@@ -62,6 +62,9 @@ from .arbitrator import sac_to_discrete
 from .action_interpreter import ActionInterpreter
 from .ycb_utils import convert_ycb_objects
 from .visualize_env import EpisodeVisualizer
+from .episode_pools import (
+    _is_on_wall, _get_handle_info, _check_handle_between
+)
 
 
 logger = logging.getLogger(__name__)
@@ -2657,6 +2660,13 @@ class RLGoalApproachExperiment:
             goal_pose = None
             is_fallback_episode = False
 
+            handle_between = level_filter.get("handle_between", False)
+            handle_info = None
+            if handle_between:
+                handle_info = _get_handle_info(online_env)
+                if handle_info is None:
+                    handle_between = False
+
             for _attempt in range(max_goal_attempts):
                 online_env.reset()
                 start_pos = online_env.get_pose()[:3]
@@ -2669,6 +2679,13 @@ class RLGoalApproachExperiment:
                     mesh_sample=True,
                 )
 
+                if handle_between:
+                    if not _check_handle_between(
+                        online_env, start_pos,
+                        candidate[:3], handle_info,
+                    ):
+                        continue
+                    
                 if require_same_side is not None or require_path_blocked is not None:
                     online_env.set_goal(candidate)
                     sensor_check = online_env.get_sensor_data()

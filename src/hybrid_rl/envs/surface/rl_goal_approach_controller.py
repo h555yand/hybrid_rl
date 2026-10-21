@@ -2083,6 +2083,8 @@ class RLGoalApproachController:
                 prev_action=self._last_action,
             )
         )
+        phase_eff = self._compute_movement_efficiency(window=20)
+        phase_thr = self.config.get("stuck_threshold", 0.15)
 
         q_norm = self._normalize_values(q_values)
         h_norm = self._normalize_values(heuristic)
@@ -2552,6 +2554,7 @@ class RLGoalApproachController:
             f"{pos_str}"
             f"{snap_str}"
             f"{fly_debug_str}]"
+            f"|peff={phase_eff:.2f}|pthr={phase_thr}"
         )
 
         if strategic_source:

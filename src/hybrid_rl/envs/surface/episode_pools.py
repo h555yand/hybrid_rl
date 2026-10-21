@@ -33,6 +33,108 @@ from .lightweight_env import LightweightEnv, _is_reachable_by_surface
 logger = logging.getLogger(__name__)
 
 
+def _is_on_wall(env: LightweightEnv, point: np.ndarray) -> bool:
+    """Check point is on vertical wall (not bottom/rim, not handle)."""
+    _, _, face_id = env.mesh.nearest.on_surface([point[:3]])
+    normal_at = env.mesh.face_normals[face_id[0]]
+    if abs(float(np.dot(normal_at, env.up_direction))) > 0.5:
+        return False
+
+    center = np.array(env.mesh.centroid, dtype=float)
+    delta = point[:3] - center
+    delta[env.height_axis] = 0.0
+    horiz_dist = float(np.linalg.norm(delta))
+
+    extents = env.mesh.bounds[1] - env.mesh.bounds[0]
+    horiz_extents = [
+        extents[i] for i in range(3) if i != env.height_axis
+    ]
+    body_radius = min(horiz_extents) / 2.0
+
+    return horiz_dist < body_radius * 1.15
+
+
+def _get_handle_info(env: LightweightEnv) -> dict[str, Any] | None:
+    """Get handle geometry info. Returns None if no handle detected."""
+    height_axis = env.height_axis
+    extents = env.mesh.bounds[1] - env.mesh.bounds[0]
+    horiz_axes = [i for i in range(3) if i != height_axis]
+
+    horiz_extents = [extents[i] for i in horiz_axes]
+    min_horiz = min(horiz_extents)
+    max_horiz = max(horiz_extents)
+
+    if max_horiz < min_horiz * 1.3:
+        return None
+
+    handle_axis = (
+        horiz_axes[0]
+        if extents[horiz_axes[0]] > extents[horiz_axes[1]]
+        else horiz_axes[1]
+    )
+    sym_axis = (
+        horiz_axes[1]
+        if handle_axis == horiz_axes[0]
+        else horiz_axes[0]
+    )
+
+    body_radius = min_horiz / 2.0
+    bbox_min_h = env.mesh.bounds[0][handle_axis]
+    centroid_h = float(env.mesh.centroid[handle_axis])
+
+    center_option_1 = bbox_min_h + body_radius
+    center_option_2 = env.mesh.bounds[1][handle_axis] - body_radius
+    if abs(centroid_h - center_option_1) < abs(centroid_h - center_option_2):
+        center_h = center_option_1
+    else:
+        center_h = center_option_2
+
+    center_s = float(env.mesh.centroid[sym_axis])
+
+    return {
+        "handle_axis": handle_axis,
+        "sym_axis": sym_axis,
+        "body_radius": body_radius,
+        "center_h": center_h,
+        "center_s": center_s,
+    }
+
+
+def _check_handle_between(
+    env: LightweightEnv,
+    start_pos: np.ndarray,
+    goal_pos: np.ndarray,
+    handle_info: dict[str, Any],
+) -> bool:
+    """Check if start and goal are on opposite sides of handle.
+    
+    Both must be on wall, near handle axis, on opposite
+    sides of symmetry axis.
+    """
+    if not _is_on_wall(env, start_pos):
+        return False
+    if not _is_on_wall(env, goal_pos):
+        return False
+
+    ha = handle_info["handle_axis"]
+    ch = handle_info["center_h"]
+    br = handle_info["body_radius"]
+    sa = handle_info["sym_axis"]
+    cs = handle_info["center_s"]
+
+    # Both near handle side
+    if start_pos[ha] < ch + br * 0.3:
+        return False
+    if goal_pos[ha] < ch + br * 0.3:
+        return False
+
+    # Opposite sides of sym axis
+    if (start_pos[sa] - cs) * (goal_pos[sa] - cs) > 0:
+        return False
+
+    return True
+
+
 def generate_episode_pools(
     mesh_path: str,
     episodes_per_level: int,
@@ -94,12 +196,27 @@ def generate_episode_pools(
             "path_blocked", None
         )
 
+        require_handle_between = level_filter.get(
+            "handle_between", False
+        )
+        
+        handle_info = None
+        if require_handle_between:
+            handle_info = _get_handle_info(env)
+            if handle_info is None:
+                logger.warning(
+                    "Level %d: handle_between filter "
+                    "requested but no handle detected",
+                    level_idx,
+                )
+                require_handle_between = False
+
         max_attempts = (
             100
             if (
                 require_same_side is not None
-                or require_path_blocked
-                is not None
+                or require_path_blocked is not None
+                or require_handle_between
             )
             else 1
         )
@@ -122,6 +239,14 @@ def generate_episode_pools(
                         mesh_sample=True,
                     )
                 )
+                
+                # Check handle_between
+                if require_handle_between:
+                    if not _check_handle_between(
+                        env, start_pos, candidate[:3],
+                        handle_info,
+                    ):
+                        continue
 
                 # Check same_side
                 same_side = bool(
