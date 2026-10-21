@@ -1,7 +1,7 @@
 seed: 42
 # Visualization: null | text | pictures | video
 visualise: text
-regenerate_scripts: true
+regenerate_scripts: false
 do_train: false
 do_eval: false
 do_heur_eval: true
@@ -192,8 +192,8 @@ eval_meshes:
   - vase
   - mug
   # Held-out — hollow
-  - mesh: cup
-    pool_seed: 57
+  #- mesh: cup
+  #  pool_seed: 57
 
 eval_episodes_per_level: 100
 

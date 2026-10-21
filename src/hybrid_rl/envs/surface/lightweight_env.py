@@ -433,15 +433,17 @@ class LightweightEnv:
         vertex_indices = self.mesh.faces[face_idx]
 
         if not hasattr(self, "_vertex_mean_curvature"):
+            _curv_radius = 5.0
+            _curv_area = np.pi * _curv_radius ** 2
             self._vertex_mean_curvature = (
                 trimesh.curvature.discrete_mean_curvature_measure(
-                    self.mesh, self.mesh.vertices, radius=5.0
-                )
+                    self.mesh, self.mesh.vertices, radius=_curv_radius
+                ) / _curv_area
             )
             self._vertex_gaussian_curvature = (
                 trimesh.curvature.discrete_gaussian_curvature_measure(
-                    self.mesh, self.mesh.vertices, radius=5.0
-                )
+                    self.mesh, self.mesh.vertices, radius=_curv_radius
+                ) / _curv_area
             )
 
         H = float(np.mean(self._vertex_mean_curvature[vertex_indices]))
@@ -481,11 +483,17 @@ class LightweightEnv:
         vertex_indices = self.mesh.faces[face_idx]
 
         if not hasattr(self, "_vertex_mean_curvature"):
-            self._vertex_mean_curvature = trimesh.curvature.discrete_mean_curvature_measure(
-                self.mesh, self.mesh.vertices, radius=5.0
+            _curv_radius = 5.0
+            _curv_area = np.pi * _curv_radius ** 2
+            self._vertex_mean_curvature = (
+                trimesh.curvature.discrete_mean_curvature_measure(
+                    self.mesh, self.mesh.vertices, radius=_curv_radius
+                ) / _curv_area
             )
-            self._vertex_gaussian_curvature = trimesh.curvature.discrete_gaussian_curvature_measure(
-                self.mesh, self.mesh.vertices, radius=5.0
+            self._vertex_gaussian_curvature = (
+                trimesh.curvature.discrete_gaussian_curvature_measure(
+                    self.mesh, self.mesh.vertices, radius=_curv_radius
+                ) / _curv_area
             )
 
         mean_curv = float(np.mean(self._vertex_mean_curvature[vertex_indices]))
@@ -542,11 +550,17 @@ class LightweightEnv:
         
         if not snap_to_surface:
             return
+
+        # Get curvature at current point for _is_horizontal check
+        curvature = self._estimate_curvature()
+        curv_k1 = curvature.get("k1", 0.0)
         
         # 2. Find snap target
         snap = self._find_snap_target(
-            old_pos, old_normal, world_dir, step_size
+            old_pos, old_normal, world_dir, step_size,
+            curvature_k1=curv_k1,
         )
+
         if snap is None:
             self.agent_pos = old_pos  # too far from surface
             return
@@ -637,7 +651,7 @@ class LightweightEnv:
         d = np.cos(a) * t1 + np.sin(a) * t2
         return d / (np.linalg.norm(d) + 1e-12)
 
-    def _find_snap_target(self, old_pos, old_normal, world_dir, step_size):
+    def _find_snap_target(self, old_pos, old_normal, world_dir, step_size, curvature_k1=None):
         """Find the best surface point to snap to."""
         self._wall_side_debug = ""
         
@@ -651,8 +665,22 @@ class LightweightEnv:
         hit_n = self.mesh.face_normals[face_id[0]].copy()
         hit_n /= np.linalg.norm(hit_n) + 1e-12
         
-        is_from_horiz = self._is_horizontal(old_normal)
-        is_new_horiz = self._is_horizontal(hit_n)
+        is_from_horiz = self._is_horizontal(old_normal, curvature_k1)
+        
+        # Compute curvature at snap point for is_new_horiz
+        snap_k1 = None
+        snap_vertex_indices = self.mesh.faces[face_id[0]]
+        if hasattr(self, "_vertex_mean_curvature"):
+            snap_H = float(np.mean(
+                self._vertex_mean_curvature[snap_vertex_indices]
+            ))
+            snap_K = float(np.mean(
+                self._vertex_gaussian_curvature[snap_vertex_indices]
+            ))
+            disc = max(snap_H * snap_H - snap_K, 0.0)
+            snap_k1 = float(snap_H + np.sqrt(disc))
+        
+        is_new_horiz = self._is_horizontal(hit_n, snap_k1)
         
         hit_n = self._align_normal(
             hit_n, old_normal, is_from_horiz
@@ -1014,40 +1042,22 @@ class LightweightEnv:
                             "normal": old_normal,
                             "valid": False,
                         }
-
         # ═══ Side consistency: wall → wall ═══
-        # If inner wall → outer wall (crossed through thin wall),
-        # reject.
+        # Use normal dot product instead of outward check.
+        # Outward check fails on thin/curved objects where
+        # normals relative to centroid are unreliable.
+        # Dot product directly detects opposite-side snap:
+        #   dot > 0: same side (normals agree)
+        #   dot ≈ 0: perpendicular (edge transition, handled elsewhere)
+        #   dot < -0.3: opposite side (normals oppose)
         if not is_from_horiz and not is_new_horiz:
-            old_radial = old_pos - self._mesh_centroid
-            old_radial[self.height_axis] = 0.0
-            new_radial = closest[0] - self._mesh_centroid
-            new_radial[self.height_axis] = 0.0
-
-            old_n_h = old_normal.copy()
-            old_n_h[self.height_axis] = 0.0
-            new_n_h = hit_n.copy()
-            new_n_h[self.height_axis] = 0.0
-
-            if (
-                np.linalg.norm(old_radial) > 1e-8
-                and np.linalg.norm(new_radial) > 1e-8
-                and np.linalg.norm(old_n_h) > 0.3
-                and np.linalg.norm(new_n_h) > 0.3
-            ):
-                old_outward = float(
-                    np.dot(old_n_h, old_radial)
-                ) > 0
-                new_outward = float(
-                    np.dot(new_n_h, new_radial)
-                ) > 0
-
-                if old_outward != new_outward:
-                    return {
-                        "position": old_pos,
-                        "normal": old_normal,
-                        "valid": False,
-                    }
+            dot_normals = float(np.dot(old_normal, hit_n))
+            if dot_normals < -0.5:
+                return {
+                    "position": old_pos,
+                    "normal": old_normal,
+                    "valid": False,
+                }
 
         new_pos = closest[0] + hit_n * 2.0
 
@@ -1058,9 +1068,23 @@ class LightweightEnv:
             "valid": True,
         }
     
-    def _is_horizontal(self, normal):
-        """Check if surface is horizontal (rim, bottom, top)."""
+    def _is_horizontal_old(self, normal):
         return abs(float(np.dot(normal, self.up_direction))) > 0.85
+
+    def _is_horizontal(self, normal, curvature_k1=None):
+        """Check if surface is horizontal (rim, bottom, top).
+        
+        High curvature surfaces with vertical normals (e.g. torus
+        handle top/bottom) are NOT horizontal — they are curved
+        geometry that happens to have a vertical normal at that point.
+        """
+        return abs(float(np.dot(normal, self.up_direction))) > 0.85
+        # needs improvements
+        if abs(float(np.dot(normal, self.up_direction))) <= 0.85:
+            return False
+        if curvature_k1 is not None and abs(curvature_k1) > 0.1:
+            return False
+        return True
 
     def _align_normal(self, hit_n, old_normal, is_from_horiz):
         """Align snap normal with agent's current orientation."""
@@ -1125,10 +1149,14 @@ class LightweightEnv:
                     n_probe /= np.linalg.norm(n_probe) + 1e-12
                     
                     # Must be a different face orientation
-                    normals_different = abs(float(
+                    dot_probe_old = float(
                         np.dot(n_probe, old_normal)
-                    )) < 0.5
-                    
+                    )
+                    normals_different = (
+                        abs(dot_probe_old) < 0.5
+                        and dot_probe_old > -0.3
+                    )
+
                     # Must be close to boundary
                     face_near_boundary = any(
                         abs(cl[0][ax] - bbox_max[ax]) < step_size
@@ -1583,33 +1611,41 @@ class LightweightEnv:
         # 10-25 (open top has far fewer hits). For symmetric objects
         # (cube, sphere, flat_square) asymmetry is 0-3.
         MIN_ASYMMETRY_THRESHOLD = 5
-
         if best_asymmetry < MIN_ASYMMETRY_THRESHOLD:
-            # Check if one axis is significantly thinner than others
-            # (flat objects like flat_square: 100×100×3)
             sorted_extents = np.sort(extents)
             thinnest = sorted_extents[0]
             second_thinnest = sorted_extents[1]
+            thickest = sorted_extents[2]
 
-            # If thinnest axis is < 30% of second thinnest,
-            # it's a flat object → use thinnest as height
             if thinnest < second_thinnest * 0.3:
+                # Flat object (100×100×3) → thinnest = height
                 thin_axis = int(np.argmin(extents))
                 best_axis = thin_axis
                 best_up_sign = 1.0
 
                 logger.debug(
-                    f"_compute_up_direction: symmetric object, "
+                    f"_compute_up_direction: flat object, "
                     f"using thinnest axis {thin_axis} as height "
                     f"(extents={extents.tolist()}, "
                     f"asymmetry={best_asymmetry})"
                 )
+            elif thickest > second_thinnest * 2.0:
+                # Elongated object (10×10×120) → longest = height
+                long_axis = int(np.argmax(extents))
+                best_axis = long_axis
+                best_up_sign = 1.0
+
+                logger.debug(
+                    f"_compute_up_direction: elongated object, "
+                    f"using longest axis {long_axis} as height "
+                    f"(extents={extents.tolist()}, "
+                    f"asymmetry={best_asymmetry})"
+                )
             else:
-                # Truly symmetric (cube, sphere) — any axis works,
-                # keep the ray-based result
+                # Truly symmetric (cube, sphere)
                 logger.debug(
                     f"_compute_up_direction: symmetric object, "
-                    f"no thin axis, keeping ray-based "
+                    f"no thin/long axis, keeping ray-based "
                     f"axis={best_axis} "
                     f"(extents={extents.tolist()}, "
                     f"asymmetry={best_asymmetry})"
