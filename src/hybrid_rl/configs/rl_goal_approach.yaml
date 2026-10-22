@@ -237,7 +237,7 @@ bc_action_min_absolute: 100
 bc_q_store_fraction: 0.3
 
 rl_config:
-  state_dim: 22
+  state_dim: 24
   stuck_threshold: 0.05
   warmup_episodes: 100     # per level warmup
   air_start_enabled: true

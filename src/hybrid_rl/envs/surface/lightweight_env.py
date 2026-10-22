@@ -203,6 +203,9 @@ class LightweightEnv:
 
         # ═══ path_blocked (ray cast) ═══
         path_blocked = False
+        bl_locations = np.array([]).reshape(0, 3)
+        bl_hit_distances = np.array([])
+        dist_to_goal = 0.0
         if hasattr(self, "_current_goal") and self._current_goal is not None:
             goal_pos = self._current_goal[:3]
             direction = goal_pos - self.agent_pos
@@ -215,12 +218,141 @@ class LightweightEnv:
                     ray_directions=[direction_norm],
                 )
                 if len(bl_locations) > 0:
-                    hit_distances = np.linalg.norm(
+                    bl_hit_distances = np.linalg.norm(
                         bl_locations - self.agent_pos, axis=1
                     )
-                    # Blocked if any intersection is closer than goal
-                    # margin 2.0mm to avoid counting the goal surface itself
-                    path_blocked = bool(np.min(hit_distances) < dist_to_goal - 2.0)
+                    path_blocked = bool(
+                        np.min(bl_hit_distances) < dist_to_goal - 2.0
+                    )
+
+        # ═══ Lateral obstacle rays (±60° from goal direction) ═══
+        path_blocked_left_raw = 0.0    # 0.0=blocked, 1.0=clear
+        path_blocked_right_raw = 0.0
+        path_blocked_hit_pos = None
+        path_blocked_all_hits = []
+        path_blocked_left_dir = None
+        path_blocked_right_dir = None
+        path_blocked_left_hit = None   # hit position of blocked left ray
+        path_blocked_right_hit = None
+        _obstacle_probe_range = 40.0
+
+        if (
+            path_blocked
+            and on_object
+            and hasattr(self, "_current_goal")
+            and self._current_goal is not None
+            and point_normal is not None
+        ):
+            goal_pos = self._current_goal[:3]
+            direction = goal_pos - self.agent_pos
+            _dist_to_goal = np.linalg.norm(direction)
+
+            if _dist_to_goal > 1e-8:
+                goal_dir = direction / _dist_to_goal
+                n = np.array(point_normal, dtype=float)
+                n /= np.linalg.norm(n) + 1e-12
+
+                forward = goal_dir - np.dot(goal_dir, n) * n
+                fwd_len = np.linalg.norm(forward)
+
+                if fwd_len > 1e-8:
+                    forward /= fwd_len
+
+                    right = np.cross(n, forward)
+                    right_len = np.linalg.norm(right)
+
+                    if right_len > 1e-8:
+                        right /= right_len
+
+                        origin = self.agent_pos + n * 10.0
+
+                        left_dir = (
+                            np.cos(-np.pi / 4) * forward
+                            + np.sin(-np.pi / 4) * right
+                        )
+                        left_dir /= np.linalg.norm(left_dir) + 1e-12
+
+                        right_dir = (
+                            np.cos(np.pi / 4) * forward
+                            + np.sin(np.pi / 4) * right
+                        )
+                        right_dir /= np.linalg.norm(right_dir) + 1e-12
+
+                        path_blocked_left_dir = left_dir.tolist()
+                        path_blocked_right_dir = right_dir.tolist()
+
+                        lr_locs, lr_index_ray, _ = (
+                            self.mesh.ray.intersects_location(
+                                ray_origins=np.array([origin, origin]),
+                                ray_directions=np.array([
+                                    left_dir, right_dir
+                                ]),
+                            )
+                        )
+
+                        # Left ray — normalized distance
+                        left_hits = lr_locs[lr_index_ray == 0]
+                        if len(left_hits) > 0:
+                            left_dist = float(np.min(
+                                np.linalg.norm(
+                                    left_hits - origin, axis=1
+                                )
+                            ))
+                            path_blocked_left_raw = float(
+                                np.clip(
+                                    left_dist / _obstacle_probe_range,
+                                    0.0, 1.0,
+                                )
+                            )
+                            if left_dist < _obstacle_probe_range:
+                                nearest_left = np.argmin(
+                                    np.linalg.norm(
+                                        left_hits - origin, axis=1
+                                    )
+                                )
+                                path_blocked_left_hit = (
+                                    left_hits[nearest_left].tolist()
+                                )
+                        else:
+                            path_blocked_left_raw = 1.0
+
+                        # Right ray — normalized distance
+                        right_hits = lr_locs[lr_index_ray == 1]
+                        if len(right_hits) > 0:
+                            right_dist = float(np.min(
+                                np.linalg.norm(
+                                    right_hits - origin, axis=1
+                                )
+                            ))
+                            path_blocked_right_raw = float(
+                                np.clip(
+                                    right_dist / _obstacle_probe_range,
+                                    0.0, 1.0,
+                                )
+                            )
+                            if right_dist < _obstacle_probe_range:
+                                nearest_right = np.argmin(
+                                    np.linalg.norm(
+                                        right_hits - origin, axis=1
+                                    )
+                                )
+                                path_blocked_right_hit = (
+                                    right_hits[nearest_right].tolist()
+                                )
+                        else:
+                            path_blocked_right_raw = 1.0
+
+            # Central ray hits
+            if len(bl_locations) > 0 and len(bl_hit_distances) > 0:
+                nearest_hit_idx = np.argmin(bl_hit_distances)
+                path_blocked_hit_pos = (
+                    bl_locations[nearest_hit_idx].tolist()
+                )
+                for i in range(len(bl_locations)):
+                    if bl_hit_distances[i] < dist_to_goal - 2.0:
+                        path_blocked_all_hits.append(
+                            bl_locations[i].tolist()
+                        )
 
         # ═══ Curvature ═══
         curvature_data = self._estimate_curvature()
@@ -229,14 +361,12 @@ class LightweightEnv:
         same_side = True
         if hasattr(self, "_current_goal") and self._current_goal is not None:
             on_object = bool(depth < 3.0)
-            
+
             if on_object:
-                # On surface: use nearest.on_surface (reliable)
                 same_side = _is_reachable_by_surface(
                     self, self.agent_pos, self._current_goal[:3]
                 )
             else:
-                # In air: use ray-based inside/outside test
                 same_side = self._same_side_air(
                     self.agent_pos, self._current_goal[:3],
                     point_normal,
@@ -246,23 +376,45 @@ class LightweightEnv:
             "point_normal": point_normal,
             "k1": curvature_data["k1"],
             "k2": curvature_data["k2"],
-            "principal_curvatures": [curvature_data["k1"], curvature_data["k2"]],
+            "principal_curvatures": [
+                curvature_data["k1"], curvature_data["k2"]
+            ],
             "on_object": on_object,
             "depth": depth,
-            "passed_through": getattr(self, "_passed_through", False),
+            "passed_through": getattr(
+                self, "_passed_through", False
+            ),
             "goal_normal": goal_normal,
-            "detach_had_collision": getattr(self, "_detach_had_collision", False),
-            "detach_sub_steps": getattr(self, "_last_detach_sub_steps", 1),
+            "detach_had_collision": getattr(
+                self, "_detach_had_collision", False
+            ),
+            "detach_sub_steps": getattr(
+                self, "_last_detach_sub_steps", 1
+            ),
             "path_blocked": path_blocked,
+            "path_blocked_left_raw": path_blocked_left_raw,
+            "path_blocked_right_raw": path_blocked_right_raw,
+            "path_blocked_hit_pos": path_blocked_hit_pos,
+            "path_blocked_all_hits": path_blocked_all_hits,
             "up_direction": self.up_direction.tolist(),
             "object_center": self.mesh.centroid.tolist(),
             "same_side": same_side,
-            "object_extents": (self.mesh.bounds[1] - self.mesh.bounds[0]).tolist(),
-            "edge_traversed": getattr(self, "_edge_traversed", False),
+            "object_extents": (
+                self.mesh.bounds[1] - self.mesh.bounds[0]
+            ).tolist(),
+            "edge_traversed": getattr(
+                self, "_edge_traversed", False
+            ),
             "open_edge_height": self.open_edge_height,
-            "snap_debug": getattr(self, "_last_snap_debug", ""),
+            "snap_debug": getattr(
+                self, "_last_snap_debug", ""
+            ),
+            "path_blocked_left_dir": path_blocked_left_dir,
+            "path_blocked_right_dir": path_blocked_right_dir,
+            "path_blocked_left_hit": path_blocked_left_hit,
+            "path_blocked_right_hit": path_blocked_right_hit,
         }
-
+    
     def _same_side_air(self, agent_pos, goal_pos, agent_normal):
         """Determine same_side when agent is in air.
         

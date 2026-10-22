@@ -113,7 +113,7 @@ class ObjectPartitionedBuffer:
     def __init__(
         self,
         capacity_per_object: int = 50_000,
-        state_dim: int = 22,
+        state_dim: int = 24,
         max_params: int = 3,
         bc_capacity_per_object: int = 5_000,
         elite_capacity_per_object: int = 5_000,

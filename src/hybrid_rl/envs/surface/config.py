@@ -16,7 +16,7 @@
 
 DEFAULT_CONFIG = {
     # State
-    "state_dim": 22,
+    "state_dim": 24,
     # HNSW store
     "max_points": 100000,
     "k_neighbors": 7,
