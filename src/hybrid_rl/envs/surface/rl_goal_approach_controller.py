@@ -1371,15 +1371,29 @@ class RLGoalApproachController:
                     asymmetry = abs(
                         left_dist - right_dist
                     )
-                    is_protrusion = (
-                        same_side
-                        and alignment > -0.5
-                        and asymmetry > 0.15
-                        and max(
-                            left_dist, right_dist
+                    # Strong asymmetry = definitely protrusion
+                    # (don't need alignment check)
+                    # Weak asymmetry = need alignment to confirm
+                    if asymmetry > 0.5:
+                        is_protrusion = (
+                            same_side
+                            and max(
+                                left_dist,
+                                right_dist,
+                            )
+                            > 0.5
                         )
-                        > 0.5
-                    )
+                    else:
+                        is_protrusion = (
+                            same_side
+                            and alignment > -0.5
+                            and asymmetry > 0.15
+                            and max(
+                                left_dist,
+                                right_dist,
+                            )
+                            > 0.5
+                        )
                 print(f"PROT: step={self._steps} ld={left_dist} rd={right_dist} ss={same_side} al={alignment:.2f} was={was_avoiding} res={is_protrusion}")
                 
                 if is_protrusion:
