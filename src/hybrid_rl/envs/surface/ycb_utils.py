@@ -79,6 +79,7 @@ def convert_ycb_objects(
             converted[local_name] = stl_path
             continue
 
+        ycb_name = ycb_name["glb_name"]
         glb_path = ycb_src / ycb_name / "google_16k" / "textured.glb"
         if not glb_path.exists():
             logger.warning("  SKIP %s: %s not found", ycb_name, glb_path)

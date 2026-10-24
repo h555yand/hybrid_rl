@@ -242,7 +242,7 @@ class RLGoalApproachExperiment:
         self.do_ycb_eval = self.config.get("do_ycb_eval", False)
         self.ycb_config = self.config.get("ycb_config", {})
         self.do_ycb_mujoco_eval = self.config.get("do_ycb_mujoco_eval", False)
-        self.ycb_mujoco_config = self.config.get("ycb_mujoco_config", {})
+        self.ycb_mujoco_config = self.config.get("ycb_config", {})
         self.do_ycb_mujoco_adaptive = self.config.get("do_ycb_mujoco_adaptive", False)
         self.ycb_mujoco_adaptive_config = self.config.get("ycb_mujoco_adaptive_config", {})
 
@@ -3508,9 +3508,18 @@ class RLGoalApproachExperiment:
         logger.info("Converted %d YCB objects", len(converted))
 
         # Eval config
+        #eval_cfg = {
+        #    **self.rl_config,
+        #    "mode": "eval",
+        #}
         eval_cfg = {
             **self.rl_config,
             "mode": "eval",
+            "eval_epsilon": 1.0,
+            "temperature_override": 0.01,
+            "strategic_eval_epsilon": 1.0,
+            "air_start_enabled": False,
+            "air_start_in_eval": False,
         }
 
         all_ycb_results = {}
@@ -3547,6 +3556,7 @@ class RLGoalApproachExperiment:
                 episodes_per_level=ycb_episodes_per_level,
                 mesh_name=mesh_name,
                 visualise=self.visualise,
+                log_prefix="heuristic",
             )
 
             all_ycb_results[mesh_name] = eval_results
