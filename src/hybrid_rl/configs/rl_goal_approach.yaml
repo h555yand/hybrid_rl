@@ -21,17 +21,17 @@ promote_threshold: 0.5
 promote_window: 100
 
 curriculum_levels:
-  #- [10.0, 60.0]    # L0: same_side, no path_blocked
-  #- [10.0, 80.0]    # L1: same_side, path_blocked
-  #- [10.0, 120.0]   # L2: different sides
-  - [10.0, 120.0]   # L3: handle as obstacle
+  - [10.0, 60.0]    # L0: same_side, no path_blocked
+  - [10.0, 80.0]    # L1: same_side, path_blocked
+  - [10.0, 120.0]   # L2: different sides
+  #- [10.0, 120.0]   # L3: handle as obstacle
 
 
 curriculum_filters:
-  #- {same_side: true, path_blocked: false}
-  #- {same_side: true, path_blocked: true}
-  #- {same_side: false}
-  - {"handle_between": True, same_side: true, path_blocked: true}
+  - {same_side: true, path_blocked: false}
+  - {same_side: true, path_blocked: true}
+  - {same_side: false}
+  #- {"handle_between": True, same_side: true, path_blocked: true}
 
 # ═══════════════════════════════════════════
 # PHASE 1: Primitives (from scratch)
