@@ -182,17 +182,22 @@ class LightweightEnv:
             ray_directions=[ray_direction],
         )
 
+        face_id = None
         if len(locations) > 0:
             distances = np.linalg.norm(locations - self.agent_pos, axis=1)
             nearest_idx = np.argmin(distances)
 
-            depth = distances[nearest_idx]
-            face_idx = index_tri[nearest_idx]
+            depth = float(distances[nearest_idx])
+            face_idx = int(index_tri[nearest_idx])
+            face_id = face_idx
+
             point_normal = self.mesh.face_normals[face_idx].tolist()
-            on_object = bool(depth < 3.0)
+            on_object_raw = bool(depth < 3.0)
+            on_object = on_object_raw
         else:
             depth = 100.0
             point_normal = None
+            on_object_raw = False
             on_object = False
 
         goal_normal = None
@@ -201,12 +206,18 @@ class LightweightEnv:
             _, _, gf_id = self.mesh.nearest.on_surface([goal_pos])
             goal_normal = self.mesh.face_normals[gf_id[0]].tolist()
 
-        # ═══ path_blocked (ray cast) ═══
+        # ═══ path_blocked (ray cast) + diagnostics ═══
         path_blocked = False
+        pb_hits = 0
+        pb_hit_min = None
+        pb_goal_dist = None
+        pb_margin = 2.0
+
         if hasattr(self, "_current_goal") and self._current_goal is not None:
             goal_pos = self._current_goal[:3]
             direction = goal_pos - self.agent_pos
-            dist_to_goal = np.linalg.norm(direction)
+            dist_to_goal = float(np.linalg.norm(direction))
+            pb_goal_dist = dist_to_goal
 
             if dist_to_goal > 1e-8:
                 direction_norm = direction / dist_to_goal
@@ -218,29 +229,38 @@ class LightweightEnv:
                     hit_distances = np.linalg.norm(
                         bl_locations - self.agent_pos, axis=1
                     )
+                    pb_hits = int(len(bl_locations))
+                    pb_hit_min = float(np.min(hit_distances))
+
                     # Blocked if any intersection is closer than goal
                     # margin 2.0mm to avoid counting the goal surface itself
-                    path_blocked = bool(np.min(hit_distances) < dist_to_goal - 2.0)
+                    path_blocked = bool(pb_hit_min < dist_to_goal - pb_margin)
 
         # ═══ Curvature ═══
         curvature_data = self._estimate_curvature()
 
-        # ═══ same_side ═══
+        # ═══ same_side + diagnostics ═══
         same_side = True
+        same_side_raw = True
+        same_side_method = "none"
+
         if hasattr(self, "_current_goal") and self._current_goal is not None:
-            on_object = bool(depth < 3.0)
-            
+            # keep behavior consistent with on_object used by env
             if on_object:
                 # On surface: use nearest.on_surface (reliable)
-                same_side = _is_reachable_by_surface(
+                same_side_raw = _is_reachable_by_surface(
                     self, self.agent_pos, self._current_goal[:3]
                 )
+                same_side_method = "surface"
             else:
                 # In air: use ray-based inside/outside test
-                same_side = self._same_side_air(
+                same_side_raw = self._same_side_air(
                     self.agent_pos, self._current_goal[:3],
                     point_normal,
                 )
+                same_side_method = "air"
+
+            same_side = bool(same_side_raw)
 
         return {
             "point_normal": point_normal,
@@ -248,21 +268,29 @@ class LightweightEnv:
             "k2": curvature_data["k2"],
             "principal_curvatures": [curvature_data["k1"], curvature_data["k2"]],
             "on_object": on_object,
-            "depth": depth,
+            "on_object_raw": on_object_raw,
+            "depth": float(depth),
+            "face_id": face_id,
             "passed_through": getattr(self, "_passed_through", False),
             "goal_normal": goal_normal,
             "detach_had_collision": getattr(self, "_detach_had_collision", False),
             "detach_sub_steps": getattr(self, "_last_detach_sub_steps", 1),
             "path_blocked": path_blocked,
+            "pb_hits": pb_hits,
+            "pb_hit_min": pb_hit_min,
+            "pb_goal_dist": pb_goal_dist,
+            "pb_margin": pb_margin,
             "up_direction": self.up_direction.tolist(),
             "object_center": self.mesh.centroid.tolist(),
             "same_side": same_side,
+            "same_side_raw": bool(same_side_raw),
+            "same_side_method": same_side_method,
             "object_extents": (self.mesh.bounds[1] - self.mesh.bounds[0]).tolist(),
             "edge_traversed": getattr(self, "_edge_traversed", False),
             "open_edge_height": self.open_edge_height,
             "snap_debug": getattr(self, "_last_snap_debug", ""),
         }
-
+        
     def _same_side_air(self, agent_pos, goal_pos, agent_normal):
         """Determine same_side when agent is in air.
         
@@ -538,60 +566,123 @@ class LightweightEnv:
         rot_matrix = np.column_stack([right, up, forward])
         return R.from_matrix(rot_matrix).as_euler("xyz")
 
-    def _move_tangentially(self, direction_degrees, step_size, snap_to_surface=True):
+    def _move_tangentially(
+        self,
+        direction_degrees,
+        step_size,
+        snap_to_surface: bool = True,
+    ):
         """Move agent along surface tangent with snap."""
-        
-        # 1. Compute movement
-        old_pos, old_normal, world_dir = self._compute_tangent_move(
+
+        # --- NEW: capture pre-move sensor for diagnostics ---
+        pre_sensor = self.get_sensor_data()
+        old_face_id = pre_sensor.get("face_id")
+        old_normal = pre_sensor.get("point_normal")
+        if old_normal is not None:
+            old_normal = np.asarray(old_normal, dtype=float)
+            old_normal /= np.linalg.norm(old_normal) + 1e-12
+        else:
+            old_normal = None
+
+        # 1) Compute movement
+        old_pos, old_n, world_dir = self._compute_tangent_move(
             direction_degrees, step_size
         )
-        if old_normal is None:
-            return  # no surface, raw move already applied
-        
+        if old_n is None:
+            # no surface, raw move already applied
+            # Keep debug minimal
+            self._last_snap_debug = f"raw|step={step_size:.1f}|fid={old_face_id}"
+            return
+
         if not snap_to_surface:
+            self._last_snap_debug = f"nosnap|step={step_size:.1f}|fid={old_face_id}"
             return
 
         # Get curvature at current point for _is_horizontal check
         curvature = self._estimate_curvature()
         curv_k1 = curvature.get("k1", 0.0)
-        
-        # 2. Find snap target
+
+        # 2) Find snap target
         snap = self._find_snap_target(
-            old_pos, old_normal, world_dir, step_size,
+            old_pos, old_n, world_dir, step_size,
             curvature_k1=curv_k1,
         )
 
         if snap is None:
             self.agent_pos = old_pos  # too far from surface
+            self._last_snap_debug = f"nosurf|step={step_size:.1f}|fid={old_face_id}"
             return
-        
-        # 3. Validate: through-wall check
-        snap = self._validate_snap(old_pos, old_normal, world_dir, snap, step_size)
-        
-        # 4. Apply
-        if snap["valid"]:
+
+        # 3) Validate: through-wall check
+        snap = self._validate_snap(old_pos, old_n, world_dir, snap, step_size)
+
+        # 4) Apply
+        if snap.get("valid", False):
             self.agent_pos = snap["position"]
             self.agent_rot = self._look_at_direction(-snap["normal"])
             self._edge_traversed = snap.get("edge_traversed", False)
-            
+
             # Snap debug info
             center = np.array(self.mesh.centroid, dtype=float)
             from_c = snap["position"] - center
             from_c[self.height_axis] = 0
             dist_c = float(np.linalg.norm(from_c))
             move_d = float(np.linalg.norm(snap["position"] - old_pos))
-            ws = getattr(self, '_wall_side_debug', '')
+
+            # Existing wall-side debug (from _find_snap_target)
+            ws = getattr(self, "_wall_side_debug", "")
             ws_str = f"|ws={ws}" if ws else ""
-            
+
+            # --- NEW: pull extended snap details if available ---
+            snap_face_id = snap.get("snap_face_id", None)
+            snap_dist = snap.get("snap_dist", None)
+            dot_old_new = snap.get("dot_old_new_n", None)
+            can_transition = snap.get("can_transition", None)
+
+            # through-wall diag if you store it in _check_through_wall
+            twc = int(getattr(self, "_last_through_wall_count", 0) or 0)
+            tw = 1 if twc > 0 else 0
+
+            # fallback dot if not provided
+            if dot_old_new is None and old_normal is not None:
+                n_new = np.asarray(snap["normal"], dtype=float)
+                n_new /= np.linalg.norm(n_new) + 1e-12
+                dot_old_new = float(np.dot(old_normal, n_new))
+
+            # build compact fields
+            sd_str = f"{snap_dist:.2f}" if isinstance(snap_dist, (int, float)) else "na"
+            dot_str = f"{dot_old_new:.3f}" if isinstance(dot_old_new, (int, float)) else "na"
+            ct_str = f"{int(can_transition)}" if isinstance(can_transition, (bool, np.bool_)) else "na"
+            fid_str = f"{old_face_id}->{snap_face_id}" if snap_face_id is not None else f"{old_face_id}->na"
+
             self._last_snap_debug = (
-                f"ok|dc={dist_c:.1f}"
+                f"ok"
+                f"|dc={dist_c:.1f}"
                 f"|md={move_d:.1f}"
+                f"|step={float(step_size):.1f}"
+                f"|sd={sd_str}"
+                f"|fid={fid_str}"
+                f"|dot={dot_str}"
+                f"|ct={ct_str}"
+                f"|tw={tw}|twn={twc}"
                 f"|edge={int(snap.get('edge_traversed', False))}"
                 f"{ws_str}"
             )
         else:
             self.agent_pos = old_pos
-            self._last_snap_debug = f"blocked|ws={getattr(self, '_wall_side_debug', '')}"
+            ws = getattr(self, "_wall_side_debug", "")
+            ws_str = f"|ws={ws}" if ws else ""
+            snap_face_id = snap.get("snap_face_id", None)
+            fid_str = f"{old_face_id}->{snap_face_id}" if snap_face_id is not None else f"{old_face_id}->na"
+            twc = int(getattr(self, "_last_through_wall_count", 0) or 0)
+            tw = 1 if twc > 0 else 0
+            self._last_snap_debug = (
+                f"blocked"
+                f"|step={float(step_size):.1f}"
+                f"|fid={fid_str}"
+                f"|tw={tw}|twn={twc}"
+                f"{ws_str}"
+            )
 
     def _compute_tangent_move(self, direction_degrees, step_size):
         """Compute tangent direction and move agent.
@@ -654,49 +745,41 @@ class LightweightEnv:
     def _find_snap_target(self, old_pos, old_normal, world_dir, step_size, curvature_k1=None):
         """Find the best surface point to snap to."""
         self._wall_side_debug = ""
-        
-        closest, dist, face_id = self.mesh.nearest.on_surface(
-            [self.agent_pos]
-        )
-        
+
+        closest, dist, face_id = self.mesh.nearest.on_surface([self.agent_pos])
+
+        # Diagnostics from nearest query (initial)
+        snap_face_id = int(face_id[0]) if len(face_id) > 0 else None
+        snap_dist = float(dist[0]) if len(dist) > 0 else None
+
         if dist[0] > 15.0:
             return None
-        
+
         hit_n = self.mesh.face_normals[face_id[0]].copy()
         hit_n /= np.linalg.norm(hit_n) + 1e-12
-        
+
         is_from_horiz = self._is_horizontal(old_normal, curvature_k1)
-        
+
         # Compute curvature at snap point for is_new_horiz
         snap_k1 = None
         snap_vertex_indices = self.mesh.faces[face_id[0]]
         if hasattr(self, "_vertex_mean_curvature"):
-            snap_H = float(np.mean(
-                self._vertex_mean_curvature[snap_vertex_indices]
-            ))
-            snap_K = float(np.mean(
-                self._vertex_gaussian_curvature[snap_vertex_indices]
-            ))
+            snap_H = float(np.mean(self._vertex_mean_curvature[snap_vertex_indices]))
+            snap_K = float(np.mean(self._vertex_gaussian_curvature[snap_vertex_indices]))
             disc = max(snap_H * snap_H - snap_K, 0.0)
             snap_k1 = float(snap_H + np.sqrt(disc))
-        
+
         is_new_horiz = self._is_horizontal(hit_n, snap_k1)
-        
-        hit_n = self._align_normal(
-            hit_n, old_normal, is_from_horiz
-        )
-        
+
+        hit_n = self._align_normal(hit_n, old_normal, is_from_horiz)
+
         can_transition = self._can_transition(
             hit_n, old_normal, is_from_horiz, is_new_horiz
         )
-        
+
         edge_traversed = False
-        
-        if (
-            can_transition
-            and not is_from_horiz
-            and not is_new_horiz
-        ):
+
+        if can_transition and not is_from_horiz and not is_new_horiz:
             edge_result = self._probe_for_edge(
                 old_normal, world_dir, closest[0], step_size
             )
@@ -704,16 +787,14 @@ class LightweightEnv:
                 closest = [edge_result["point"]]
                 hit_n = edge_result["normal"]
                 edge_traversed = True
-        
+
         if (
             not can_transition
             and not is_from_horiz
             and is_new_horiz
             and dist[0] < step_size * 2.0
         ):
-            vert = abs(float(
-                np.dot(world_dir, self.up_direction)
-            ))
+            vert = abs(float(np.dot(world_dir, self.up_direction)))
             if vert > 0.2:
                 can_transition = True
                 edge_traversed = True
@@ -728,25 +809,36 @@ class LightweightEnv:
             f"|on={[round(x,2) for x in old_normal.tolist()]}"
         )
 
+        # Helper: dot(old_normal, hit_n) diagnostic
+        dot_old_new = float(np.dot(old_normal, hit_n)) if old_normal is not None else None
+
         if not can_transition:
             edge_result = self._try_intermediate_edge(
-                old_pos, old_normal, world_dir, step_size,
-                is_from_horiz
+                old_pos, old_normal, world_dir, step_size, is_from_horiz
             )
             if edge_result is not None:
+                # attach diagnostics to intermediate result too
+                edge_result["snap_face_id"] = snap_face_id
+                edge_result["snap_dist"] = snap_dist
+                edge_result["dot_old_new_n"] = dot_old_new
+                edge_result["can_transition"] = False
                 return edge_result
+
             return {
                 "position": old_pos,
                 "normal": old_normal,
                 "valid": False,
+                "edge_traversed": False,
+                # diagnostics
+                "snap_face_id": snap_face_id,
+                "snap_dist": snap_dist,
+                "dot_old_new_n": dot_old_new,
+                "can_transition": False,
             }
-        
+
         # ═══ Correct side for hollow objects ═══
         if is_from_horiz and not is_new_horiz:
-            if (
-                hasattr(self, '_current_goal')
-                and self._current_goal is not None
-            ):
+            if hasattr(self, "_current_goal") and self._current_goal is not None:
                 hit_n_h = hit_n.copy()
                 hit_n_h[self.height_axis] = 0.0
                 hn_len = np.linalg.norm(hit_n_h)
@@ -768,16 +860,10 @@ class LightweightEnv:
                     gr_len = 0.0
 
                     if from_bottom:
-                        from_inner_bottom = (
-                            old_normal[self.height_axis]
-                            * self.up_sign > 0
-                        )
+                        from_inner_bottom = (old_normal[self.height_axis] * self.up_sign > 0)
                         if sr_len > 1e-8:
                             normal_is_outward = (
-                                float(np.dot(
-                                    hit_n_h / hn_len,
-                                    snap_radial / sr_len,
-                                )) > 0
+                                float(np.dot(hit_n_h / hn_len, snap_radial / sr_len)) > 0
                             )
                             if from_inner_bottom:
                                 need_flip = normal_is_outward
@@ -792,59 +878,42 @@ class LightweightEnv:
                         agent_radial = old_pos - self._mesh_centroid
                         agent_radial[self.height_axis] = 0.0
                         ar_len = float(np.linalg.norm(agent_radial))
-                        
+
                         if sr_len > 1e-8 and ar_len > 1e-8:
                             normal_is_outward = (
-                                float(np.dot(
-                                    hit_n_h / hn_len,
-                                    snap_radial / sr_len,
-                                )) > 0
+                                float(np.dot(hit_n_h / hn_len, snap_radial / sr_len)) > 0
                             )
-                            
+
                             radial_dir = agent_radial / ar_len
-                            
-                            # ═══ Probe OUTWARD to find outer wall at rim level ═══
+
+                            # Probe outward
                             probe_out = old_pos.copy()
                             probe_out += radial_dir * 5.0
                             cl_out, _, _ = self.mesh.nearest.on_surface([probe_out])
                             out_radial = cl_out[0] - self._mesh_centroid
                             out_radial[self.height_axis] = 0.0
                             outer_radius = float(np.linalg.norm(out_radial))
-                            
-                            # ═══ Probe INWARD to find inner wall at rim level ═══
+
+                            # Probe inward
                             probe_in = old_pos.copy()
                             probe_in -= radial_dir * 5.0
                             cl_in, _, _ = self.mesh.nearest.on_surface([probe_in])
                             in_radial = cl_in[0] - self._mesh_centroid
                             in_radial[self.height_axis] = 0.0
                             inner_radius = float(np.linalg.norm(in_radial))
-                            
-                            # Wall midline at rim height
+
                             wall_midline = (outer_radius + inner_radius) / 2.0
-                            
-                            # Agent on inner edge if closer to center than midline
                             agent_on_inner_edge = ar_len < wall_midline
-                            
-                            # Goal analysis (for debug, not used in decision)
-                            goal_radial = (
-                                self._current_goal[:3] - self._mesh_centroid
-                            )
+
+                            goal_radial = (self._current_goal[:3] - self._mesh_centroid)
                             goal_radial[self.height_axis] = 0.0
                             gr_len = float(np.linalg.norm(goal_radial))
-                            
-                            # ═══ KEY LOGIC ═══
-                            # Agent crawled UP to rim from one side,
-                            # now falls DOWN the OTHER side.
-                            # inner edge → came from inside → wants OUTSIDE
-                            # outer edge → came from outside → wants INSIDE
-                            
+
                             if agent_on_inner_edge:
-                                # Came from inside → want outer wall
                                 need_flip = not normal_is_outward
                             else:
-                                # Came from outside → want inner wall  
                                 need_flip = normal_is_outward
-                            
+
                             nf_info = (
                                 f"rim|ar={ar_len:.1f}"
                                 f"|sr={sr_len:.1f}"
@@ -856,111 +925,50 @@ class LightweightEnv:
                                 f"|flip={int(need_flip)}"
                             )
                         else:
-                            nf_info = (
-                                f"rim|skip"
-                                f"|sr={sr_len:.1f}"
-                                f"|ar={ar_len:.1f}"
-                            )
+                            nf_info = f"rim|skip|sr={sr_len:.1f}|ar={ar_len:.1f}"
 
-                    # Debug
                     gdc_str = f"|gdc={gr_len:.1f}" if from_rim else ""
                     self._wall_side_debug = (
-                        f"nf={int(need_flip)}"
-                        f"|{nf_info}"
-                        f"|sdc={sr_len:.1f}"
-                        f"{gdc_str}"
+                        f"nf={int(need_flip)}|{nf_info}|sdc={sr_len:.1f}{gdc_str}"
                     )
 
                     if need_flip:
-                        opp_pos = (
-                            closest[0] - hit_n * 5.0
-                        )
-                        cl_opp, d_opp, f_opp = (
-                            self.mesh.nearest.on_surface(
-                                [opp_pos]
-                            )
-                        )
-                        n_opp = self.mesh.face_normals[
-                            f_opp[0]
-                        ].copy()
-                        n_opp /= (
-                            np.linalg.norm(n_opp)
-                            + 1e-12
-                        )
+                        opp_pos = closest[0] - hit_n * 5.0
+                        cl_opp, d_opp, f_opp = self.mesh.nearest.on_surface([opp_pos])
+                        n_opp = self.mesh.face_normals[f_opp[0]].copy()
+                        n_opp /= np.linalg.norm(n_opp) + 1e-12
 
-                        if not self._is_horizontal(
-                            n_opp
-                        ):
+                        if not self._is_horizontal(n_opp):
                             n_opp_h = n_opp.copy()
-                            n_opp_h[
-                                self.height_axis
-                            ] = 0.0
-                            nol = np.linalg.norm(
-                                n_opp_h
-                            )
+                            n_opp_h[self.height_axis] = 0.0
+                            nol = np.linalg.norm(n_opp_h)
                             if nol > 1e-8:
-                                opp_r = (
-                                    cl_opp[0]
-                                    - self._mesh_centroid
-                                )
-                                opp_r[
-                                    self.height_axis
-                                ] = 0.0
-                                opp_sr = float(
-                                    np.linalg.norm(
-                                        opp_r
-                                    )
-                                )
+                                opp_r = cl_opp[0] - self._mesh_centroid
+                                opp_r[self.height_axis] = 0.0
+                                opp_sr = float(np.linalg.norm(opp_r))
                                 if opp_sr > 1e-8:
-                                    opp_outward = (
-                                        float(
-                                            np.dot(
-                                                n_opp_h
-                                                / nol,
-                                                opp_r
-                                                / opp_sr,
-                                            )
-                                        )
-                                        > 0
-                                    )
+                                    opp_outward = float(np.dot(n_opp_h / nol, opp_r / opp_sr)) > 0
                                     if from_bottom:
-                                        if (
-                                            from_inner_bottom
-                                        ):
-                                            ok = (
-                                                not opp_outward
-                                            )
+                                        if from_inner_bottom:
+                                            ok = (not opp_outward)
                                         else:
-                                            ok = (
-                                                opp_outward
-                                            )
+                                            ok = opp_outward
                                     else:
-                                        # from_rim: crossing
-                                        # to other side
-                                        if (
-                                            agent_on_inner_edge
-                                        ):
-                                            ok = (
-                                                opp_outward
-                                            )
+                                        if agent_on_inner_edge:
+                                            ok = opp_outward
                                         else:
-                                            ok = (
-                                                not opp_outward
-                                            )
+                                            ok = (not opp_outward)
                                     if ok:
                                         hit_n = n_opp
-                                        closest = (
-                                            cl_opp
-                                        )
+                                        closest = cl_opp
                 else:
                     self._wall_side_debug = "hn0"
             else:
                 self._wall_side_debug = "nogoal"
 
-
-        # Recompute is_new_horiz after edge traversal
-        # (edge traversal may have changed hit_n)
+        # Recompute is_new_horiz after potential changes
         is_new_horiz = self._is_horizontal(hit_n)
+
         # UNCONDITIONAL DEBUG
         self._wall_side_debug = (
             f"PRE|fh={int(is_from_horiz)}"
@@ -969,42 +977,22 @@ class LightweightEnv:
             f"|edge={int(edge_traversed)}"
         )
 
-        # ═══ Side consistency: wall → horizontal ═══
-        # If inner wall → outer bottom (crossed through),
-        # find inner bottom instead.
+        # Side consistency: wall -> horizontal
         if not is_from_horiz and is_new_horiz:
-            # Check by position, not by normal
-            # (normal may be flipped by _probe_for_edge)
             snap_h = closest[0][self.height_axis]
             bmin_h = self.mesh.bounds[0][self.height_axis]
             bmax_h = self.mesh.bounds[1][self.height_axis]
 
-            # DEBUG INSIDE
-            self._wall_side_debug = (
-                f"INSIDE_SC|sh={snap_h:.1f}"
-                f"|bm={bmin_h:.1f}"
-            )
-            
             old_n_h = old_normal.copy()
             old_n_h[self.height_axis] = 0.0
             old_radial = old_pos - self._mesh_centroid
             old_radial[self.height_axis] = 0.0
 
-            if (
-                np.linalg.norm(old_n_h) > 0.3
-                and np.linalg.norm(old_radial) > 1e-8
-            ):
+            if np.linalg.norm(old_n_h) > 0.3 and np.linalg.norm(old_radial) > 1e-8:
                 was_inner = float(np.dot(old_n_h, old_radial)) < 0
-                
-                # Outer bottom: snap point near bbox_min
-                # Inner bottom: snap point NOT near bbox_min
-                # (inner bottom z ≈ bbox_min + wall_thickness)
                 snap_near_bbox_min = abs(snap_h - bmin_h) < 3.0
-                snap_near_bbox_max = abs(snap_h - bmax_h) < 3.0
-                
-                # Crossing: inner wall → outer bottom
                 is_outer_bottom = snap_near_bbox_min and was_inner
-                
+
                 self._wall_side_debug = (
                     f"SC|sh={snap_h:.1f}"
                     f"|bm={bmin_h:.1f}"
@@ -1014,58 +1002,66 @@ class LightweightEnv:
                 )
 
                 if is_outer_bottom:
-                    # Probe UPWARD from outer bottom to find inner bottom
                     probe = closest[0] + self.up_direction * 5.0
-                    cl_fb, d_fb, f_fb = (
-                        self.mesh.nearest.on_surface([probe])
-                    )
+                    cl_fb, d_fb, f_fb = self.mesh.nearest.on_surface([probe])
                     n_fb = self.mesh.face_normals[f_fb[0]].copy()
                     n_fb /= np.linalg.norm(n_fb) + 1e-12
-                    
-                    # Inner bottom: z > outer bottom z
-                    # (inner bottom z ≈ bbox_min + wall_thickness)
+
                     fb_z = cl_fb[0][self.height_axis]
-                    is_above_outer = (
-                        (fb_z - bmin_h) * self.up_sign > 1.0
-                    )
-                    
+                    is_above_outer = (fb_z - bmin_h) * self.up_sign > 1.0
+
                     if self._is_horizontal(n_fb) and is_above_outer:
-                        # Align normal toward agent
                         agent_to_fb = old_pos - cl_fb[0]
                         if np.dot(n_fb, agent_to_fb) < 0:
                             n_fb = -n_fb
                         hit_n = n_fb
                         closest = cl_fb
                     else:
+                        dot_old_new = float(np.dot(old_normal, hit_n)) if old_normal is not None else None
                         return {
                             "position": old_pos,
                             "normal": old_normal,
                             "valid": False,
+                            "edge_traversed": False,
+                            # diagnostics
+                            "snap_face_id": snap_face_id,
+                            "snap_dist": snap_dist,
+                            "dot_old_new_n": dot_old_new,
+                            "can_transition": True,
                         }
-        # ═══ Side consistency: wall → wall ═══
-        # Use normal dot product instead of outward check.
-        # Outward check fails on thin/curved objects where
-        # normals relative to centroid are unreliable.
-        # Dot product directly detects opposite-side snap:
-        #   dot > 0: same side (normals agree)
-        #   dot ≈ 0: perpendicular (edge transition, handled elsewhere)
-        #   dot < -0.3: opposite side (normals oppose)
+
+        # Side consistency: wall -> wall (dot check)
         if not is_from_horiz and not is_new_horiz:
             dot_normals = float(np.dot(old_normal, hit_n))
             if dot_normals < -0.5:
+                dot_old_new = float(np.dot(old_normal, hit_n)) if old_normal is not None else None
                 return {
                     "position": old_pos,
                     "normal": old_normal,
                     "valid": False,
+                    "edge_traversed": False,
+                    # diagnostics
+                    "snap_face_id": snap_face_id,
+                    "snap_dist": snap_dist,
+                    "dot_old_new_n": dot_old_new,
+                    "can_transition": True,
                 }
 
         new_pos = closest[0] + hit_n * 2.0
+
+        # Final diagnostics (after all adjustments)
+        dot_old_new = float(np.dot(old_normal, hit_n)) if old_normal is not None else None
 
         return {
             "position": new_pos,
             "normal": hit_n,
             "edge_traversed": edge_traversed,
             "valid": True,
+            # diagnostics
+            "snap_face_id": snap_face_id,
+            "snap_dist": snap_dist,
+            "dot_old_new_n": dot_old_new,
+            "can_transition": bool(can_transition),
         }
     
     def _is_horizontal_old(self, normal):
@@ -1214,15 +1210,20 @@ class LightweightEnv:
         
         return snap
 
-
     def _check_through_wall(self, old_pos, new_pos, margin=2.5):
-        """Check if path passes through mesh geometry."""
+        """Check if path passes through mesh geometry.
+
+        Saves diagnostic count in self._last_through_wall_count.
+        """
         move_vec = new_pos - old_pos
         move_dist = float(np.linalg.norm(move_vec))
-        
+
+        # default diag
+        self._last_through_wall_count = 0
+
         if move_dist <= margin * 2:
             return False
-        
+
         move_dir = move_vec / move_dist
         locs, _, _ = self.mesh.ray.intersects_location(
             ray_origins=[old_pos],
@@ -1230,11 +1231,13 @@ class LightweightEnv:
         )
         if len(locs) == 0:
             return False
-        
+
         dists = np.linalg.norm(locs - old_pos, axis=1)
-        return int(np.sum(
+        count = int(np.sum(
             (dists > margin) & (dists < move_dist - margin)
-        )) > 0
+        ))
+        self._last_through_wall_count = count
+        return count > 0
 
     def _correct_wall_side(self, old_pos, old_normal, snap_point, hit_n):
         """Ensure wall normal points to same side as agent was on.

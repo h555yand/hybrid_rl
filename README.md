@@ -18,6 +18,38 @@ We validate the approach for:
 
 ---
 ---
+## Known limitation: rounded rims / openings on real meshes (YCB mug/bowl)
+
+Our lightweight simulator (`LightweightEnv` + trimesh) supports fast RL experiments on object surfaces using ray-cast depth/normal sensing and a “tangent step + snap-to-surface” motion model. On simple geometric primitives (cube/cylinder/sphere) this behaves reliably. However, on real meshes with *rounded rims* and *thin, closely spaced inner/outer surfaces* (e.g., YCB `mug`, `bowl`) the environment may exhibit non-physical transitions near the opening.
+
+### Symptoms
+Near a rounded rim / opening, the agent may:
+- **“Teleport” across the wall** (e.g., outside → inside) due to snap-to-surface selecting the opposite side of a thin/rounded geometry.
+- **Oscillate / stall near the rim** (limit-cycle behavior), repeatedly snapping between nearby triangles with low net progress.
+- **Trigger false contact loss (“lost_object”)** when depth briefly exceeds the on-surface threshold during rim traversal.
+
+These effects can produce **false collisions or timeouts** that are caused by the environment’s geometric approximation rather than the RL policy.
+
+### Root cause (high level)
+The current surface locomotion model is approximate:
+1. apply a tangential move in world space,
+2. “snap” to the nearest surface point via `nearest.on_surface`,
+3. apply heuristic transition checks (edge probing, through-wall checks).
+
+On rounded rims and thin walls, multiple surface candidates can be at similar distance, so “nearest surface” can switch abruptly between inner/outer faces. Single-ray through-wall checks may miss grazing or near-tangent cases.
+
+### Impact on RL experiments
+This is treated as a **known limitation of the environment**, not a failure of the RL algorithm. For RL benchmarking, keep in mind that reported failures near rims/openings may include environment artifacts.
+
+### Possible improvements (future work)
+Without changing the overall RL design, the environment could be made more robust by:
+- **Hysteresis / filtering** for surface contact (`on_object`) and inside/outside classification (`same_side`) to reduce threshold jitter near rims.
+- **Snap safety checks** to prevent large snap jumps or abrupt normal flips unless an explicit edge transition is intended.
+- **Multi-ray or volumetric validation** for “through-wall” detection to handle grazing intersections more reliably.
+- **Rim-aware transition mode** (a dedicated “edge traversal” procedure) for smooth openings, instead of relying on generic nearest-point snapping.
+- **Adaptive step size near high curvature** (smaller tangential steps near rounded rims) to reduce ambiguous nearest-surface matches.
+
+We intentionally keep the current implementation simple and fast for iteration; the above items are candidates for future environment-quality upgrades.
 ---
 
 # Bio-Inspired Hybrid RL for 3D Object Navigation

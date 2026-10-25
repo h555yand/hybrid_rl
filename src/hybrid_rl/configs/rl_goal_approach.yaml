@@ -21,15 +21,15 @@ promote_threshold: 0.5
 promote_window: 100
 
 curriculum_levels:
-  - [10.0, 60.0]    # L0: same_side, no path_blocked
-  - [10.0, 80.0]    # L1: same_side, path_blocked
+  #- [10.0, 60.0]    # L0: same_side, no path_blocked
+  #- [10.0, 80.0]    # L1: same_side, path_blocked
   - [10.0, 120.0]   # L2: different sides
   #- [10.0, 120.0]   # L3: handle as obstacle
 
 
 curriculum_filters:
-  - {same_side: true, path_blocked: false}
-  - {same_side: true, path_blocked: true}
+  #- {same_side: true, path_blocked: false}
+  #- {same_side: true, path_blocked: true}
   - {same_side: false}
   #- {"handle_between": True, same_side: true, path_blocked: true}
 
@@ -375,15 +375,15 @@ ycb_config:
     ycb_bowl:
       mujoco_name: bowl
       glb_name: 024_bowl
-    ycb_can:
-      mujoco_name: master_chef_can
-      glb_name: 002_master_chef_can
-    ycb_banana:
-      mujoco_name: banana
-      glb_name: 011_banana
-    ycb_cracker_box:
-      mujoco_name: cracker_box
-      glb_name: 003_cracker_box
+    #ycb_can:
+    #  mujoco_name: master_chef_can
+    #  glb_name: 002_master_chef_can
+    #ycb_banana:
+    #  mujoco_name: banana
+    #  glb_name: 011_banana
+    #ycb_cracker_box:
+    #  mujoco_name: cracker_box
+    #  glb_name: 003_cracker_box
 
     #ycb_cups:
     #  mujoco_name: a_cups

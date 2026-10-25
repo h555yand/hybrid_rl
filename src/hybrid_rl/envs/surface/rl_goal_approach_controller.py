@@ -364,6 +364,8 @@ class RLGoalApproachController:
         self._episode_phase_counts: Dict[str, int] = {}
         self._episode_steps_history: List[int] = []
         self._success_steps_history: List[int] = []
+        self._last_collision: Optional[str] = None
+        self._last_collision_diag: str = ""
 
         logger.info(
             f"RLGoalApproachController initialized: "
@@ -487,6 +489,8 @@ class RLGoalApproachController:
         self._pending_strategic_detach = []
         self._pending_strategic_direction = None
         self._path_clear_streak = 0
+        self._last_collision = None
+        self._last_collision_diag = ""
 
         if self.is_training and self.mode != "adaptive":
             is_level_warmup = getattr(
@@ -1394,12 +1398,19 @@ class RLGoalApproachController:
     # COLLISION DETECTION
     # ══════════════════════════════════════════════════════════
     def _detect_collision(self, sensor_data):
+        # reset per-step diag
+        self._last_collision_diag = ""
+
         if sensor_data.get("passed_through", False):
-            print(f"COLL_DIAG: passed_through")
+            msg = "passed_through"
+            self._last_collision_diag = msg
+            # print(f"COLL_DIAG: {msg}")
             return "surface_violation"
 
         if sensor_data.get("detach_had_collision", False):
-            print(f"COLL_DIAG: detach_collision")
+            msg = "detach_collision"
+            self._last_collision_diag = msg
+            # print(f"COLL_DIAG: {msg}")
             return "detach_collision"
 
         depth = sensor_data.get("depth", self.config["max_sensor_range"])
@@ -1411,9 +1422,7 @@ class RLGoalApproachController:
         now_on = sensor_data.get("on_object", False)
 
         prev_depth = (
-            self._prev_sensor_data.get(
-                "depth", self.config["max_sensor_range"]
-            )
+            self._prev_sensor_data.get("depth", self.config["max_sensor_range"])
             if self._prev_sensor_data is not None
             else self.config["max_sensor_range"]
         )
@@ -1423,9 +1432,13 @@ class RLGoalApproachController:
             and prev_depth > 1.5
             and depth < self.config["min_valid_depth"]
         ):
-            print(f"COLL_DIAG: depth_violation depth={depth:.3f}, "
-                  f"prev_depth={prev_depth:.3f}, "
-                  f"min_valid={self.config['min_valid_depth']}")
+            msg = (
+                f"depth_violation depth={depth:.3f} "
+                f"prev_depth={prev_depth:.3f} "
+                f"min_valid={self.config['min_valid_depth']}"
+            )
+            self._last_collision_diag = msg
+            # print(f"COLL_DIAG: {msg}")
             return "surface_violation"
 
         if self._prev_sensor_data is not None and was_on and now_on:
@@ -1437,16 +1450,19 @@ class RLGoalApproachController:
                 if prev_normal is not None and curr_normal is not None:
                     dot = np.dot(np.array(prev_normal), np.array(curr_normal))
                     if dot < self.config["normal_flip_threshold"]:
-                        print(f"COLL_DIAG: normal_flip dot={dot:.4f}, "
-                              f"threshold={self.config['normal_flip_threshold']}, "
-                              f"prev_n={[round(x,3) for x in prev_normal]}, "
-                              f"curr_n={[round(x,3) for x in curr_normal]}, "
-                              f"depth={depth:.1f}, prev_depth={prev_depth:.1f}")
+                        msg = (
+                            f"normal_flip dot={dot:.4f} "
+                            f"thr={self.config['normal_flip_threshold']}"
+                        )
+                        self._last_collision_diag = msg
+                        # print(f"COLL_DIAG: {msg} ...")
                         return "surface_violation"
 
         if self._prev_sensor_data is not None:
             if was_on and not now_on:
-                print(f"COLL_DIAG: lost_object depth={depth:.1f}")
+                msg = f"lost_object depth={depth:.1f}"
+                self._last_collision_diag = msg
+                # print(f"COLL_DIAG: {msg}")
                 return "lost_object"
 
         return None
@@ -2469,8 +2485,35 @@ class RLGoalApproachController:
             )
 
         same_side = sensor_data.get("same_side", True)
+        same_side_raw = sensor_data.get("same_side_raw", same_side)
+        same_side_method = sensor_data.get("same_side_method", "?")
+
         path_blocked = sensor_data.get("path_blocked", False)
-        depth = sensor_data.get("depth", 100.0)
+        depth = float(sensor_data.get("depth", 100.0))
+
+        on_object_raw = sensor_data.get("on_object_raw", None)
+        face_id = sensor_data.get("face_id", None)
+
+        pb_hits = sensor_data.get("pb_hits", None)
+        pb_hit_min = sensor_data.get("pb_hit_min", None)
+        pb_goal_dist = sensor_data.get("pb_goal_dist", None)
+
+        # Format PB diagnostics compactly
+        pb_diag = ""
+        if pb_hits is not None:
+            pb_diag += f"|pbh={int(pb_hits)}"
+        if pb_hit_min is not None and pb_goal_dist is not None:
+            pb_diag += f"|pbd={float(pb_hit_min):.1f}/{float(pb_goal_dist):.1f}"
+
+        # Format on_object raw
+        onr_str = ""
+        if on_object_raw is not None:
+            onr_str = f"|onr={int(bool(on_object_raw))}"
+
+        # face id
+        fid_str = ""
+        if face_id is not None:
+            fid_str = f"|fid={int(face_id)}"
 
         subgoal_str = ""
         if getattr(self, "_current_subgoal_dir", None) is not None:
@@ -2490,64 +2533,44 @@ class RLGoalApproachController:
 
         fly_debug_str = ""
         if current_phase == "FLY_TO_EDGE":
-            if hasattr(self, '_fly_edge_debug') and self._fly_edge_debug:
+            if hasattr(self, "_fly_edge_debug") and self._fly_edge_debug:
                 fly_debug_str = f"|fly={self._fly_edge_debug}"
-            if hasattr(self, '_cross_side_debug') and self._cross_side_debug:
+            if hasattr(self, "_cross_side_debug") and self._cross_side_debug:
                 fly_debug_str += f"|cs={self._cross_side_debug}"
 
-        # ═══ Diagnostic: movement efficiency ═══
+        # Movement efficiency diagnostic
         eff = self._compute_movement_efficiency(window=20)
-        pos_len = len(getattr(self, '_position_history', []))
-        
-        # ═══ Diagnostic: crawl direction debug ═══
-        crawl_debug = ""
-        if current_phase in ("CRAWL_TO_EDGE", "CRAWL_TO_GOAL"):
-            # Recompute what _compute_crawl_to_edge_direction sees
-            goal_dir_dbg = self._current_goal[:3] - current_pose[:3]
-            pn = sensor_data.get("point_normal")
-            if pn is not None:
-                n_dbg = np.asarray(pn, dtype=float)
-                n_len_dbg = np.linalg.norm(n_dbg)
-                if n_len_dbg > 1e-8:
-                    n_dbg = n_dbg / n_len_dbg
-                    dist_dbg = float(np.linalg.norm(goal_dir_dbg))
-                    crawl_proj = goal_dir_dbg - np.dot(goal_dir_dbg, n_dbg) * n_dbg
-                    cl = float(np.linalg.norm(crawl_proj))
-                    ratio = cl / max(dist_dbg, 1e-8)
-                    al_dbg = float(np.dot(goal_dir_dbg / max(dist_dbg, 1e-8), n_dbg))
-                    k1_dbg = float(sensor_data.get("k1", 0.0))
-                    k2_dbg = float(sensor_data.get("k2", 0.0))
-                    is_flat_dbg = abs(k1_dbg) < 0.01 and abs(k2_dbg) < 0.01
-                    
-                    # Check degenerate conditions
-                    degen = (
-                        cl < 1.0
-                        or (dist_dbg > 10.0 and ratio < 0.15)
-                        or (is_flat_dbg and al_dbg < -0.85)
-                    )
-                    
-                    crawl_debug = (
-                        f"|cl={cl:.1f}"
-                        f"|ratio={ratio:.3f}"
-                        f"|flat={int(is_flat_dbg)}"
-                        f"|degen={int(degen)}"
-                        f"|k1={k1_dbg:.4f}"
-                    )
+        pos_len = len(getattr(self, "_position_history", []))
 
         snap_dbg = sensor_data.get("snap_debug", "")
         snap_str = f"|snap={snap_dbg}" if snap_dbg else ""
-        crawl_edge_dbg = getattr(self, '_crawl_edge_debug', '')
+
+        crawl_edge_dbg = getattr(self, "_crawl_edge_debug", "")
         ce_str = f"|ce={crawl_edge_dbg}" if crawl_edge_dbg else ""
 
+        coll = getattr(self, "_last_collision", None)
+        cdiag = getattr(self, "_last_collision_diag", "")
+        coll_str = f"|coll={coll}" if coll else ""
+        # cdiag лучше ограничить по длине, чтобы не раздувать actions.txt
+        if cdiag:
+            cdiag_short = cdiag[:80]
+            coll_str += f"|cdiag={cdiag_short}"
+
+        # --- UPDATED debug_prefix ---
         debug_prefix = (
             f"[phase={current_phase}|"
-            f"ss={int(same_side)}|"
-            f"pb={int(path_blocked)}|"
-            f"d={depth:.1f}"
+            f"ss={int(bool(same_side))}"
+            f"|ssr={int(bool(same_side_raw))}"
+            f"|ssm={same_side_method}"
+            f"|pb={int(bool(path_blocked))}"
+            f"|d={depth:.1f}"
+            f"{coll_str}"
+            f"{onr_str}"
+            f"{fid_str}"
+            f"{pb_diag}"
             f"|al={float(state[12]):.2f}"
             f"|eff={eff:.2f}"
             f"|plen={pos_len}"
-            f"{crawl_debug}"
             f"{ce_str}"
             f"{subgoal_str}"
             f"{normal_str}"
@@ -6389,6 +6412,7 @@ class RLGoalApproachController:
 
         state = self._compute_state(current_pose, sensor_data)
         collision = self._detect_collision(sensor_data)
+        self._last_collision = collision
         done = False
 
         if self._prev_state is not None:
