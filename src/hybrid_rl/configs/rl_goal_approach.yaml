@@ -1,7 +1,7 @@
 seed: 42
 # Visualization: null | text | pictures | video
 visualise: video
-regenerate_scripts: true
+regenerate_scripts: false
 do_train: false
 do_eval: false
 do_heur_eval: false

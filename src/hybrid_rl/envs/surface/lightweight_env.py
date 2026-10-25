@@ -57,6 +57,9 @@ class LightweightEnv:
         self._edge_traversed = None
         self._last_snap_debug = ""
         self._wall_side_debug = ""
+        self._pb_lift_mm = 6.0
+        self._pb_margin_mm = 2.0
+        self._pb_normal_agree_thr = 0.5
 
     @staticmethod
     def _normalize_euler(angles):
@@ -206,7 +209,7 @@ class LightweightEnv:
             _, _, gf_id = self.mesh.nearest.on_surface([goal_pos])
             goal_normal = self.mesh.face_normals[gf_id[0]].tolist()
 
-        # ═══ path_blocked (ray cast) + diagnostics ═══
+        # ═══ path_blocked: keep old single-ray diagnostics ═══
         path_blocked = False
         pb_hits = 0
         pb_hit_min = None
@@ -231,10 +234,65 @@ class LightweightEnv:
                     )
                     pb_hits = int(len(bl_locations))
                     pb_hit_min = float(np.min(hit_distances))
-
-                    # Blocked if any intersection is closer than goal
-                    # margin 2.0mm to avoid counting the goal surface itself
                     path_blocked = bool(pb_hit_min < dist_to_goal - pb_margin)
+
+        # ═══ NEW: lifted + normal-agreement path_blocked ═══
+        path_blocked_lifted = None
+        pbl_hits = 0
+        pbl_hit_min = None
+        pbl_goal_dist = None
+
+        pb_normal_dot = None
+        pb_normal_override = False
+
+        if hasattr(self, "_current_goal") and self._current_goal is not None:
+            goal_pos = self._current_goal[:3]
+
+            agent_n = None
+            if point_normal is not None:
+                agent_n = np.asarray(point_normal, dtype=float)
+                agent_n /= np.linalg.norm(agent_n) + 1e-12
+
+            goal_n = None
+            if goal_normal is not None:
+                goal_n = np.asarray(goal_normal, dtype=float)
+                goal_n /= np.linalg.norm(goal_n) + 1e-12
+
+            # 1) normal agreement override
+            if agent_n is not None and goal_n is not None:
+                pb_normal_dot = float(np.dot(agent_n, goal_n))
+                if pb_normal_dot > 0.5:
+                    pb_normal_override = True
+                    path_blocked_lifted = False
+
+            # 2) lifted raycast
+            if path_blocked_lifted is None and agent_n is not None and goal_n is not None:
+                lift = float(getattr(self, "_pb_lift_mm", 6.0))
+                margin = float(getattr(self, "_pb_margin_mm", 2.0))
+
+                origin = self.agent_pos + agent_n * lift
+                target = goal_pos + goal_n * lift
+                vec = target - origin
+                dist = float(np.linalg.norm(vec))
+                pbl_goal_dist = dist
+
+                if dist > 1e-8:
+                    dirn = vec / dist
+                    locs, _, _ = self.mesh.ray.intersects_location(
+                        ray_origins=[origin],
+                        ray_directions=[dirn],
+                    )
+                    if len(locs) > 0:
+                        dists = np.linalg.norm(locs - origin, axis=1)
+                        pbl_hits = int(len(locs))
+                        pbl_hit_min = float(np.min(dists))
+                        path_blocked_lifted = bool(pbl_hit_min < dist - margin)
+                    else:
+                        path_blocked_lifted = False
+
+            # 3) choose final
+            if path_blocked_lifted is not None:
+                path_blocked = bool(path_blocked_lifted)
 
         # ═══ Curvature ═══
         curvature_data = self._estimate_curvature()
@@ -245,21 +303,17 @@ class LightweightEnv:
         same_side_method = "none"
 
         if hasattr(self, "_current_goal") and self._current_goal is not None:
-            # keep behavior consistent with on_object used by env
             if on_object:
-                # On surface: use nearest.on_surface (reliable)
                 same_side_raw = _is_reachable_by_surface(
                     self, self.agent_pos, self._current_goal[:3]
                 )
                 same_side_method = "surface"
             else:
-                # In air: use ray-based inside/outside test
                 same_side_raw = self._same_side_air(
                     self.agent_pos, self._current_goal[:3],
                     point_normal,
                 )
                 same_side_method = "air"
-
             same_side = bool(same_side_raw)
 
         return {
@@ -271,15 +325,29 @@ class LightweightEnv:
             "on_object_raw": on_object_raw,
             "depth": float(depth),
             "face_id": face_id,
+
             "passed_through": getattr(self, "_passed_through", False),
             "goal_normal": goal_normal,
             "detach_had_collision": getattr(self, "_detach_had_collision", False),
             "detach_sub_steps": getattr(self, "_last_detach_sub_steps", 1),
+
+            # final pb (lifted if available)
             "path_blocked": path_blocked,
+
+            # old single-ray pb diagnostics
             "pb_hits": pb_hits,
             "pb_hit_min": pb_hit_min,
             "pb_goal_dist": pb_goal_dist,
             "pb_margin": pb_margin,
+
+            # lifted pb diagnostics
+            "path_blocked_lifted": path_blocked_lifted,
+            "pbl_hits": pbl_hits,
+            "pbl_hit_min": pbl_hit_min,
+            "pbl_goal_dist": pbl_goal_dist,
+            "pb_normal_dot": pb_normal_dot,
+            "pb_normal_override": pb_normal_override,
+
             "up_direction": self.up_direction.tolist(),
             "object_center": self.mesh.centroid.tolist(),
             "same_side": same_side,
@@ -290,7 +358,7 @@ class LightweightEnv:
             "open_edge_height": self.open_edge_height,
             "snap_debug": getattr(self, "_last_snap_debug", ""),
         }
-        
+                
     def _same_side_air(self, agent_pos, goal_pos, agent_normal):
         """Determine same_side when agent is in air.
         
@@ -566,15 +634,138 @@ class LightweightEnv:
         rot_matrix = np.column_stack([right, up, forward])
         return R.from_matrix(rot_matrix).as_euler("xyz")
 
-    def _move_tangentially(
-        self,
-        direction_degrees,
-        step_size,
-        snap_to_surface: bool = True,
-    ):
-        """Move agent along surface tangent with snap."""
+    def _raycast_distance(self, origin: np.ndarray, direction: np.ndarray) -> float:
+        """Return nearest hit distance along direction, or -1.0 if no hit."""
+        d = np.asarray(direction, dtype=float)
+        d_norm = float(np.linalg.norm(d))
+        if d_norm < 1e-12:
+            return -1.0
+        d = d / d_norm
 
-        # --- NEW: capture pre-move sensor for diagnostics ---
+        locs, _, _ = self.mesh.ray.intersects_location(
+            ray_origins=[origin],
+            ray_directions=[d],
+        )
+        if len(locs) == 0:
+            return -1.0
+
+        dists = np.linalg.norm(locs - origin, axis=1)
+        return float(np.min(dists))
+
+    def _multi_probe_raycast(
+        self,
+        origin: np.ndarray,
+        forward: np.ndarray,
+        rot: R,
+        prev_normal: Optional[np.ndarray] = None,
+        max_dist: float = 15.0,
+    ) -> Tuple[float, Optional[np.ndarray], str]:
+        """Probe rays to find a nearby surface reliably (MuJoCo-style).
+
+        Returns:
+            (best_dist, best_dir, tag)
+            - best_dist: hit distance in mm (float), or -1.0 if none
+            - best_dir: unit direction (np.ndarray shape (3,)) or None
+            - tag: source label (str)
+        """
+        fwd = np.asarray(forward, dtype=float)
+        fwd /= np.linalg.norm(fwd) + 1e-12
+
+        best_dist = float(max_dist)
+        best_dir = None
+        best_tag = "none"
+
+        # 1) forward
+        d = self._raycast_distance(origin, fwd)
+        if 0.0 < d < best_dist:
+            best_dist, best_dir, best_tag = float(d), fwd, "fwd"
+
+        # 2) toward previous surface (-prev_normal)
+        if prev_normal is not None:
+            pn = np.asarray(prev_normal, dtype=float)
+            pn /= np.linalg.norm(pn) + 1e-12
+            d = self._raycast_distance(origin, -pn)
+            if 0.0 < d < best_dist:
+                best_dist, best_dir, best_tag = float(d), -pn, "prev_n"
+        
+        # 3) cone around forward
+        right = rot.apply([1.0, 0.0, 0.0])
+        up = rot.apply([0.0, 1.0, 0.0])
+        right /= np.linalg.norm(right) + 1e-12
+        up /= np.linalg.norm(up) + 1e-12
+
+        probe_axes = [
+            up, -up, right, -right,
+            (up + right) / np.sqrt(2.0),
+            (up - right) / np.sqrt(2.0),
+            (-up + right) / np.sqrt(2.0),
+            (-up - right) / np.sqrt(2.0),
+        ]
+        probe_angles = [15, 30, 45, 60]
+
+        for ang_deg in probe_angles:
+            a = np.radians(float(ang_deg))
+            ca, sa = float(np.cos(a)), float(np.sin(a))
+            for axis in probe_axes:
+                v = fwd * ca + axis * sa
+                v /= np.linalg.norm(v) + 1e-12
+                d = self._raycast_distance(origin, v)
+                if 0.0 < d < best_dist:
+                    best_dist, best_dir, best_tag = float(d), v, f"cone{ang_deg}"
+
+        if best_dir is None:
+            return -1.0, None, "none"
+        return best_dist, best_dir, best_tag
+
+    def _resnap_by_raycast(
+        self,
+        origin: np.ndarray,
+        rot: R,
+        prev_normal: Optional[np.ndarray],
+        target_depth: float = 2.0,
+        max_dist: float = 15.0,
+    ) -> bool:
+        """Fallback: recover surface contact using multi-ray probing.
+
+        - origin: starting point in world mm
+        - rot: current agent rotation as scipy Rotation (world)
+        - prev_normal: surface normal before the move (unit or not)
+        """
+        forward = rot.apply([0.0, 0.0, -1.0])
+
+        hit_dist, hit_dir, tag = self._multi_probe_raycast(
+            origin=origin,
+            forward=forward,
+            rot=rot,
+            prev_normal=prev_normal,
+            max_dist=max_dist,
+        )
+        if hit_dir is None or hit_dist <= 0.0:
+            return False
+
+        # Move toward surface but stop at target depth
+        approach = float(hit_dist - target_depth)
+
+        # Safety: don't move backwards aggressively if already very close
+        if approach < -1.0:
+            approach = 0.0
+
+        new_pos = origin + hit_dir * approach
+
+        # Apply directly (no nearest.on_surface)
+        self.agent_pos = np.asarray(new_pos, dtype=float)
+
+        # Look toward surface (hit_dir points from agent to surface)
+        self.agent_rot = self._normalize_euler(self._look_at_direction(hit_dir))
+
+        # Minimal debug tag (will be included in snap_debug if you append it)
+        self._last_resnap_debug = f"tag={tag}|hit={hit_dist:.2f}|app={approach:.2f}"
+        return True
+
+    def _move_tangentially(self, direction_degrees, step_size, snap_to_surface=True):
+        """Move agent along surface tangent with snap + anomaly fallback."""
+
+        # --- capture pre-move sensor for diagnostics ---
         pre_sensor = self.get_sensor_data()
         old_face_id = pre_sensor.get("face_id")
         old_normal = pre_sensor.get("point_normal")
@@ -589,8 +780,6 @@ class LightweightEnv:
             direction_degrees, step_size
         )
         if old_n is None:
-            # no surface, raw move already applied
-            # Keep debug minimal
             self._last_snap_debug = f"raw|step={step_size:.1f}|fid={old_face_id}"
             return
 
@@ -598,7 +787,7 @@ class LightweightEnv:
             self._last_snap_debug = f"nosnap|step={step_size:.1f}|fid={old_face_id}"
             return
 
-        # Get curvature at current point for _is_horizontal check
+        # curvature at current point for is_horizontal check
         curvature = self._estimate_curvature()
         curv_k1 = curvature.get("k1", 0.0)
 
@@ -609,37 +798,34 @@ class LightweightEnv:
         )
 
         if snap is None:
-            self.agent_pos = old_pos  # too far from surface
+            self.agent_pos = old_pos
             self._last_snap_debug = f"nosurf|step={step_size:.1f}|fid={old_face_id}"
             return
 
-        # 3) Validate: through-wall check
+        # 3) Validate through-wall
         snap = self._validate_snap(old_pos, old_n, world_dir, snap, step_size)
 
-        # 4) Apply
+        # 4) Apply snap
         if snap.get("valid", False):
             self.agent_pos = snap["position"]
             self.agent_rot = self._look_at_direction(-snap["normal"])
             self._edge_traversed = snap.get("edge_traversed", False)
 
-            # Snap debug info
+            # compact snap debug
             center = np.array(self.mesh.centroid, dtype=float)
             from_c = snap["position"] - center
             from_c[self.height_axis] = 0
             dist_c = float(np.linalg.norm(from_c))
             move_d = float(np.linalg.norm(snap["position"] - old_pos))
 
-            # Existing wall-side debug (from _find_snap_target)
             ws = getattr(self, "_wall_side_debug", "")
             ws_str = f"|ws={ws}" if ws else ""
 
-            # --- NEW: pull extended snap details if available ---
             snap_face_id = snap.get("snap_face_id", None)
             snap_dist = snap.get("snap_dist", None)
             dot_old_new = snap.get("dot_old_new_n", None)
             can_transition = snap.get("can_transition", None)
 
-            # through-wall diag if you store it in _check_through_wall
             twc = int(getattr(self, "_last_through_wall_count", 0) or 0)
             tw = 1 if twc > 0 else 0
 
@@ -649,11 +835,14 @@ class LightweightEnv:
                 n_new /= np.linalg.norm(n_new) + 1e-12
                 dot_old_new = float(np.dot(old_normal, n_new))
 
-            # build compact fields
             sd_str = f"{snap_dist:.2f}" if isinstance(snap_dist, (int, float)) else "na"
             dot_str = f"{dot_old_new:.3f}" if isinstance(dot_old_new, (int, float)) else "na"
             ct_str = f"{int(can_transition)}" if isinstance(can_transition, (bool, np.bool_)) else "na"
-            fid_str = f"{old_face_id}->{snap_face_id}" if snap_face_id is not None else f"{old_face_id}->na"
+            fid_str = (
+                f"{old_face_id}->{snap_face_id}"
+                if snap_face_id is not None
+                else f"{old_face_id}->na"
+            )
 
             self._last_snap_debug = (
                 f"ok"
@@ -668,21 +857,59 @@ class LightweightEnv:
                 f"|edge={int(snap.get('edge_traversed', False))}"
                 f"{ws_str}"
             )
-        else:
-            self.agent_pos = old_pos
-            ws = getattr(self, "_wall_side_debug", "")
-            ws_str = f"|ws={ws}" if ws else ""
-            snap_face_id = snap.get("snap_face_id", None)
-            fid_str = f"{old_face_id}->{snap_face_id}" if snap_face_id is not None else f"{old_face_id}->na"
-            twc = int(getattr(self, "_last_through_wall_count", 0) or 0)
-            tw = 1 if twc > 0 else 0
-            self._last_snap_debug = (
-                f"blocked"
-                f"|step={float(step_size):.1f}"
-                f"|fid={fid_str}"
-                f"|tw={tw}|twn={twc}"
-                f"{ws_str}"
-            )
+
+            # ═══ NEW: cone-ray resnap fallback on anomaly ═══
+            # 1) surface contact lost but still near surface
+            post = self.get_sensor_data()
+            post_depth = float(post.get("depth", 100.0))
+            post_on = bool(post.get("on_object", False))
+
+            anomaly = False
+            if (not post_on) and (post_depth < 15.0):
+                anomaly = True
+
+            # 2) big snap jump
+            if move_d > 1.7 * float(step_size):
+                anomaly = True
+
+            # 3) strong normal flip
+            if isinstance(dot_old_new, (int, float)) and dot_old_new < -0.2:
+                anomaly = True
+
+            if anomaly and old_n is not None:
+                # Requires helper methods:
+                # _raycast_distance, _multi_probe_raycast, _resnap_by_raycast
+                ok = self._resnap_by_raycast(
+                    origin=self.agent_pos.copy(),
+                    rot=R.from_euler("xyz", self.agent_rot, degrees=True),
+                    prev_normal=old_n,
+                    target_depth=2.0,
+                    max_dist=15.0,
+                )
+                if ok:
+                    extra = getattr(self, "_last_resnap_debug", "")
+                    if extra:
+                        self._last_snap_debug = self._last_snap_debug + f"|fb=resnap({extra})"
+                    else:
+                        self._last_snap_debug = self._last_snap_debug + "|fb=resnap"
+
+            return
+
+        # invalid snap -> rollback
+        self.agent_pos = old_pos
+        ws = getattr(self, "_wall_side_debug", "")
+        ws_str = f"|ws={ws}" if ws else ""
+        snap_face_id = snap.get("snap_face_id", None)
+        fid_str = (
+            f"{old_face_id}->{snap_face_id}"
+            if snap_face_id is not None
+            else f"{old_face_id}->na"
+        )
+        twc = int(getattr(self, "_last_through_wall_count", 0) or 0)
+        tw = 1 if twc > 0 else 0
+        self._last_snap_debug = (
+            f"blocked|step={float(step_size):.1f}|fid={fid_str}|tw={tw}|twn={twc}{ws_str}"
+        )
 
     def _compute_tangent_move(self, direction_degrees, step_size):
         """Compute tangent direction and move agent.

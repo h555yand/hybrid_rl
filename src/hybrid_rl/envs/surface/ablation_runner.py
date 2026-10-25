@@ -1009,6 +1009,12 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
                     "up_sign": float(getattr(env, "up_sign", 0.0)),
                     "open_edge_height": float(getattr(env, "open_edge_height", 0.0)),
                 }
+                extra_info.update({
+                    "done_reason": getattr(controller, "_last_done_reason", None),
+                    "done_collision": getattr(controller, "_last_done_collision", None),
+                    "done_collision_diag": getattr(controller, "_last_done_collision_diag", ""),
+                    "done_step": getattr(controller, "_last_done_step", None),
+                })
                 visualizer.save_episode(
                     env=env,
                     episode=episode,

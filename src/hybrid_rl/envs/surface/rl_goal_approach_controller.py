@@ -366,6 +366,10 @@ class RLGoalApproachController:
         self._success_steps_history: List[int] = []
         self._last_collision: Optional[str] = None
         self._last_collision_diag: str = ""
+        self._last_done_reason: Optional[str] = None
+        self._last_done_collision: Optional[str] = None
+        self._last_done_collision_diag: str = ""
+        self._last_done_step: Optional[int] = None
 
         logger.info(
             f"RLGoalApproachController initialized: "
@@ -491,6 +495,10 @@ class RLGoalApproachController:
         self._path_clear_streak = 0
         self._last_collision = None
         self._last_collision_diag = ""
+        self._last_done_reason = None
+        self._last_done_collision = None
+        self._last_done_collision_diag = ""
+        self._last_done_step = None
 
         if self.is_training and self.mode != "adaptive":
             is_level_warmup = getattr(
@@ -596,6 +604,11 @@ class RLGoalApproachController:
                     if self.is_training:
                         self._apply_success_backup_updates()
                     self.success_trails = self._episode_transitions.copy()
+                # --- NEW: persist episode termination diagnostics for orchestrator/logging ---
+                self._last_done_reason = termination_reason
+                self._last_done_collision = collision
+                self._last_done_collision_diag = getattr(self, "_last_collision_diag", "") or ""
+                self._last_done_step = int(self._steps)
                 self._on_episode_done(state, termination_reason)
                 return None, None
 

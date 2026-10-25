@@ -17,6 +17,75 @@ We validate the approach for:
 
 
 ---
+## Known limitations / failure modes
+
+This project uses a lightweight geometry-based simulator (`LightweightEnv`, based on `trimesh`) and a hybrid RL controller (tactical Q-store + strategic transition memory / SAC). While it is fast and practical for iteration, several known limitations can produce non-intuitive failures (timeouts, false collisions, “stuck” behavior), especially on thin-walled/hollow objects (mugs, bowls).
+
+### 1) False “collision_surface_violation” from normal flips (`normal_flip`)
+**Symptom:** An episode terminates with `collision_surface_violation` and a diagnostic like:
+- `normal_flip dot=... thr=-0.5`
+
+Sometimes this happens even when the agent visually appears safe or near the goal.
+
+**Root cause:**
+- The collision detector compares **consecutive surface normals** and treats a large sign flip as a surface violation.
+- In `LightweightEnv`, `point_normal` is derived from **a ray cast along the sensor/view direction** (`get_sensor_data()`), not from the “contact surface” under the agent.
+- Near rims, thin walls, or concave regions, the view ray can hit the *opposite* side (inner wall vs outer wall) or a differently oriented triangle.
+- STL meshes may contain locally inconsistent triangle orientations; neighboring triangles can have opposite normals even without any physical penetration.
+
+**Impact:** False positives: valid transitions or harmless viewpoint changes may be labeled as collisions.
+
+### 2) False “collision_surface_violation” from depth thresholding (`depth_violation`)
+**Symptom:** Episode ends with:
+- `depth_violation depth=... prev_depth=... min_valid=...`
+
+**Root cause:**
+- The depth used for collision detection is **ray-depth** (what the sensor “sees”), not the actual clearance between the agent body and the mesh.
+- Small viewpoint changes can reduce measured depth below `min_valid_depth` even if the agent is not inside the mesh.
+- This is most common near curved surfaces, edges, and thin-walled geometry.
+
+**Impact:** Another false-positive collision mode that can trigger at the rim or during aggressive tangential snaps.
+
+### 3) Rim/neck “stuck” oscillations on hollow objects (mugs/bowls)
+**Symptom:** Agent reaches the rim/neck and then times out while alternating between a small set of surface states (e.g., rim ↔ wall), often with limited progress to the goal.
+
+**Root cause:**
+- The snap-to-surface procedure relies heavily on `nearest.on_surface()` which can jump between nearby surfaces around edges.
+- Phase logic tends to remain in `CRAWL_TO_EDGE` while `path_blocked` stays true, even after the rim is effectively reached.
+- Around the rim, `same_side` and `path_blocked` can be noisy/ambiguous (inside/outside transitions), and without a dedicated “rim-crossing” policy the agent may enter a limit cycle.
+- Strategic detach decisions may be conservative (or undertrained early), causing the controller to keep crawling instead of switching modes.
+
+**Impact:** Timeouts on mugs/bowls where a correct solution requires a stable “cross rim → move on inner surface” transition or a detach/fly maneuver.
+
+### 4) Contact vs perception mismatch (ray-based sensors)
+**Symptom:** Controller decisions and collision checks sometimes disagree with what “should” be happening physically.
+
+**Root cause:**
+- In the current simulator, both normals and depth are taken from the **forward viewing ray**.
+- This is a perceptual proxy and can diverge from the actual surface the agent is intended to be attached to (especially after snapping and orientation adjustments).
+
+**Impact:** Non-physical artifacts: the agent may be considered “on object” while sensing the opposite side, or vice versa, leading to unstable state estimation and abrupt termination.
+
+### 5) Sensitivity to mesh quality (non-watertight, thin walls, inconsistent normals)
+**Symptom:** Behavior varies significantly across meshes; some objects produce frequent false collisions or unstable snapping.
+
+**Root cause:**
+- Many STL assets are not guaranteed to be watertight or consistently oriented.
+- `trimesh` ray intersections and face normals are deterministic but depend on mesh cleanliness.
+
+**Impact:** Reproducibility is mesh-dependent; some assets may require preprocessing (normal unification, watertight repair, thickness handling) for stable training/evaluation.
+
+---
+
+### Recommended mitigations (high-level)
+These limitations are known and can be reduced by:
+- Separating **contact geometry** (nearest-surface normal / distance-to-surface) from **perception geometry** (view ray normal / depth).
+- Making `normal_flip` and `depth_violation` *non-terminal* unless confirmed by a geometric penetration test (e.g., along-motion ray test).
+- Adding dedicated rim/edge transition handling (rim state detection, cycle detection, forced detach/crossing policies).
+- Preprocessing meshes (repair, normal consistency, watertightness checks) when possible.
+
+(These mitigations are not fully implemented in the current version.)
+
 ---
 ## Known limitation: rounded rims / openings on real meshes (YCB mug/bowl)
 
