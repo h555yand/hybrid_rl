@@ -71,6 +71,8 @@ class AdaptiveTrainingManager:
         offline_check_window: int = 50,
         promote_threshold: float = 0.70,
         promote_window: int = 100,
+        enable_online_sac_updates: bool = True,
+        enable_offline_sac_retrain: bool = True,
     ):
         self.controller = controller
         self.env = env
@@ -132,6 +134,8 @@ class AdaptiveTrainingManager:
         self._offline_just_completed = False
         self._online_critic_warmup_updates = 0
         self._critic_warmup_threshold = 3
+        self.enable_online_sac_updates = enable_online_sac_updates
+        self.enable_offline_sac_retrain = enable_offline_sac_retrain
 
     @property
     def success_rate(self) -> float:
@@ -267,26 +271,30 @@ class AdaptiveTrainingManager:
             self.controller.epsilon = eps
             self.controller.strategic_epsilon = eps
             self._collect_transitions(success, transitions)
-            self._maybe_online_sac_update()
+            if self.enable_online_sac_updates:
+                self._maybe_online_sac_update()
             return
 
         if self.mode == "offline":
-            self._trigger_offline()
-            self._offline_just_completed = True
-            self.controller.mode = "adaptive"
-            eps = self._get_adaptive_epsilon()
-            self.controller.epsilon = eps
-            self.controller.strategic_epsilon = eps
-            self.mode = "online"
-            self.mode_changes.append({
-                "episode": self.total_episodes,
-                "from_mode": "offline",
-                "to_mode": "online",
-                "success_rate": 0.0,
-                "offline_iterations": self.total_offline_iterations,
-                "sac_updates": self.total_sac_updates,
-                "note": "post_offline_reset",
-            })
+            if not self.enable_offline_sac_retrain:
+                logger.info("OFFLINE SAC disabled (policy-only mode)")
+            else:
+                self._trigger_offline()
+                self._offline_just_completed = True
+                self.controller.mode = "adaptive"
+                eps = self._get_adaptive_epsilon()
+                self.controller.epsilon = eps
+                self.controller.strategic_epsilon = eps
+                self.mode = "online"
+                self.mode_changes.append({
+                    "episode": self.total_episodes,
+                    "from_mode": "offline",
+                    "to_mode": "online",
+                    "success_rate": 0.0,
+                    "offline_iterations": self.total_offline_iterations,
+                    "sac_updates": self.total_sac_updates,
+                    "note": "post_offline_reset",
+                })
 
     def _collect_transitions(
         self,

@@ -2113,6 +2113,7 @@ class RLGoalApproachController:
         if (
             warmup_episodes > 0
             and self._total_episodes <= warmup_episodes
+            and self.is_training
         ):
             combined = h_norm.copy()
             temperature = 0.001

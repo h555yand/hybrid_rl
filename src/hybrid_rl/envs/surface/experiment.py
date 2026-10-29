@@ -2039,6 +2039,8 @@ class RLGoalApproachExperiment:
         sac_trainer = PSACTrainer(
             state_dim=self.rl_config.get("state_dim", 20),
             num_types=num_types,
+            max_steps_per_goal=int(self.sac_config.get("max_steps_per_goal", 500)),
+            goal_threshold=float(self.sac_config.get("goal_threshold", 4.0)),
         )
         sac_trainer.load(
             self._sac_model_dir(self.sac_seed)
@@ -2113,6 +2115,9 @@ class RLGoalApproachExperiment:
                 sac_eval_pools=sac_eval_pools,
                 mesh_path=mesh_path,
                 curriculum_levels=eval_curriculum_levels,
+                visualise=self.visualise,              # NEW
+                save_dir=str(self.data_dir),           # NEW (куда складывать)
+                mesh_name=mesh_name,                   # NEW (лейбл)
             )
             all_results[mesh_name] = results
 
@@ -2150,269 +2155,218 @@ class RLGoalApproachExperiment:
         sac_eval_pools: dict[int, dict[str, Any]],
         mesh_path: str,
         curriculum_levels: list[tuple[float, float]] | None = None,
+        visualise=None,
+        save_dir: str | None = None,
+        mesh_name: str = "",
     ) -> dict[str, Any]:
-        """Run SAC evaluation on episode pools.
+        """Run SAC evaluation on episode pools + (optional) save EpisodeVisualizer logs.
 
-        Args:
-            sac_trainer: Trained PSACTrainer instance.
-            sac_eval_pools: Episode pools keyed by seed.
-            mesh_path: Path to the mesh file.
-            curriculum_levels: Per-mesh curriculum levels.
-                Falls back to self.curriculum_levels if None.
-
-        Returns:
-            Dict with per-level evaluation results.
+        Visualisation/logging logic mirrors PSACTrainer.train():
+        - create EpisodeVisualizer if visualise and save_dir
+        - collect current_poses + action_explanations (+ optional short)
+        - call visualizer.save_episode() for each episode
         """
         if curriculum_levels is None:
             curriculum_levels = self.curriculum_levels
 
+        # ─────────────────────────────────────────────
+        # Optional visualizer (same pattern as SAC train)
+        # ─────────────────────────────────────────────
+        visualizer = None
+        if visualise and save_dir:
+            from .visualize_env import EpisodeVisualizer
+
+            visualizer = EpisodeVisualizer(
+                output_dir=Path(save_dir),
+                mesh_name=(mesh_name or Path(mesh_path).stem),
+                stage="sac_eval",
+                max_per_type_per_level=5,
+                timeout_frame_interval=50,
+                visualize_mode=visualise,
+                num_levels=len(curriculum_levels) if curriculum_levels else 1,
+            )
+
         type_names = ExperienceExtractor.get_type_names()
         results: dict[str, Any] = {}
         sample_seed = self.sac_eval_seeds[0]
-        num_levels = len(
-            sac_eval_pools[sample_seed].get("levels", [])
-        )
+        num_levels = len(sac_eval_pools[sample_seed].get("levels", []))
+
+        # Global monotonically increasing episode index for visualizer filenames
+        global_ep_idx = 0
 
         for level_idx in range(num_levels):
             successes = 0
             timeouts = 0
             collisions = 0
             total = 0
+
             action_counts: dict[int, int] = {}
             collision_counts: dict[int, int] = {}
             total_steps = 0
+
             episode_steps_list: list[int] = []
             success_steps_list: list[int] = []
 
             for eval_seed in self.sac_eval_seeds:
-                pool = sac_eval_pools[eval_seed][
-                    "levels"
-                ][level_idx]
+                pool = sac_eval_pools[eval_seed]["levels"][level_idx]
 
                 np.random.seed(eval_seed)  # noqa: NPY002
                 torch.manual_seed(eval_seed)
-                env = LightweightEnv(
-                    mesh_path, seed=eval_seed
-                )
+
+                env = LightweightEnv(mesh_path, seed=eval_seed)
                 controller = RLGoalApproachController(
-                    agent_id=(
-                        f"sac_eval_L{level_idx}"
-                        f"_{eval_seed}"
-                    ),
-                    config={
-                        **self.rl_config,
-                        "mode": "eval",
-                    },
+                    agent_id=f"sac_eval_L{level_idx}_{eval_seed}",
+                    config={**self.rl_config, "mode": "eval"},
                 )
                 interpreter = ActionInterpreter(env)
 
                 for ep_data in pool:
-                    start_pos = np.array(
-                        ep_data["start_pos"]
+                    global_ep_idx += 1
+
+                    start_pos = np.array(ep_data["start_pos"])
+                    start_rot = np.array(ep_data["start_rot"])
+                    env.reset(position=start_pos, rotation=start_rot)
+
+                    goal_pose = np.concatenate(
+                        [np.array(ep_data["goal_pos"]), np.array(ep_data["goal_rot"])]
                     )
-                    start_rot = np.array(
-                        ep_data["start_rot"]
-                    )
-                    env.reset(
-                        position=start_pos,
-                        rotation=start_rot,
-                    )
-                    goal_pose = np.concatenate([
-                        np.array(ep_data["goal_pos"]),
-                        np.array(ep_data["goal_rot"]),
-                    ])
-                    controller.set_new_goal(
-                        goal_pose, start_pos
-                    )
+                    controller.set_new_goal(goal_pose, start_pos)
                     env.set_goal(goal_pose)
 
                     success = False
                     collision = False
 
-                    for step_idx in range(
-                        sac_trainer.max_steps_per_goal
-                    ):
+                    # Per-episode logs (like SAC train)
+                    current_poses: list[np.ndarray] = [env.get_pose().copy()]
+                    action_explanations: list[str] = []
+                    actions_short: list[str] = []
+
+                    for step_idx in range(sac_trainer.max_steps_per_goal):
                         pose = env.get_pose()
                         sensor = env.get_sensor_data()
-                        state_raw = (
-                            controller._compute_state(
-                                pose, sensor
-                            )
-                        )
-                        state = (
-                            sac_trainer.normalize_state(
-                                state_raw
-                            )
-                        )
 
-                        # Strategic override (if enabled)
+                        state_raw = controller._compute_state(pose, sensor)
+                        state = sac_trainer.normalize_state(state_raw)
+
+                        # ─── Select action (same logic as your current SAC eval) ───
                         strategic_type = None
-                        if (
-                            sac_trainer
-                            .use_strategic_override
-                        ):
-                            strategic_type, _ = (
-                                sac_trainer
-                                ._strategic_detach_check(
-                                    state_raw,
-                                    controller,
-                                    sensor,
-                                )
+                        strategic_source = None
+
+                        if sac_trainer.use_strategic_override:
+                            strategic_type, strategic_source = sac_trainer._strategic_detach_check(
+                                state_raw, controller, sensor
                             )
 
-                        if (
-                            strategic_type
-                            is not None
-                        ):
-                            atype = strategic_type
-                            aparams = np.zeros(
-                                3,
-                                dtype=np.float32,
-                            )
+                        if strategic_type is not None:
+                            atype = int(strategic_type)
+                            aparams = np.zeros(3, dtype=np.float32)
                         else:
-                            if (
-                                sac_trainer
-                                .use_strategic_override
-                            ):
-                                dir_phase = (
-                                    sac_trainer
-                                    ._strategic_direction_check(
-                                        state_raw,
-                                        controller,
-                                        sensor,
-                                        pose,
-                                    )
+                            if sac_trainer.use_strategic_override:
+                                dir_phase = sac_trainer._strategic_direction_check(
+                                    state_raw, controller, sensor, pose
                                 )
-                                if (
-                                    dir_phase
-                                    is not None
-                                ):
-                                    controller._current_phase = (
-                                        dir_phase
-                                    )
+                                if dir_phase is not None:
+                                    controller._current_phase = dir_phase
 
-                            state_t = (
-                                torch.FloatTensor(
-                                    state.astype(
-                                        np.float32
-                                    )
-                                ).unsqueeze(0)
-                            )
+                            state_t = torch.FloatTensor(state.astype(np.float32)).unsqueeze(0)
                             with torch.no_grad():
-                                at, ap, _, _ = (
-                                    sac_trainer
-                                    .actor
-                                    .sample_eval(
-                                        state_t
-                                    )
-                                )
-                            atype = at[0].item()
+                                at, ap, _, _ = sac_trainer.actor.sample_eval(state_t)
+                            atype = int(at[0].item())
                             aparams = ap[0].numpy()
 
                             # Action masks
-                            atype, aparams = (
-                                sac_trainer
-                                ._apply_action_masks(
-                                    atype,
-                                    aparams,
-                                    state_raw,
-                                    state,
-                                    controller,
-                                )
+                            atype, aparams = sac_trainer._apply_action_masks(
+                                atype, aparams, state_raw, state, controller
                             )
 
-                        action_counts[atype] = (
-                            action_counts.get(
-                                atype, 0
-                            )
-                            + 1
-                        )
+                        # ─── Per-step accounting ───
+                        action_counts[atype] = action_counts.get(atype, 0) + 1
                         total_steps += 1
 
-                        sensor = (
-                            interpreter.execute(
-                                atype, aparams
-                            )
-                        )
-                        pose = env.get_pose()
+                        # ─── Log step (BEFORE executing action) ───
+                        # (avoid UnboundLocalError and match "train-style" logging)
+                        dist_before = float(np.linalg.norm(goal_pose[:3] - pose[:3]))
+                        act_name = type_names.get(atype, f"type_{atype}")
+                        param_str = self._format_action_params(atype, aparams)
+                        state_debug = controller.get_state_debug_info(state_raw, pose, sensor)
 
-                        # Update tracking
-                        next_raw = (
-                            controller
-                            ._compute_state(
-                                pose, sensor
-                            )
+                        source_tag = (
+                            f"[{strategic_source}]" if strategic_source is not None else ""
                         )
+                        action_explanations.append(
+                            f"{act_name}({param_str}) {state_debug} {source_tag}".strip()
+                        )
+                        actions_short.append(
+                            f"Step {step_idx+1:03d} | dist={dist_before:.1f}mm | {act_name}"
+                        )
+
+                        # ─── Execute action ───
+                        sensor_after = interpreter.execute(atype, aparams)
+                        current_poses.append(env.get_pose().copy())
+                        pose_after = env.get_pose()
+
+                        # Update controller tracking (important for next step strategic logic)
+                        next_raw = controller._compute_state(pose_after, sensor_after)
                         sac_trainer._update_controller_tracking(
-                            controller,
-                            next_raw,
-                            sensor,
-                            pose,
-                            atype,
+                            controller, next_raw, sensor_after, pose_after, atype
                         )
 
-                        dist = float(
-                            np.linalg.norm(
-                                goal_pose[:3]
-                                - pose[:3]
-                            )
-                        )
-
-                        if (
-                            dist
-                            < sac_trainer
-                            .goal_threshold
-                        ):
+                        # Termination checks
+                        dist_after = float(np.linalg.norm(goal_pose[:3] - pose_after[:3]))
+                        if dist_after < sac_trainer.goal_threshold:
                             success = True
                             break
 
-                        depth = sensor.get(
-                            "depth", 100.0
-                        )
-                        if (
-                            depth
-                            < _COLLISION_DEPTH_THRESHOLD
-                        ):
+                        depth = sensor_after.get("depth", 100.0)
+                        if depth < _COLLISION_DEPTH_THRESHOLD:
                             collision = True
-                            collision_counts[
-                                atype
-                            ] = (
-                                collision_counts.get(
-                                    atype, 0
-                                )
-                                + 1
-                            )
+                            collision_counts[atype] = collision_counts.get(atype, 0) + 1
                             break
 
                     ep_step_count = step_idx + 1
                     episode_steps_list.append(ep_step_count)
                     total += 1
+
                     if success:
                         successes += 1
                         success_steps_list.append(ep_step_count)
+                        ep_result = "success"
                     elif collision:
                         collisions += 1
+                        ep_result = "collision"
                     else:
                         timeouts += 1
+                        ep_result = "timeout"
+
+                    # Save episode visualization/logs (same as SAC train)
+                    if visualizer is not None:
+                        visualizer.save_episode(
+                            env=env,
+                            episode=global_ep_idx,
+                            level=level_idx,
+                            result=ep_result,
+                            goal_pose=goal_pose,
+                            poses=current_poses,
+                            actions=action_explanations,
+                            actions_short=actions_short,
+                            extra_info={
+                                "policy": "sac",
+                                "eval_seed": int(eval_seed),
+                            },
+                        )
 
             count = max(total, 1)
             bounds = curriculum_levels[level_idx]
-            total_act = max(
-                sum(action_counts.values()), 1
-            )
+            total_act = max(sum(action_counts.values()), 1)
 
             collision_rate_per_type = {}
             for tid, cc in collision_counts.items():
                 tc = action_counts.get(tid, 0)
-                name = type_names.get(
-                    tid, f"type_{tid}"
-                )
+                name = type_names.get(tid, f"type_{tid}")
                 collision_rate_per_type[name] = {
                     "collisions": cc,
                     "total_calls": tc,
-                    "rate": round(
-                        cc / max(tc, 1), 4
-                    ),
+                    "rate": round(cc / max(tc, 1), 4),
                 }
 
             results[f"level_{level_idx}"] = {
@@ -2425,41 +2379,23 @@ class RLGoalApproachExperiment:
                 "timeout_rate": timeouts / count,
                 "collision_rate": collisions / count,
                 "mean_episode_steps": round(
-                    float(np.mean(episode_steps_list))
-                    if episode_steps_list else 0, 1,
+                    float(np.mean(episode_steps_list)) if episode_steps_list else 0, 1
                 ),
                 "mean_success_steps": round(
-                    float(np.mean(success_steps_list))
-                    if success_steps_list else 0, 1,
+                    float(np.mean(success_steps_list)) if success_steps_list else 0, 1
                 ),
-                "total_steps_per_goal": round(
-                    total_steps / max(successes, 1),
-                    1,
-                ),
+                "total_steps_per_goal": round(total_steps / max(successes, 1), 1),
                 "action_distribution": {
-                    type_names.get(
-                        k, f"type_{k}"
-                    ): {
+                    type_names.get(k, f"type_{k}"): {
                         "count": v,
-                        "rate": round(
-                            v / total_act, 4
-                        ),
+                        "rate": round(v / total_act, 4),
                     }
-                    for k, v in sorted(
-                        action_counts.items()
-                    )
+                    for k, v in sorted(action_counts.items())
                 },
                 "collision_stats": {
-                    type_names.get(
-                        k, f"type_{k}"
-                    ): v
-                    for k, v in (
-                        collision_counts.items()
-                    )
+                    type_names.get(k, f"type_{k}"): v for k, v in collision_counts.items()
                 },
-                "collision_rate_per_type": (
-                    collision_rate_per_type
-                ),
+                "collision_rate_per_type": collision_rate_per_type,
             }
 
         return results
@@ -2575,6 +2511,8 @@ class RLGoalApproachExperiment:
             promote_window=self.promote_window,
             online_sac_update_every=100,
             online_sac_update_steps=40,
+            enable_online_sac_updates=False,
+            enable_offline_sac_retrain=False,
         )
         manager.sac_trainer = sac_trainer
 
