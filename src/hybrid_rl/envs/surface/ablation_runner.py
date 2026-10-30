@@ -704,7 +704,7 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
             break
 
         ep_mesh_path = mesh_path or np.random.choice(mesh_files)
-        env = LightweightEnv(ep_mesh_path, seed=seed)
+        env = LightweightEnv(ep_mesh_path, seed=seed, mesh_name=Path(mesh_path).stem)
         goals_before = controller._total_goals_reached
 
         # Setup episode

@@ -35,8 +35,9 @@ class LightweightEnv:
     - GPU
     """
 
-    def __init__(self, mesh_path: str, seed=None):
+    def __init__(self, mesh_path: str, seed=None, mesh_name: str = None):
         self.mesh = trimesh.load(mesh_path)
+        self.mesh_name = mesh_name
         # all numbers are mm
         # z+ is out of the page, x+ is "right", and y+ is "up"
         self.agent_pos = np.zeros(3)
@@ -52,11 +53,24 @@ class LightweightEnv:
         self._passed_through = False
         self._detach_had_collision = False
         self._compute_up_direction()
+        self._is_hollow = self._check_is_hollow()
         self._mesh_centroid = np.array(self.mesh.centroid, dtype=float)
         self._wrong_side_outward = None
         self._edge_traversed = None
         self._last_snap_debug = ""
         self._wall_side_debug = ""
+
+    def _check_is_hollow(self) -> bool:
+        """Hardcoded hollow detection by mesh name.
+        
+        Solid objects have no interior cavity — same_side is always True.
+        Hollow objects (mug, vase, cup) have interior accessible through rim.
+        """
+        HOLLOW_MESHES = {"mug", "vase", "cup"}
+        if self.mesh_name is not None:
+            return self.mesh_name.lower() in HOLLOW_MESHES
+        # Fallback: assume solid (safe default)
+        return False
 
     @staticmethod
     def _normalize_euler(angles):
@@ -269,6 +283,9 @@ class LightweightEnv:
         Agent side: horizontal ray cast toward center (position-based).
         Goal side: normal-based (reliable for on-surface points).
         """
+        if not self._is_hollow:
+            return True
+    
         center = np.array(self.mesh.centroid, dtype=float)
         height_axis = self.height_axis
         up = self.up_direction
@@ -2374,6 +2391,9 @@ def _is_reachable_by_surface(
     Returns:
         True if both points are on the same side.
     """
+    if not env._is_hollow:
+        return True
+    
     center = np.array(env.mesh.centroid, dtype=float)
     height_axis = env.height_axis
     up = env.up_direction

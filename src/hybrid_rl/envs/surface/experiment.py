@@ -3343,7 +3343,7 @@ class RLGoalApproachExperiment:
         np.random.seed(self.adapt_seed)
         random.seed(self.adapt_seed)
 
-        env = LightweightEnv(mesh_path, seed=adapt_seed)
+        env = LightweightEnv(mesh_path, seed=adapt_seed, mesh_name=self.adaptive_mesh)
 
         adapt_q_dir = str(
             self.runs_dir

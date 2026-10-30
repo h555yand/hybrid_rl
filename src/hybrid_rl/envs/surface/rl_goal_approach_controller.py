@@ -745,9 +745,14 @@ class RLGoalApproachController:
             else:
                 projected_2d = np.zeros(2)
 
+        if distance > 1e-8:
+            local_pos_direction = local_pos_error / distance
+        else:
+            local_pos_direction = np.zeros(3)
+
         state = np.concatenate(
             [
-                local_pos_error,      # [0:3]   3D
+                local_pos_direction,      # [0:3]   3D
                 rot_error_deg,        # [3:6]   3D
                 local_normal,         # [6:9]   3D
                 [k1],                 # [9]     1D
@@ -2073,7 +2078,8 @@ class RLGoalApproachController:
         explain: bool = False,
     ):
         store = self._select_store(state)
-        q_values = store.get_q_values(state)
+        # q_values = store.get_q_values(state)
+        q_values, q_confidence = store.get_q_values_with_confidence(state)
 
         heuristic, heuristic_components = (
             self._compute_heuristic_bias(
@@ -2540,8 +2546,30 @@ class RLGoalApproachController:
         crawl_edge_dbg = getattr(self, '_crawl_edge_debug', '')
         ce_str = f"|ce={crawl_edge_dbg}" if crawl_edge_dbg else ""
 
+        surface_q = q_values[:8]
+        top3_idx = np.argsort(surface_q)[-3:][::-1]
+        top3_str = "|".join(f"a{i}={surface_q[i]:.2f}" for i in top3_idx)
+        
+        conf_str = (
+            f"|prox={q_confidence['proximity']:.2f}"
+            f"|exp={q_confidence['experience']:.2f}"
+            f"|cons={q_confidence['consistency']:.1f}"
+            f"|ovr={q_confidence['overall']:.2f}"
+            f"|vm={q_confidence['v_mean']:.1f}"
+            f"|vs={q_confidence['v_spread']:.1f}"
+            f"|qtop=[{top3_str}]"
+        )
+
+        p2d_str = f"|p2d=[{state[20]:.2f},{state[21]:.2f}]|lpe=[{state[0]:.1f},{state[1]:.1f},{state[2]:.1f}]"
+
+        norm_state = store._normalize(state)
+        norm_str = f"|np2d=[{norm_state[20]:.1f},{norm_state[21]:.1f}]|nlpe=[{norm_state[0]:.1f},{norm_state[1]:.1f},{norm_state[2]:.1f}]"
+
         debug_prefix = (
             f"[phase={current_phase}|"
+            f"{conf_str}" 
+            f"{p2d_str}" 
+            f"{norm_str}" 
             f"ss={int(same_side)}|"
             f"pb={int(path_blocked)}|"
             f"d={depth:.1f}"
@@ -2678,7 +2706,8 @@ class RLGoalApproachController:
         components: Dict[str, np.ndarray] = {}
         self._last_surface_debug = None
 
-        local_pos_error = state[0:3]
+        local_pos_direction = state[0:3]
+        local_pos_error = local_pos_direction * state[13]  # restore raw mm
         on_object = float(state[11])
         alignment = float(state[12])
         distance = float(state[13])
@@ -5583,7 +5612,7 @@ class RLGoalApproachController:
     # EPISODE LIFECYCLE
     # ══════════════════════════════════════════════════════════
     def _on_episode_done(self, final_state, termination_reason):
-        distance = np.linalg.norm(final_state[0:3])
+        distance = float(final_state[13])
         goal_reached = termination_reason == "goal_reached"
         start_distance = np.linalg.norm(
             self._current_goal[0:3] - self.start_pos
