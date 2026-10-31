@@ -1,7 +1,7 @@
 seed: 42
 # Visualization: null | text | pictures | video
 visualise: text
-regenerate_scripts: true
+regenerate_scripts: false
 do_train: true
 do_eval: true
 do_heur_eval: false
@@ -377,7 +377,7 @@ rl_config:
   k_neighbors: 7
   max_steps_per_goal: 500
   adaptive_sigma: true
-  insert_threshold: 0.150
+  insert_threshold: 0.50
   auto_calibrate: false
 
   # Rewards
@@ -453,8 +453,8 @@ sac_episodes_per_mesh:
 
 sac_eval_episodes_per_level: 100
 
-adaptive_mesh: cup
-adaptive_episodes: 2000
+adaptive_mesh: sphere
+adaptive_episodes: 1000
 
 offline_check_window: 100
 
