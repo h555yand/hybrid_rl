@@ -1146,11 +1146,6 @@ class Arbitrator:
 
         q_values = self.controller.apply_action_mask(q_values, state)
 
-        # ... existing detach override logic ...
-
-        if self.controller._consecutive_detach_count >= 3:
-            q_values[self.controller.action_space.IDX_DETACH] = -1e9
-
         valid = q_values > -1e8
         if valid.sum() > 1:
             q_spread = float(
@@ -1161,6 +1156,8 @@ class Arbitrator:
 
         eps = self.controller._get_current_epsilon()
         temperature = max(np.clip(0.5 * eps, 0.01, 0.5), 0.05)
+        if self.temperature_override is not None:
+            temperature = self.temperature_override
 
         v = q_values.copy()
         v[~valid] = -1e9
