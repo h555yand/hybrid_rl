@@ -2768,7 +2768,9 @@ class RLGoalApproachExperiment:
                 )
 
                 # Track source
-                if source.startswith("q_confirms_sac"):
+                if source.startswith("blend"):
+                    source_key = "blend"
+                elif source.startswith("q_confirms_sac"):
                     source_key = "blend"
                 elif source.startswith("q_sac_conflict"):
                     source_key = "heuristic"
@@ -2781,8 +2783,8 @@ class RLGoalApproachExperiment:
                 elif source.startswith("q_"):
                     source_key = "q_store"
                 else:
-                    source_key = "sac"
-
+                    source_key = "heuristic"  # safe default instead of "sac"
+                    
                 source_counts[source_key] = (
                     source_counts.get(source_key, 0) + 1
                 )

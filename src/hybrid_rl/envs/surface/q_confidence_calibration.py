@@ -67,6 +67,7 @@ class QConfidenceCalibration:
         self.v_max_bins = [[] for _ in range(num_bins)]
         self.v_spread_bins = [[] for _ in range(num_bins)]
         self.best_q_norm_bins = [[] for _ in range(num_bins)]
+        self.top2_spread_bins = [[] for _ in range(num_bins)]
 
         # Current episode accumulators
         self._current_surface_confs: List[float] = []
@@ -79,6 +80,7 @@ class QConfidenceCalibration:
         self._current_v_maxs: List[float] = []
         self._current_v_spreads: List[float] = []
         self._current_best_q_norms: List[float] = []
+        self._current_top2_spreads: List[float] = []
 
         # V-value scales (from Q-store stats)
         self._current_v_max_scale: float = 1.0
@@ -124,6 +126,9 @@ class QConfidenceCalibration:
         )
         self._current_best_q_norms.append(
             confidence_info.get("best_q_norm", 0.0)
+        )
+        self._current_top2_spreads.append(
+            confidence_info.get("top2_spread", 0.0)
         )
 
         # Save scales (overwrite — same for all steps)
@@ -210,7 +215,14 @@ class QConfidenceCalibration:
                 int(bqn_scaled * self.num_bins), self.num_bins - 1
             )
             self.best_q_norm_bins[bin_idx].append(success)
-
+        # top2_spread: range [0, 5+] → scale to [0, 1]
+        if self._current_top2_spreads:
+            median_t2s = float(np.median(self._current_top2_spreads))
+            t2s_scaled = np.clip(median_t2s / 5.0, 0.0, 1.0)
+            bin_idx = min(
+                int(t2s_scaled * self.num_bins), self.num_bins - 1
+            )
+            self.top2_spread_bins[bin_idx].append(success)
         # Reset accumulators
         self._current_surface_confs = []
         self._current_free_confs = []
@@ -222,6 +234,7 @@ class QConfidenceCalibration:
         self._current_v_maxs = []
         self._current_v_spreads = []
         self._current_best_q_norms = []
+        self._current_top2_spreads = []
 
     def get_calibration(self) -> Dict[str, Any]:
         """Get full calibration data."""
@@ -290,6 +303,9 @@ class QConfidenceCalibration:
                 "best_q_norm": _bqn_bins_to_dict(
                     self.best_q_norm_bins
                 ),
+                "top2_spread": _v_bins_to_dict(
+                    self.top2_spread_bins, 5.0
+                ),
             },
             "total_episodes": self._total_episodes,
             "total_steps": self._total_steps,
@@ -330,6 +346,7 @@ class QConfidenceCalibration:
             self.best_q_norm_bins[i].extend(
                 other.best_q_norm_bins[i]
             )
+            self.top2_spread_bins[i].extend(other.top2_spread_bins[i])
         self._total_episodes += other._total_episodes
         self._total_steps += other._total_steps
 

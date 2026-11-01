@@ -919,6 +919,14 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
 
                     # best_Q_norm: normalized best Q-value
                     _cal_best_q = float(np.max(_cal_q))
+                    # top2_spread
+                    _cal_surface_q = _cal_q[:8]
+                    _cal_valid = _cal_surface_q[_cal_surface_q > -1e8]
+                    if len(_cal_valid) >= 2:
+                        _cal_sorted = np.sort(_cal_valid)[::-1]
+                        _cal_conf["top2_spread"] = float(_cal_sorted[0] - _cal_sorted[1])
+                    else:
+                        _cal_conf["top2_spread"] = 0.0
                     _cal_store_key = (
                         "surface" if _cal_on_obj else "free"
                     )

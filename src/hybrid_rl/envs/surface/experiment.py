@@ -2726,28 +2726,24 @@ class RLGoalApproachExperiment:
                 )
 
                 # Track source
-                if source.startswith("blend_agree"):
+                if source.startswith("blend"):
                     source_key = "blend"
-                elif source.startswith("q_moderate_fresh"):
-                    source_key = "q_store"
-                elif source.startswith("sac_moderate_stale"):
-                    source_key = "sac"
-                elif source.startswith("q_override_disagree"):
-                    source_key = "q_store"
-                elif source.startswith("sac_override_disagree"):
-                    source_key = "sac"
-                elif source.startswith("heuristic_disagree"):
+                elif source.startswith("q_confirms_sac"):
+                    source_key = "blend"
+                elif source.startswith("q_sac_conflict"):
                     source_key = "heuristic"
-                elif source.startswith("heuristic_low_ml"):
+                elif source.startswith("q_confident"):
+                    source_key = "blend"
+                elif source.startswith("forced_heuristic"):  # ← ДОБАВИТЬ
                     source_key = "heuristic"
-                elif source.startswith("sac_default"):
+                elif source.startswith("heuristic"):
+                    source_key = "heuristic"
+                elif source.startswith("sac"):
                     source_key = "sac"
-                elif source.startswith("q_fallback"):
+                elif source.startswith("q_"):
                     source_key = "q_store"
-                elif source.startswith("forced_heuristic"):
-                    source_key = "heuristic"
                 else:
-                    source_key = "sac"
+                    source_key = "heuristic"
 
                 source_counts[source_key] = (
                     source_counts.get(source_key, 0) + 1

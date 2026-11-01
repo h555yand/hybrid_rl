@@ -43,6 +43,56 @@ logger = logging.getLogger(__name__)
 
 def sac_to_discrete(action_type: int, action_params: np.ndarray) -> int:
     if action_type == 0:
+        sin_a = float(action_params[0])
+        cos_a = float(action_params[1])
+        angle = np.degrees(np.arctan2(sin_a, cos_a)) % 360.0
+        directions = [0, 45, 90, 135, 180, 225, 270, 315]
+        best_idx = 0
+        best_diff = 360.0
+        for i, d in enumerate(directions):
+            diff = abs(angle - d)
+            diff = min(diff, 360 - diff)
+            if diff < best_diff:
+                best_diff = diff
+                best_idx = i
+        return best_idx
+    elif action_type == 1:
+        step = float(action_params[0])
+        if step < 0:
+            return 9
+        elif abs(step) <= 3.0:
+            return 19
+        else:
+            return 8
+    elif action_type == 2:
+        sin_a = float(action_params[0])
+        cos_a = float(action_params[1])
+        angle = np.degrees(np.arctan2(sin_a, cos_a))
+        if abs(angle) > 10.0:
+            return 22 if angle >= 0 else 23
+        return 10 if angle >= 0 else 11
+    elif action_type == 3:
+        sin_a = float(action_params[0])
+        cos_a = float(action_params[1])
+        angle = np.degrees(np.arctan2(sin_a, cos_a))
+        if abs(angle) > 10.0:
+            return 20 if angle >= 0 else 21
+        return 12 if angle >= 0 else 13
+    elif action_type == 4:
+        sin_a = float(action_params[0])
+        cos_a = float(action_params[1])
+        angle = np.degrees(np.arctan2(sin_a, cos_a))
+        return 14 if angle >= 0 else 15
+    elif action_type == 5:
+        return 16
+    elif action_type == 6:
+        return 17
+    elif action_type == 7:
+        return 18
+    return 0
+
+def sac_to_discrete_old(action_type: int, action_params: np.ndarray) -> int:
+    if action_type == 0:
         angle = float(action_params[0]) % 360.0
         directions = [0, 45, 90, 135, 180, 225, 270, 315]
         best_idx = 0
@@ -376,6 +426,240 @@ class Arbitrator:
         return 1.0, "same", sac_discrete
 
     def decide(self, state, current_pose, sensor_data):
+        self.stats["total_decisions"] += 1
+        level = self._current_level
+        has_sac = self.sac_actor is not None
+        has_sac = False
+        self._level_total_decisions[level] += 1
+
+        # ═══ Force heuristic mode ═══
+        if self._force_heuristic:
+            return self._decide_heuristic(
+                state, current_pose, sensor_data,
+                "forced_heuristic(mode=force_all)",
+            )
+
+        # ═══ Forced heuristic when stuck ═══
+        phase = getattr(self.controller, '_current_phase', 'CRAWL_TO_GOAL')
+        if phase == "DETACH_NEEDED":
+            eff = self.controller._compute_movement_efficiency(window=20)
+            return self._decide_heuristic(
+                state, current_pose, sensor_data,
+                f"forced_heuristic(phase=DETACH_NEEDED,eff={eff:.2f})",
+            )
+
+        # ═══ Get proposals ═══
+        q_action, q_confidence, q_spread, q_recency, q_best_norm = (
+            self._get_q_action(state)
+        )
+        q_type = ExperienceExtractor.DISCRETE_TO_PSAC[q_action][0]
+        q_params = self._discrete_to_params(q_action)
+
+        if has_sac:
+            sac_type, sac_params = self._get_sac_action_continuous(state)
+        else:
+            sac_type, sac_params = q_type, q_params.copy()
+
+        # ═══ Compute agreement ═══
+        agreement_score, agreement_cat, sac_discrete = (
+            self._compute_agreement(q_action, sac_type, sac_params)
+        )
+
+        # ═══ Track proposals ═══
+        q_name = self._type_names.get(q_type, f"type_{q_type}")
+        self.q_proposed_actions[q_name] += 1
+        self.q_confidence_history.append(q_confidence)
+        self.q_spread_history.append(q_spread)
+
+        if has_sac:
+            sac_name = self._type_names.get(sac_type, f"type_{sac_type}")
+            self.sac_proposed_actions[sac_name] += 1
+            self.both_proposed_count += 1
+            if agreement_cat == "same":
+                self.agreement_count += 1
+
+        self._agreement_categories[agreement_cat] = (
+            self._agreement_categories.get(agreement_cat, 0) + 1
+        )
+
+        # ═══ Track records ═══
+        q_track, sac_track, b_track, h_track, best_ml_track, worst_ml_track, has_enough_data = (
+            self._get_level_tracks(level)
+        )
+
+        # ═══ Heuristic budget ═══
+        total_on_level = max(self._level_total_decisions[level], 1)
+        heuristic_on_level = self._level_heuristic_decisions[level]
+        heuristic_ratio = heuristic_on_level / total_on_level
+
+        h_budget = self._compute_heuristic_budget(
+            q_confidence, q_best_norm, h_track, best_ml_track, has_enough_data,
+        )
+        h_budget_available = heuristic_ratio < h_budget
+
+        # ═══ Q reliability (calibrated) ═══
+        # q_confidence now includes top2_spread via multiplicative overall.
+        # Low top2_spread (bias) → low q_confidence → not reliable.
+        on_object = state[11] > 0.5
+        q_reliable_threshold = (
+            self._q_reliable_threshold_surface if on_object
+            else self._q_reliable_threshold_free
+        )
+        q_is_reliable = (
+            q_confidence >= q_reliable_threshold
+            and q_best_norm >= -1.0
+        )
+
+        # ═══════════════════════════════════════════════════════
+        # DECISION TREE
+        # ═══════════════════════════════════════════════════════
+
+        # --- 1. Q NOT RELIABLE → heuristic or SAC fallback ---
+        if not q_is_reliable:
+            if has_enough_data and h_track > best_ml_track and h_budget_available:
+                return self._decide_heuristic(
+                    state, current_pose, sensor_data,
+                    f"heuristic_explore("
+                    f"q_conf={q_confidence:.2f},"
+                    f"bqn={q_best_norm:.2f},"
+                    f"thresh={q_reliable_threshold:.2f},"
+                    f"h_track={h_track:.2f},"
+                    f"best_ml={best_ml_track:.2f},"
+                    f"h_budget={h_budget:.2f},"
+                    f"h_used={heuristic_ratio:.3f})",
+                )
+            if has_sac:
+                sac_n = self._type_names.get(sac_type, f"type_{sac_type}")
+                self._record_decision("sac")
+                self.sac_chosen_actions[sac_n] += 1
+                self._current_episode_sources.append("sac")
+                return sac_type, sac_params, (
+                    f"sac_default_low_conf("
+                    f"q_conf={q_confidence:.2f},"
+                    f"bqn={q_best_norm:.2f},"
+                    f"h_track={h_track:.2f},"
+                    f"best_ml={best_ml_track:.2f})"
+                )
+            # No SAC → Q not reliable → heuristic fallback
+            return self._decide_heuristic(
+                state, current_pose, sensor_data,
+                f"heuristic_low_conf_no_sac("
+                f"q_conf={q_confidence:.2f},"
+                f"bqn={q_best_norm:.2f},"
+                f"t2s={q_spread:.2f})",
+            )
+
+        # --- 2. Q RELIABLE + STRONG AGREE (same or neighbor) ---
+        if agreement_score >= 0.75:
+            if has_sac:
+                self._record_decision("blend")
+                self.blend_chosen_actions[sac_n] += 1
+                self._current_episode_sources.append("blend")
+            else:
+                self._record_decision("q_store")
+                self.q_chosen_actions[q_name] += 1
+                self._current_episode_sources.append("q_store")
+            return sac_type, sac_params, (
+                f"{'blend' if has_sac else 'q'}_agree("
+                f"agree={agreement_score:.2f},"
+                f"cat={agreement_cat},"
+                f"conf={q_confidence:.2f},"
+                f"bqn={q_best_norm:.2f},"
+                f"recency={q_recency:.2f})"
+            )
+
+        # --- 3. Q RELIABLE + MODERATE (e.g. 90° off) ---
+        if agreement_score >= 0.5:
+            if q_recency > 0.5 and q_best_norm >= 0.0:
+                self._record_decision("q_store")
+                self.q_chosen_actions[q_name] += 1
+                self._current_episode_sources.append("q_store")
+                return q_type, q_params, (
+                    f"q_moderate_fresh("
+                    f"agree={agreement_score:.2f},"
+                    f"cat={agreement_cat},"
+                    f"conf={q_confidence:.2f},"
+                    f"bqn={q_best_norm:.2f},"
+                    f"recency={q_recency:.2f})"
+                )
+            else:
+                sac_n = self._type_names.get(sac_type, f"type_{sac_type}")
+                self._record_decision("sac")
+                self.sac_chosen_actions[sac_n] += 1
+                self._current_episode_sources.append("sac")
+                return sac_type, sac_params, (
+                    f"sac_moderate_stale("
+                    f"agree={agreement_score:.2f},"
+                    f"cat={agreement_cat},"
+                    f"conf={q_confidence:.2f},"
+                    f"bqn={q_best_norm:.2f},"
+                    f"recency={q_recency:.2f})"
+                )
+
+        # --- 4. Q RELIABLE + STRONG DISAGREE ---
+        best_ml = max(q_track, sac_track)
+
+        # 4a. Heuristic better than both ML → heuristic
+        if has_enough_data and best_ml < h_track * 0.85 and h_budget_available:
+            self._log_disagreement(
+                q_action, sac_discrete, agreement_cat,
+                q_confidence, q_recency, q_track, sac_track,
+                "heuristic_chosen", state,
+            )
+            return self._decide_heuristic(
+                state, current_pose, sensor_data,
+                f"heuristic_disagree("
+                f"agree={agreement_score:.2f},"
+                f"cat={agreement_cat},"
+                f"bqn={q_best_norm:.2f},"
+                f"q_track={q_track:.2f},"
+                f"sac_track={sac_track:.2f},"
+                f"h_track={h_track:.2f})",
+            )
+
+        # 4b. Q track better AND fresh AND sees good path
+        if q_track > sac_track and q_recency > 0.5 and q_best_norm >= 0.0:
+            self._record_decision("q_store")
+            self.q_chosen_actions[q_name] += 1
+            self._current_episode_sources.append("q_store")
+            self._log_disagreement(
+                q_action, sac_discrete, agreement_cat,
+                q_confidence, q_recency, q_track, sac_track,
+                "q_chosen", state,
+            )
+            return q_type, q_params, (
+                f"q_override_disagree("
+                f"agree={agreement_score:.2f},"
+                f"cat={agreement_cat},"
+                f"conf={q_confidence:.2f},"
+                f"bqn={q_best_norm:.2f},"
+                f"recency={q_recency:.2f},"
+                f"q_track={q_track:.2f},"
+                f"sac_track={sac_track:.2f})"
+            )
+
+        # 4c. SAC better or Q stale/low path quality
+        sac_n = self._type_names.get(sac_type, f"type_{sac_type}")
+        self._record_decision("sac")
+        self.sac_chosen_actions[sac_n] += 1
+        self._current_episode_sources.append("sac")
+        self._log_disagreement(
+            q_action, sac_discrete, agreement_cat,
+            q_confidence, q_recency, q_track, sac_track,
+            "sac_chosen", state,
+        )
+        return sac_type, sac_params, (
+            f"sac_override_disagree("
+            f"agree={agreement_score:.2f},"
+            f"cat={agreement_cat},"
+            f"conf={q_confidence:.2f},"
+            f"bqn={q_best_norm:.2f},"
+            f"recency={q_recency:.2f},"
+            f"q_track={q_track:.2f},"
+            f"sac_track={sac_track:.2f})"
+        )
+
+    def decide_old(self, state, current_pose, sensor_data):
         self.stats["total_decisions"] += 1
         level = self._current_level
         has_sac = self.sac_actor is not None

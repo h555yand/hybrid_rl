@@ -299,35 +299,28 @@ class HNSWStateStore:
     ) -> tuple:
         """Get Q-values and confidence estimate via KNN interpolation.
 
-        Same interpolation logic as get_q_values, but additionally
-        computes a confidence score indicating how much we should
-        trust the returned Q-values.
-
         Confidence components:
             proximity: fraction of max possible kernel weight achieved.
-                High when neighbors are close, low when far.
             experience: weighted average visit count of neighbors.
-                High when neighbors have been updated many times.
             consistency: fraction of neighbors that agree on best action.
-                High when neighbors all recommend the same action.
-            overall: product of all three (conservative estimate).
+            top2_spread: gap between best and second-best Q-value.
+                High spread = Q clearly knows which action is best.
+                Low spread = Q uncertain between multiple actions (bias).
+            overall: multiplicative — top2_spread gates proximity/experience.
+                If Q doesn't distinguish actions (t2s low), overall is low
+                regardless of proximity/experience.
 
         Args:
             state: Raw (unnormalized) state vector [state_dim].
 
         Returns:
-            Tuple of (q_values, confidence_info):
-                q_values: np.ndarray [num_actions]
-                confidence_info: dict with keys:
-                    proximity (float 0..1)
-                    experience (float 0..1)
-                    consistency (float 0..1)
-                    overall (float 0..1)
+            Tuple of (q_values, confidence_info).
         """
         empty_confidence = {
             "proximity": 0.0,
             "experience": 0.0,
             "consistency": 0.0,
+            "top2_spread": 0.0,
             "overall": 0.0,
             "v_mean": 0.0,
             "v_max": 0.0,
@@ -353,14 +346,32 @@ class HNSWStateStore:
             point.last_step = self.global_step
 
             visit_conf = min(point.visit_count / 10.0, 1.0)
+
+            # Top-2 spread
+            q = point.q_values
+            valid_q = q[q > -1e8]
+            if len(valid_q) >= 2:
+                sorted_q = np.sort(valid_q)[::-1]
+                t2s = float(sorted_q[0] - sorted_q[1])
+            else:
+                t2s = 0.0
+            t2s_norm = float(np.clip(t2s / 3.0, 0.0, 1.0))
+
+            # Overall: t2s gates experience
+            overall = float(np.clip(
+                t2s_norm * (0.5 + 0.5 * visit_conf),
+                0.0, 1.0
+            ))
+
             return point.q_values.copy(), {
                 "proximity": 1.0,
                 "experience": visit_conf,
                 "consistency": 1.0,
-                "overall": visit_conf,
-                "v_mean": float(np.mean(point.q_values)), 
-                "v_max": float(np.max(point.q_values)),
-                "v_spread": float(np.max(point.q_values) - np.min(point.q_values)),
+                "top2_spread": t2s,
+                "overall": overall,
+                "v_mean": float(np.mean(q)),
+                "v_max": float(np.max(q)),
+                "v_spread": float(np.max(q) - np.min(q)),
             }
 
         # ═══ Kernel weights ═══
@@ -373,10 +384,10 @@ class HNSWStateStore:
 
         # ═══ Confidence components ═══
 
-        # 1. Proximity: what fraction of max possible weight
+        # 1. Proximity
         proximity = float(min(weight_sum / k, 1.0))
 
-        # 2. Experience: kernel-weighted average visit count
+        # 2. Experience
         visit_counts = np.array([
             self.points[l].visit_count for l in labels
         ], dtype=float)
@@ -385,7 +396,7 @@ class HNSWStateStore:
         )
         experience = float(min(weighted_visits / 10.0, 1.0))
 
-        # 3. Consistency: do neighbors agree on best action?
+        # 3. Consistency
         neighbor_best_actions = [
             int(np.argmax(self.points[l].q_values))
             for l in labels
@@ -397,49 +408,44 @@ class HNSWStateStore:
             most_common_count / len(neighbor_best_actions)
         )
 
-        # 4. Recency: how recently were neighbors updated?
-        #last_steps = np.array([
-        #    self.points[l].last_step for l in labels
-        #], dtype=float)
-        #weighted_last_step = float(
-        #    np.sum(weights * last_steps) / weight_sum
-        #)
-        #age = max(self.global_step - weighted_last_step, 0)
-        #midpoint = 2000.0
-        #steepness = 3.0 / midpoint
-        #recency = float(1.0 / (1.0 + np.exp(steepness * (age - midpoint))))
-
         # 4. Recency
         max_last_step = float(max(
             self.points[l].last_step for l in labels
         ))
         age = self.global_step - max_last_step
-
-        # Процент от всей истории, но не менее 1000 шагов (~10 эпизодов)
         window = max(self.global_step * 0.15, 1000.0)
-
-        # age < window → свежий (recency → 1.0)
-        # age > window → устаревший (recency → 0.0)
         recency = float(max(1.0 - age / window, 0.0))
 
-        # Overall: proximity и recency — главные
-        overall = float(
-            0.6 * proximity
-            + 0.4 * experience
-            + 0.0 * consistency
-        )
-
-        # ═══ Q-value interpolation (same as get_q_values) ═══
+        # ═══ Q-value interpolation ═══
         weights /= weight_sum
         q_values = np.zeros(self.num_actions)
         for i, label in enumerate(labels):
             q_values += weights[i] * self.points[label].q_values
+
+        # 5. Top-2 spread (on interpolated Q-values)
+        valid_q = q_values[q_values > -1e8]
+        if len(valid_q) >= 2:
+            sorted_q = np.sort(valid_q)[::-1]
+            t2s = float(sorted_q[0] - sorted_q[1])
+        else:
+            t2s = 0.0
+        t2s_norm = float(np.clip(t2s / 3.0, 0.0, 1.0))
+
+        # ═══ Overall: multiplicative ═══
+        # t2s_norm gates proximity + experience.
+        # If Q doesn't distinguish actions → overall ≈ 0
+        # regardless of how familiar the state is.
+        overall = float(np.clip(
+            t2s_norm * (0.5 * proximity + 0.5 * experience),
+            0.0, 1.0
+        ))
 
         confidence_info = {
             "proximity": proximity,
             "experience": experience,
             "consistency": consistency,
             "recency": recency,
+            "top2_spread": t2s,
             "overall": overall,
             "v_mean": float(np.mean(q_values)),
             "v_max": float(np.max(q_values)),

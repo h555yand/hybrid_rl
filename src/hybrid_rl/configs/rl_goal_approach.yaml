@@ -1,8 +1,8 @@
 seed: 42
 # Visualization: null | text | pictures | video
 visualise: text
-regenerate_scripts: false
-do_train: true
+regenerate_scripts: true
+do_train: false
 do_eval: true
 do_heur_eval: false
 do_bc_train: false
@@ -30,7 +30,7 @@ curriculum_levels:
 curriculum_filters:
   - {same_side: true, path_blocked: false}
   - {same_side: true, path_blocked: true}
-  - {same_side: false}
+  - {} # {same_side: false}
   #- {"handle_between": True, same_side: true, path_blocked: true}
 
 # ═══════════════════════════════════════════
@@ -454,7 +454,7 @@ sac_episodes_per_mesh:
 sac_eval_episodes_per_level: 100
 
 adaptive_mesh: sphere
-adaptive_episodes: 1000
+adaptive_episodes: 5000
 
 offline_check_window: 100
 

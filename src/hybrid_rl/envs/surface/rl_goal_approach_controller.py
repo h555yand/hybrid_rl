@@ -2549,6 +2549,10 @@ class RLGoalApproachController:
         surface_q = q_values[:8]
         top3_idx = np.argsort(surface_q)[-3:][::-1]
         top3_str = "|".join(f"a{i}={surface_q[i]:.2f}" for i in top3_idx)
+
+        sorted_sq = np.sort(surface_q[surface_q > -1e8])[::-1]
+        top2_spread = float(sorted_sq[0] - sorted_sq[1]) if len(sorted_sq) >= 2 else 0.0
+        t2s_str = f"|t2s={top2_spread:.2f}"
         
         conf_str = (
             f"|prox={q_confidence['proximity']:.2f}"
@@ -2568,6 +2572,7 @@ class RLGoalApproachController:
         debug_prefix = (
             f"[phase={current_phase}|"
             f"{conf_str}" 
+            f"{t2s_str}" 
             f"{p2d_str}" 
             f"{norm_str}" 
             f"ss={int(same_side)}|"
