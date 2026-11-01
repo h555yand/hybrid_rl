@@ -698,25 +698,28 @@ class RLGoalApproachController:
             self._compute_movement_efficiency(window=20)
         )
         # Projected goal direction on tangent plane
+        # Expressed in tangent basis (tb1, tb2) so that
+        # p2d directly maps to action directions:
+        #   p2d=[1,0] → action 0° is best
+        #   p2d=[0,1] → action 90° is best
         if (
             on_object > 0.5
             and np.linalg.norm(local_normal) > 1e-8
             and distance > 1e-8
         ):
-            # Goal direction in world frame
             rot_mat = R.from_euler(
                 "xyz", current_pose[3:6],
                 degrees=True,
             )
-            goal_dir_world = rot_mat.apply(
-                local_pos_error
-            )
-            normal_world = rot_mat.apply(
-                local_normal
-            )
+            # Surface normal in world frame
+            normal_world = rot_mat.apply(local_normal)
             n_len = np.linalg.norm(normal_world)
             if n_len > 1e-8:
                 n_hat = normal_world / n_len
+                # Goal direction in world frame
+                goal_dir_world = rot_mat.apply(
+                    local_pos_error
+                )
                 # Project onto tangent plane
                 projected = (
                     goal_dir_world
@@ -724,19 +727,29 @@ class RLGoalApproachController:
                     * n_hat
                 )
                 proj_len = np.linalg.norm(projected)
-                if proj_len > 1e-8:
-                    projected /= proj_len
-                # Back to local frame
-                projected_local = (
-                    rot_mat.inv().apply(projected)
+                
+                # Build tangent basis (same as heuristic uses)
+                tb1, tb2 = self._build_tangent_basis(
+                    rot_mat, n_hat
                 )
-                # Take 2D (x, y components)
-                projected_2d = projected_local[:2]
+                
+                if (
+                    proj_len > 1e-8
+                    and tb1 is not None
+                ):
+                    projected_unit = projected / proj_len
+                    # Express in tangent basis
+                    projected_2d = np.array([
+                        float(np.dot(projected_unit, tb1)),
+                        float(np.dot(projected_unit, tb2)),
+                    ])
+                else:
+                    projected_2d = np.zeros(2)
             else:
                 projected_2d = np.zeros(2)
         else:
             # In air or no normal: use
-            # local_pos_error direction
+            # local_pos_error direction (unchanged)
             if distance > 1e-8:
                 projected_2d = (
                     local_pos_error[:2]
@@ -2070,6 +2083,59 @@ class RLGoalApproachController:
             f"Heuristics: {h_action_name} - {h_recommends}. "
         )
 
+    def _build_tangent_basis(
+        self,
+        rot: R,
+        normal: np.ndarray,
+    ) -> tuple:
+        """Build tangent basis (tb1, tb2) from agent rotation and surface normal.
+        
+        Used by both _compute_state (for p2d) and _compute_heuristic_bias
+        (for action scoring). Must be identical in both places so that
+        p2d coordinates directly correspond to action directions.
+        
+        tb1 corresponds to action 0° direction.
+        tb2 corresponds to action 90° direction.
+        Action i at angle a: v = cos(a)*tb1 + sin(a)*tb2
+        
+        Args:
+            rot: Agent rotation (scipy Rotation).
+            normal: Unit surface normal in world frame.
+        
+        Returns:
+            (tb1, tb2) - orthonormal vectors in tangent plane (world frame).
+            Returns (None, None) if degenerate.
+        """
+        n_hat = normal
+        
+        right_world = rot.apply([1.0, 0.0, 0.0])
+        tb1 = right_world - np.dot(right_world, n_hat) * n_hat
+        tb1_norm = np.linalg.norm(tb1)
+        
+        if tb1_norm < 1e-8:
+            up_world = rot.apply([0.0, 1.0, 0.0])
+            tb1 = up_world - np.dot(up_world, n_hat) * n_hat
+            tb1_norm = np.linalg.norm(tb1)
+        
+        if tb1_norm < 1e-8:
+            tmp = np.array([0.0, 1.0, 0.0])
+            if abs(np.dot(tmp, n_hat)) > 0.9:
+                tmp = np.array([0.0, 0.0, 1.0])
+            tb1 = np.cross(n_hat, tmp)
+            tb1_norm = np.linalg.norm(tb1)
+        
+        if tb1_norm < 1e-8:
+            return None, None
+        
+        tb1 = tb1 / tb1_norm
+        tb2 = np.cross(n_hat, tb1)
+        tb2_norm = np.linalg.norm(tb2)
+        if tb2_norm < 1e-8:
+            return None, None
+        tb2 = tb2 / tb2_norm
+        
+        return tb1, tb2
+
     def _choose_action(
         self,
         state: np.ndarray,
@@ -2647,7 +2713,13 @@ class RLGoalApproachController:
         
         # Visit-based confidence: 0 at 0 visits, 1.0 at min_visits
         nn_visits = store.get_nearest_visits(t_state)
-        q_confidence = float(np.clip(nn_visits / max(min_visits, 1), 0.0, 1.0))
+
+        # Store must have minimum coverage to be trusted
+        MIN_STORE_POINTS = 10
+        if store.next_id < MIN_STORE_POINTS:
+            q_confidence = 0.0
+        else:
+            q_confidence = float(np.clip(nn_visits / max(min_visits, 1), 0.0, 1.0))
         
         # Weights: Q gets weight only when confident AND epsilon allows
         q_weight = (1.0 - epsilon) * q_confidence
@@ -2733,7 +2805,6 @@ class RLGoalApproachController:
 
         self._current_phase = phase
         self._current_subgoal_dir = subgoal_dir
-        # Store for logging
         self._current_phase_desc = phase_desc
 
         logger.debug(
@@ -2813,7 +2884,6 @@ class RLGoalApproachController:
                 self.action_space.IDX_ORIENT_VERT
             ] -= 2.0
 
-        # supress as detach is strategic decision
         suppress[self.action_space.IDX_DETACH] -= 10.0
 
         if (
@@ -2855,7 +2925,7 @@ class RLGoalApproachController:
             self.num_actions, dtype=float
         )
         if on_object > 0.5 and phase == "CRAWL_TO_EDGE":
-            SURFACE_STRENGTH = 8.0  # было 5
+            SURFACE_STRENGTH = 8.0
 
             n_world = sensor_data.get("point_normal")
             if n_world is not None:
@@ -2873,62 +2943,48 @@ class RLGoalApproachController:
                     if e_t is not None:
                         tangential_dist = float(np.linalg.norm(e_t))
                         if tangential_dist > 0.1:
-                            # === Reuse existing scoring logic ===
-                            right_world = rot.apply([1.0, 0.0, 0.0])
-                            tb1 = right_world - np.dot(right_world, n_hat) * n_hat
-                            tb1_norm = np.linalg.norm(tb1)
-                            if tb1_norm < 1e-8:
-                                up_world = rot.apply([0.0, 1.0, 0.0])
-                                tb1 = up_world - np.dot(up_world, n_hat) * n_hat
-                                tb1_norm = np.linalg.norm(tb1)
-                            if tb1_norm < 1e-8:
-                                tmp = np.array([0.0, 1.0, 0.0])
-                                if abs(np.dot(tmp, n_hat)) > 0.9:
-                                    tmp = np.array([0.0, 0.0, 1.0])
-                                tb1 = np.cross(n_hat, tmp)
-                                tb1_norm = np.linalg.norm(tb1)
-                            tb1 /= (tb1_norm + 1e-12)
-                            tb2 = np.cross(n_hat, tb1)
-                            tb2 /= (np.linalg.norm(tb2) + 1e-12)
+                            tb1, tb2 = self._build_tangent_basis(
+                                rot, n_hat
+                            )
+                            if tb1 is not None:
+                                best = None
+                                best_score = -1e18
+                                scores = np.full(8, -1e18, dtype=float)
+                                for i, deg in enumerate(
+                                    self.action_space.SURFACE_DIRECTIONS
+                                ):
+                                    a = np.radians(deg)
+                                    v_world = np.cos(a) * tb1 + np.sin(a) * tb2
+                                    v_norm = float(np.linalg.norm(v_world))
+                                    if v_norm < 1e-8:
+                                        continue
+                                    v_world /= v_norm
+                                    new_e = e_t - step * v_world
+                                    score = float(
+                                        np.dot(e_t, e_t) - np.dot(new_e, new_e)
+                                    )
+                                    scores[i] = score
+                                    if score > best_score:
+                                        best_score = score
+                                        best = i
 
-                            best = None
-                            best_score = -1e18
-                            scores = np.full(8, -1e18, dtype=float)
-                            for i, deg in enumerate(
-                                self.action_space.SURFACE_DIRECTIONS
-                            ):
-                                a = np.radians(deg)
-                                v_world = np.cos(a) * tb1 + np.sin(a) * tb2
-                                v_norm = float(np.linalg.norm(v_world))
-                                if v_norm < 1e-8:
-                                    continue
-                                v_world /= v_norm
-                                new_e = e_t - step * v_world
-                                score = float(
-                                    np.dot(e_t, e_t) - np.dot(new_e, new_e)
-                                )
-                                scores[i] = score
-                                if score > best_score:
-                                    best_score = score
-                                    best = i
-
-                            if best is not None:
-                                surface_move[best] = SURFACE_STRENGTH
-                                e_world_direct = self._current_goal[:3] - current_pose[:3]
-                                e_t_direct = e_world_direct - np.dot(e_world_direct, n_hat) * n_hat
-                                self._last_surface_debug = {
-                                    "phase": "CRAWL_TO_EDGE",
-                                    "e_t": e_t.tolist(),
-                                    "e_t_direct": e_t_direct.tolist(),
-                                    "goal_dir_world": e_world_direct.tolist(),
-                                    "n_hat": n_hat.tolist(),
-                                    "best_dir": best,
-                                    "best_score": round(best_score, 2),
-                                    "scores": [round(s, 2) for s in scores],
-                                    "tangential_dist": round(tangential_dist, 2),
-                                    "subgoal_dir": subgoal_dir.tolist() if subgoal_dir is not None else None,
-                                    "agent_rot": current_pose[3:6].tolist(),
-                                }
+                                if best is not None:
+                                    surface_move[best] = SURFACE_STRENGTH
+                                    e_world_direct = self._current_goal[:3] - current_pose[:3]
+                                    e_t_direct = e_world_direct - np.dot(e_world_direct, n_hat) * n_hat
+                                    self._last_surface_debug = {
+                                        "phase": "CRAWL_TO_EDGE",
+                                        "e_t": e_t.tolist(),
+                                        "e_t_direct": e_t_direct.tolist(),
+                                        "goal_dir_world": e_world_direct.tolist(),
+                                        "n_hat": n_hat.tolist(),
+                                        "best_dir": best,
+                                        "best_score": round(best_score, 2),
+                                        "scores": [round(s, 2) for s in scores],
+                                        "tangential_dist": round(tangential_dist, 2),
+                                        "subgoal_dir": subgoal_dir.tolist() if subgoal_dir is not None else None,
+                                        "agent_rot": current_pose[3:6].tolist(),
+                                    }
                         else:
                             self._last_surface_debug = {
                                 "phase": "CRAWL_TO_EDGE",
@@ -2939,7 +2995,7 @@ class RLGoalApproachController:
                                 "goal_dir_world": (self._current_goal[:3] - current_pose[:3]).tolist(),
                                 "subgoal_dir": subgoal_dir.tolist() if subgoal_dir is not None else None,
                             }
-                            
+
         if on_object > 0.5 and phase == "CRAWL_TO_GOAL":
             SURFACE_STRENGTH = 4.0
 
@@ -2969,7 +3025,6 @@ class RLGoalApproachController:
                         is_horizontal_surface = (
                             abs(float(np.dot(n_hat, up_dir_vec)))
                             > 0.85
-                            # and abs(float(sensor_data.get("k1", 0.0))) < 0.1
                         )
 
                         if is_horizontal_surface:
@@ -3029,14 +3084,6 @@ class RLGoalApproachController:
                                             / away_len
                                         )
 
-                                        # Determine which edge to
-                                        # push toward: inner or outer.
-                                        # Compare radial distance of
-                                        # goal vs agent from center.
-                                        # If goal is closer to center
-                                        # → push inward (toward center)
-                                        # If goal is farther
-                                        # → push outward (away)
                                         goal_from_center = (
                                             self._current_goal[:3]
                                             - center
@@ -3121,7 +3168,6 @@ class RLGoalApproachController:
                             else:
                                 e_t = e_t_horiz
 
-                            # Save rim debug for logging
                             self._rim_debug = {
                                 "is_horizontal": True,
                                 "up_dir": up_dir_vec.tolist(),
@@ -3280,7 +3326,6 @@ class RLGoalApproachController:
                                             )
                                         )
                                         use_geodesic = True
-                                        # Fallback: if geodesic lost vertical component
                                         e_t_flat_check = (
                                             e_world
                                             - np.dot(e_world, n_hat) * n_hat
@@ -3312,184 +3357,112 @@ class RLGoalApproachController:
                         )
 
                         if tangential_dist > 0.1:
-                            right_world = rot.apply(
-                                [1.0, 0.0, 0.0]
+                            tb1, tb2 = self._build_tangent_basis(
+                                rot, n_hat
                             )
-                            tb1 = (
-                                right_world
-                                - np.dot(
-                                    right_world,
-                                    n_hat,
+                            if tb1 is not None:
+                                best = None
+                                best_score = -1e18
+                                scores = np.full(
+                                    8,
+                                    -1e18,
+                                    dtype=float,
                                 )
-                                * n_hat
-                            )
-                            tb1_norm = (
-                                np.linalg.norm(tb1)
-                            )
-                            if tb1_norm < 1e-8:
-                                up_world = (
-                                    rot.apply(
-                                        [
-                                            0.0,
-                                            1.0,
-                                            0.0,
-                                        ]
+                                for (
+                                    i,
+                                    deg,
+                                ) in enumerate(
+                                    self.action_space.SURFACE_DIRECTIONS
+                                ):
+                                    a = np.radians(deg)
+                                    v_world = (
+                                        np.cos(a) * tb1
+                                        + np.sin(a)
+                                        * tb2
                                     )
-                                )
-                                tb1 = (
-                                    up_world
-                                    - np.dot(
-                                        up_world,
-                                        n_hat,
-                                    )
-                                    * n_hat
-                                )
-                                tb1_norm = (
-                                    np.linalg.norm(
-                                        tb1
-                                    )
-                                )
-                            if tb1_norm < 1e-8:
-                                tmp = np.array(
-                                    [0.0, 1.0, 0.0]
-                                )
-                                if (
-                                    abs(
-                                        np.dot(
-                                            tmp,
-                                            n_hat,
+                                    v_norm = float(
+                                        np.linalg.norm(
+                                            v_world
                                         )
                                     )
-                                    > 0.9
-                                ):
-                                    tmp = np.array(
-                                        [
-                                            0.0,
-                                            0.0,
-                                            1.0,
-                                        ]
+                                    if v_norm < 1e-8:
+                                        continue
+                                    v_world /= v_norm
+                                    new_e = (
+                                        e_t
+                                        - step * v_world
                                     )
-                                tb1 = np.cross(
-                                    n_hat, tmp
-                                )
-                                tb1_norm = (
-                                    np.linalg.norm(
-                                        tb1
+                                    score = float(
+                                        np.dot(e_t, e_t)
+                                        - np.dot(
+                                            new_e,
+                                            new_e,
+                                        )
                                     )
-                                )
-                            tb1 /= (
-                                tb1_norm + 1e-12
-                            )
-                            tb2 = np.cross(
-                                n_hat, tb1
-                            )
-                            tb2 /= (
-                                np.linalg.norm(tb2)
-                                + 1e-12
-                            )
-
-                            best = None
-                            best_score = -1e18
-                            scores = np.full(
-                                8,
-                                -1e18,
-                                dtype=float,
-                            )
-                            for (
-                                i,
-                                deg,
-                            ) in enumerate(
-                                self.action_space.SURFACE_DIRECTIONS
-                            ):
-                                a = np.radians(deg)
-                                v_world = (
-                                    np.cos(a) * tb1
-                                    + np.sin(a)
-                                    * tb2
-                                )
-                                v_norm = float(
-                                    np.linalg.norm(
-                                        v_world
-                                    )
-                                )
-                                if v_norm < 1e-8:
-                                    continue
-                                v_world /= v_norm
-                                new_e = (
-                                    e_t
-                                    - step * v_world
-                                )
-                                score = float(
-                                    np.dot(e_t, e_t)
-                                    - np.dot(
-                                        new_e,
-                                        new_e,
-                                    )
-                                )
-                                scores[i] = score
-                                if (
-                                    score
-                                    > best_score
-                                ):
-                                    best_score = (
+                                    scores[i] = score
+                                    if (
                                         score
-                                    )
-                                    best = i
+                                        > best_score
+                                    ):
+                                        best_score = (
+                                            score
+                                        )
+                                        best = i
 
-                            if (
-                                not path_blocked_now
-                            ):
                                 if (
-                                    distance
-                                    < 3.0 * step
+                                    not path_blocked_now
                                 ):
-                                    HYST_ABS = 1.0
-                                else:
-                                    HYST_ABS = 0.25
-                                if (
-                                    prev_action
-                                    is not None
-                                    and 0
-                                    <= prev_action
-                                    < 8
-                                    and best
-                                    is not None
-                                ):
-                                    prev_score = (
-                                        scores[
-                                            int(
+                                    if (
+                                        distance
+                                        < 3.0 * step
+                                    ):
+                                        HYST_ABS = 1.0
+                                    else:
+                                        HYST_ABS = 0.25
+                                    if (
+                                        prev_action
+                                        is not None
+                                        and 0
+                                        <= prev_action
+                                        < 8
+                                        and best
+                                        is not None
+                                    ):
+                                        prev_score = (
+                                            scores[
+                                                int(
+                                                    prev_action
+                                                )
+                                            ]
+                                        )
+                                        if (
+                                            best_score
+                                            - prev_score
+                                        ) < HYST_ABS:
+                                            best = int(
                                                 prev_action
                                             )
-                                        ]
-                                    )
-                                    if (
-                                        best_score
-                                        - prev_score
-                                    ) < HYST_ABS:
-                                        best = int(
-                                            prev_action
-                                        )
 
-                            if best is not None:
-                                surface_move[best] = SURFACE_STRENGTH
-                                e_world_direct = self._current_goal[:3] - current_pose[:3]
-                                e_t_direct = e_world_direct - np.dot(e_world_direct, n_hat) * n_hat
-                                self._last_surface_debug = {
-                                    "phase": "CRAWL_TO_GOAL",
-                                    "e_t": e_t.tolist(),
-                                    "e_t_direct": e_t_direct.tolist(),
-                                    "e_world": (rot.apply(local_pos_error)).tolist() if not path_blocked_now else None,
-                                    "goal_dir_world": e_world_direct.tolist(),
-                                    "n_hat": n_hat.tolist(),
-                                    "best_dir": best,
-                                    "best_score": round(best_score, 2),
-                                    "scores": [round(s, 2) for s in scores],
-                                    "tangential_dist": round(tangential_dist, 2),
-                                    "use_geodesic": use_geodesic if not path_blocked_now else False,
-                                    "path_blocked": path_blocked_now,
-                                    "is_horizontal": is_horizontal_surface if path_blocked_now else False,
-                                    "agent_rot": current_pose[3:6].tolist(),
-                                }
+                                if best is not None:
+                                    surface_move[best] = SURFACE_STRENGTH
+                                    e_world_direct = self._current_goal[:3] - current_pose[:3]
+                                    e_t_direct = e_world_direct - np.dot(e_world_direct, n_hat) * n_hat
+                                    self._last_surface_debug = {
+                                        "phase": "CRAWL_TO_GOAL",
+                                        "e_t": e_t.tolist(),
+                                        "e_t_direct": e_t_direct.tolist(),
+                                        "e_world": (rot.apply(local_pos_error)).tolist() if not path_blocked_now else None,
+                                        "goal_dir_world": e_world_direct.tolist(),
+                                        "n_hat": n_hat.tolist(),
+                                        "best_dir": best,
+                                        "best_score": round(best_score, 2),
+                                        "scores": [round(s, 2) for s in scores],
+                                        "tangential_dist": round(tangential_dist, 2),
+                                        "use_geodesic": use_geodesic if not path_blocked_now else False,
+                                        "path_blocked": path_blocked_now,
+                                        "is_horizontal": is_horizontal_surface if path_blocked_now else False,
+                                        "agent_rot": current_pose[3:6].tolist(),
+                                    }
                         else:
                             self._last_surface_debug = {
                                 "phase": "CRAWL_TO_GOAL",
@@ -3510,7 +3483,7 @@ class RLGoalApproachController:
             self.num_actions, dtype=float
         )
 
-        if on_object > 0.5 and phase  in ("CRAWL_TO_GOAL", "CRAWL_TO_EDGE"):
+        if on_object > 0.5 and phase in ("CRAWL_TO_GOAL", "CRAWL_TO_EDGE"):
             if len(self._distance_history) >= 10:
                 dist_10_ago = self._distance_history[-10]
                 dist_progress_10 = dist_10_ago - distance
@@ -3552,14 +3525,13 @@ class RLGoalApproachController:
             rotation_step = (
                 self.action_space.rotation_step
             )
-            # ═══ NEW: Depth-aware throttling (all air phases) ═══
             depth = sensor_data.get("depth", 100.0)
             free_step = self.action_space.free_step
 
-            if depth < free_step:  # < 8mm — critical proximity
+            if depth < free_step:
                 steer[self.action_space.IDX_FREE_FORWARD] -= 20.0
                 steer[self.action_space.IDX_FREE_FORWARD_SMALL] += 4.0
-            elif depth < 2.0 * free_step:  # < 16mm — caution
+            elif depth < 2.0 * free_step:
                 steer[self.action_space.IDX_FREE_FORWARD] -= 8.0
                 steer[self.action_space.IDX_FREE_FORWARD_SMALL] += 3.0
 
@@ -3808,7 +3780,7 @@ class RLGoalApproachController:
             else:
                 if (
                     distance
-                    > 2.0 * self.action_space.free_step  # 16mm (was 64mm)
+                    > 2.0 * self.action_space.free_step
                 ):
                     steer[
                         self.action_space.IDX_FREE_FORWARD
@@ -3822,7 +3794,7 @@ class RLGoalApproachController:
                     ] += STEER_STRENGTH
                     steer[
                         self.action_space.IDX_FREE_FORWARD
-                    ] -= 3.0  # suppress big step when very close
+                    ] -= 3.0
 
                 correction = STEER_STRENGTH * 0.3
                 best_pitch = max(

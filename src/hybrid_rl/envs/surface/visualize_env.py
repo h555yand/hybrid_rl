@@ -54,7 +54,7 @@ _TEXT_Y_START = 5
 _TEXT_X_START = 5
 _TEXT_LINE_SPACING = 3
 _BG_ALPHA = 200
-_DETAIL_STEPS = 100
+_DETAIL_STEPS = 25
 _FRAME_INTERVAL = 50
 
 
@@ -283,7 +283,7 @@ def should_save_frame(
         return True
     if step_idx <= detail_steps:
         return True
-    if step_idx >= total_steps - int(frame_interval * 0.5):
+    if step_idx >= total_steps - int(frame_interval * 0.1):
         return True
     if step_idx % frame_interval == 0:
         return True
