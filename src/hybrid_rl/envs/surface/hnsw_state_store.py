@@ -340,7 +340,7 @@ class HNSWStateStore:
         distances = distances[0]
 
         # ═══ Exact match ═══
-        if distances[0] < self.insert_threshold ** 2:
+        if distances[0] < self.insert_threshold ** 2 and labels[0] in self.points:
             point = self.points[labels[0]]
             point.visit_count += 1
             point.last_step = self.global_step
@@ -389,7 +389,8 @@ class HNSWStateStore:
 
         # 2. Experience
         visit_counts = np.array([
-            self.points[l].visit_count for l in labels
+            self.points[l].visit_count if l in self.points else 0
+            for l in labels
         ], dtype=float)
         weighted_visits = float(
             np.sum(weights * visit_counts) / weight_sum
@@ -400,7 +401,10 @@ class HNSWStateStore:
         neighbor_best_actions = [
             int(np.argmax(self.points[l].q_values))
             for l in labels
+            if l in self.points
         ]
+        if not neighbor_best_actions:
+            return np.zeros(self.num_actions), empty_confidence
         from collections import Counter
         action_counts = Counter(neighbor_best_actions)
         most_common_count = action_counts.most_common(1)[0][1]
@@ -409,9 +413,11 @@ class HNSWStateStore:
         )
 
         # 4. Recency
-        max_last_step = float(max(
+        valid_steps = [
             self.points[l].last_step for l in labels
-        ))
+            if l in self.points
+        ]
+        max_last_step = float(max(valid_steps)) if valid_steps else 0.0
         age = self.global_step - max_last_step
         window = max(self.global_step * 0.15, 1000.0)
         recency = float(max(1.0 - age / window, 0.0))
@@ -420,7 +426,8 @@ class HNSWStateStore:
         weights /= weight_sum
         q_values = np.zeros(self.num_actions)
         for i, label in enumerate(labels):
-            q_values += weights[i] * self.points[label].q_values
+            if label in self.points:
+                q_values += weights[i] * self.points[label].q_values
 
         # 5. Top-2 spread (on interpolated Q-values)
         valid_q = q_values[q_values > -1e8]
@@ -493,7 +500,7 @@ class HNSWStateStore:
         distances = distances[0]
 
         # coincidence
-        if distances[0] < self.insert_threshold ** 2:
+        if distances[0] < self.insert_threshold ** 2 and labels[0] in self.points:
             point = self.points[labels[0]]
             point.visit_count += 1
             point.last_step = self.global_step
@@ -523,7 +530,8 @@ class HNSWStateStore:
 
         q_values = np.zeros(self.num_actions)
         for i, label in enumerate(labels):
-            q_values += weights[i] * self.points[label].q_values
+            if label in self.points:
+                q_values += weights[i] * self.points[label].q_values
 
         # Scaling by confidence
         # Far from known points → Q-values ​​closer to zero
@@ -588,19 +596,27 @@ class HNSWStateStore:
         self._record_distance(distances[0])
         self._maybe_recalibrate()
 
-        if distances[0] < self.insert_threshold ** 2:
-            point = self.points[labels[0]]
+        # Find nearest valid point (skip ghost/deleted)
+        nearest_valid_idx = None
+        for _i in range(len(labels)):
+            if labels[_i] in self.points:
+                nearest_valid_idx = _i
+                break
+
+        if (
+            nearest_valid_idx is not None
+            and distances[nearest_valid_idx] < self.insert_threshold ** 2
+        ):
+            point = self.points[labels[nearest_valid_idx]]
             point.q_values[action] += alpha * (
                 td_target - point.q_values[action]
             )
             if count_visit:
                 point.visit_count += 1
-            point.last_step = self.global_step  # always refresh recency
+            point.last_step = self.global_step
             self._updates_existing_count += 1
         elif count_visit:
             self._insert_point(state, norm_state, action, td_target, alpha)
-            # else: backup hit an unknown region — skip insertion;
-            # we only refine states the agent actually visited online.
 
     # ══════════════════════════════════════════════════════════
     # POINT INSERTION
@@ -647,6 +663,31 @@ class HNSWStateStore:
             )
 
     def _interpolate_q_init(self, norm_state: np.ndarray) -> np.ndarray:
+        if self.next_id == 0:
+            return np.zeros(self.num_actions)
+
+        k = min(self.k_neighbors, self.next_id)
+        labels, distances = self._index.knn_query(
+            norm_state.reshape(1, -1), k=k
+        )
+
+        sigma = self._get_sigma(distances[0])
+        weights = self._gaussian_kernel(distances[0], sigma)
+        weight_sum = weights.sum()
+
+        if weight_sum < 1e-10:
+            return np.zeros(self.num_actions)
+
+        weights /= weight_sum
+
+        q_init = np.zeros(self.num_actions)
+        for i, label in enumerate(labels[0]):
+            if label in self.points:  # ← ДОБАВИТЬ ПРОВЕРКУ
+                q_init += weights[i] * self.points[label].q_values
+
+        return q_init
+    
+    def _interpolate_q_init_old(self, norm_state: np.ndarray) -> np.ndarray:
         """Initialize Q-values for new point from existing neighbors.
 
         Uses same Gaussian kernel interpolation as get_q_values.
@@ -965,6 +1006,8 @@ class HNSWStateStore:
 
         result = []
         for i, label in enumerate(labels):
+            if label not in self.points:
+                continue
             point = self.points[label]
             result.append({
                 "point_id": int(label),
@@ -999,7 +1042,9 @@ class HNSWStateStore:
         # Only count visits if neighbor is reasonably close
         if dist_sq > (self.insert_threshold * 3.0) ** 2:
             return 0
-        
+
+        if label not in self.points:
+            return 0
         return self.points[label].visit_count
 
     # ══════════════════════════════════════════════════════════

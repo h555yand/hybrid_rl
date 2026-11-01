@@ -128,7 +128,10 @@ class AdaptiveTrainingManager:
         self.extractor = ExperienceExtractor(
             config=config, mesh_name=mesh_name
         )
-        self.arbitrator = Arbitrator(controller=controller)
+        self.arbitrator = Arbitrator(
+                controller=controller,
+                temperature_override=config.get("temperature_override", None)
+            )
         self.mode_changes: List[Dict[str, Any]] = []
         self._level_success_history: Dict[int, deque] = {}
         self._offline_just_completed = False

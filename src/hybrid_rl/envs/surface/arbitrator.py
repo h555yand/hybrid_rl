@@ -155,7 +155,8 @@ class Arbitrator:
         param_mean: Optional[np.ndarray] = None,
         param_std: Optional[np.ndarray] = None,
         min_eval_per_source: int = 5,
-        force_heuristic: bool = False,          # ← НОВОЕs
+        force_heuristic: bool = False,
+        temperature_override = None,
     ):
         self.controller = controller
         self.sac_actor = sac_actor
@@ -246,6 +247,7 @@ class Arbitrator:
         self._force_heuristic = force_heuristic
         self._agreement_categories: Dict[str, int] = defaultdict(int)
         self._disagreement_log: deque = deque(maxlen=1000)
+        self.temperature_override = temperature_override
 
     def _warmup_running_stats(self):
         MAX_WARMUP_POINTS = 10000
