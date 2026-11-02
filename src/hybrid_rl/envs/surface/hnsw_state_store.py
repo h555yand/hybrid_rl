@@ -625,7 +625,9 @@ class HNSWStateStore:
         if len(self.points) >= self.max_points:
             self._evict_points()
 
-        q_init = self._interpolate_q_init(norm_state)
+        q_init = np.zeros(self.num_actions)
+        interpolated_q = self._interpolate_q_init(norm_state)
+        q_init[action] = interpolated_q[action]
         q_init[action] += alpha * (td_target - q_init[action])
 
         point_id = self.next_id

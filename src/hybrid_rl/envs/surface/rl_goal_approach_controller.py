@@ -2147,6 +2147,35 @@ class RLGoalApproachController:
         # q_values = store.get_q_values(state)
         q_values, q_confidence = store.get_q_values_with_confidence(state)
 
+        # ═══ DEBUG: nearest point info ═══
+        if store.next_id > 0:
+            _dbg_norm = store._normalize(state)
+            _dbg_k = min(3, store.next_id)
+            _dbg_labels, _dbg_dists = store._index.knn_query(
+                _dbg_norm.reshape(1, -1), k=_dbg_k
+            )
+            _dbg_nn_info = []
+            for _i in range(_dbg_k):
+                _lbl = _dbg_labels[0][_i]
+                if _lbl in store.points:
+                    _pt = store.points[_lbl]
+                    _raw_p2d = _pt.raw_state[20:22] if len(_pt.raw_state) > 21 else [0, 0]
+                    _sq = _pt.q_values[:8]
+                    _si = np.argsort(_sq)[::-1]
+                    _t3 = "/".join(f"a{_si[j]}={_sq[_si[j]]:.1f}" for j in range(3))
+                    _spr = float(_sq[_si[0]] - _sq[_si[1]])
+                    _dbg_nn_info.append(
+                        f"id={_lbl}"
+                        f"|d={_dbg_dists[0][_i]:.3f}"
+                        f"|p2d=[{_raw_p2d[0]:.2f},{_raw_p2d[1]:.2f}]"
+                        f"|q=[{_t3}]"
+                        f"|spr={_spr:.1f}"
+                        f"|vis={_pt.visit_count}"
+                    )
+            _dbg_nn_str = " | ".join(_dbg_nn_info)
+        else:
+            _dbg_nn_str = "empty"
+            
         heuristic, heuristic_components = (
             self._compute_heuristic_bias(
                 state=state,
@@ -2653,6 +2682,7 @@ class RLGoalApproachController:
             f"{normal_str}"
             f"{pos_str}"
             f"{snap_str}"
+            f"|nn={_dbg_nn_str}" 
             f"{fly_debug_str}]"
             f"|peff={phase_eff:.2f}|pthr={phase_thr}"
         )

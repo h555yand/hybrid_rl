@@ -4,10 +4,10 @@ visualise: text
 regenerate_scripts: true
 do_train: true
 do_eval: true
-do_heur_eval: false
-do_bc_train: false
-do_sac_train: false
-do_sac_eval: false
+do_heur_eval: true
+do_bc_train: true
+do_sac_train: true
+do_sac_eval: true
 do_adaptive: false
 do_ycb_eval: false
 
@@ -39,9 +39,9 @@ curriculum_filters:
 training_stages:
   # ── Phase 1: Primitives ──
   - mesh: cube
-    episodes: 1500
+    episodes: 1000
     epsilon_start: 1.0
-    epsilon_min: 0.9
+    epsilon_min: 0.95
     load_mode: null
     warmup_episodes: 100
     promote_threshold: 0.7
@@ -52,9 +52,9 @@ training_stages:
       - {}
 
   - mesh: sphere
-    episodes: 1500
+    episodes: 1000
     epsilon_start: 1.0
-    epsilon_min: 0.9
+    epsilon_min: 0.95
     load_mode: auto
     warmup_episodes: 100
     promote_threshold: 0.7
@@ -65,9 +65,9 @@ training_stages:
       - {}
 
   - mesh: cylinder
-    episodes: 1500
+    episodes: 1000
     epsilon_start: 1.0
-    epsilon_min: 0.9
+    epsilon_min: 0.95
     load_mode: auto
     warmup_episodes: 100
     promote_threshold: 0.7
@@ -78,22 +78,22 @@ training_stages:
       - {}
 
   - mesh: flat_square
-    episodes: 1000
+    episodes: 500
     epsilon_start: 1.0
-    epsilon_min: 0.9
+    epsilon_min: 0.95
     load_mode: auto
     warmup_episodes: 100
     promote_threshold: 0.7
-    promote_window: 200
+    promote_window: 100
     curriculum_filters:
       - {same_side: true, path_blocked: false}
       - {same_side: true, path_blocked: true}
       - {}
   
   - mesh: cone
-    episodes: 1500
+    episodes: 1000
     epsilon_start: 1.0
-    epsilon_min: 0.9
+    epsilon_min: 0.95
     load_mode: auto
     warmup_episodes: 100
     promote_threshold: 0.7
@@ -104,13 +104,13 @@ training_stages:
       - {}
 
   - mesh: thin_cylinder
-    episodes: 1000
+    episodes: 500
     epsilon_start: 1.0
-    epsilon_min: 0.9
+    epsilon_min: 0.95
     load_mode: auto
     warmup_episodes: 100
     promote_threshold: 0.7
-    promote_window: 200
+    promote_window: 100
     curriculum_filters:
       - {same_side: true, path_blocked: false}
       - {same_side: true, path_blocked: true}
@@ -315,7 +315,7 @@ bc_mesh_weights:
 bc_level_weights:
   0: 1.0
   1: 1.5
-  2: 2.0    # увеличил с 2.0 — L2 самый важный для генерализации
+  2: 2.0 
   
 bc_min_per_group: 50
 bc_action_min_pct: 0.01
@@ -348,32 +348,32 @@ rl_config:
     20: 0.0
     21: 0.0
   feature_weights_surface:
-    0: 2.0
-    1: 2.0
-    2: 0.5
-    3: 0.0
+    0: 2.0    # lpe[0] — без изменений
+    1: 2.0    # lpe[1] — без изменений
+    2: 0.5    # lpe[2] — без изменений
+    3: 0.0    # rot_error — без изменений
     4: 0.0
     5: 0.0
-    6: 0.3
+    6: 0.3    # local_normal — без изменений
     7: 0.3
     8: 0.3
-    9: 0.5
-    10: 0.5
-    11: 0.0
-    12: 1.0
-    13: 0.5
-    14: 0.0
-    15: 0.5
-    16: 0.5
-    17: 0.5
-    18: 3.0
-    19: 0.3
-    20: 3.0
-    21: 3.0
+    9: 1.5    # k1 — УВЕЛИЧЕН с 0.5 (выпуклая/вогнутая)
+    10: 0.5   # k2 — без изменений
+    11: 0.0   # on_object — без изменений
+    12: 1.5   # alignment — УВЕЛИЧЕН с 1.0
+    13: 0.5   # distance — без изменений
+    14: 0.0   # norm_depth — без изменений
+    15: 1.0   # goal_normal[0] — УВЕЛИЧЕН с 0.5
+    16: 1.0   # goal_normal[1] — УВЕЛИЧЕН с 0.5
+    17: 1.0   # goal_normal[2] — УВЕЛИЧЕН с 0.5
+    18: 3.0   # path_blocked — без изменений
+    19: 0.3   # movement_efficiency — без изменений
+    20: 3.0   # p2d[0] — без изменений
+    21: 3.0   # p2d[1] — без изменений
 
   mode: train_adapt_epsilon
   goal_threshold: 4.0
-  max_points: 500000
+  max_points: 10000000
   k_neighbors: 7
   max_steps_per_goal: 500
   adaptive_sigma: true
