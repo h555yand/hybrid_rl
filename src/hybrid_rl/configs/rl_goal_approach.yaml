@@ -314,7 +314,7 @@ bc_mesh_weights:
 
 bc_level_weights:
   0: 1.0
-  1: 1.5
+  1: 2.0
   2: 2.0 
   
 bc_min_per_group: 50
