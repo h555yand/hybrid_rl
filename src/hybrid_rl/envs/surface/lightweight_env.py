@@ -2406,6 +2406,18 @@ def _is_reachable_by_surface(
         True if both points are on the same side.
     """
     if not env._is_hollow:
+        # Thin objects: top and bottom are different sides
+        extents = env.mesh.bounds[1] - env.mesh.bounds[0]
+        min_extent = float(np.min(extents))
+        max_extent = float(np.max(extents))
+        
+        if min_extent < max_extent * 0.15:
+            thin_axis = int(np.argmin(extents))
+            center_val = float(env.mesh.centroid[thin_axis])
+            start_side = start_pos[thin_axis] > center_val
+            goal_side = goal_pos[thin_axis] > center_val
+            return start_side == goal_side
+        
         return True
     
     center = np.array(env.mesh.centroid, dtype=float)
