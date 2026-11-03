@@ -1948,7 +1948,7 @@ class RLGoalApproachExperiment:
                 num_episodes,
                 pool_seed,
             )
-            env = LightweightEnv(mesh_path)
+            env = LightweightEnv(mesh_path, mesh_name=Path(mesh_path).stem)
             controller = RLGoalApproachController(
                 agent_id=f"sac_{mesh_name}",
                 config={**self.rl_config, "mode": "eval"},
@@ -2186,7 +2186,7 @@ class RLGoalApproachExperiment:
                 np.random.seed(eval_seed)  # noqa: NPY002
                 torch.manual_seed(eval_seed)
                 env = LightweightEnv(
-                    mesh_path, seed=eval_seed
+                    mesh_path, seed=eval_seed, mesh_name=Path(mesh_path).stem
                 )
                 controller = RLGoalApproachController(
                     agent_id=(
@@ -3370,7 +3370,7 @@ class RLGoalApproachExperiment:
         np.random.seed(self.adapt_seed)
         random.seed(self.adapt_seed)
 
-        env = LightweightEnv(mesh_path, seed=adapt_seed)
+        env = LightweightEnv(mesh_path, seed=adapt_seed, mesh_name=Path(mesh_path).stem)
 
         adapt_q_dir = str(
             self.runs_dir
@@ -3559,7 +3559,7 @@ class RLGoalApproachExperiment:
                 continue
 
             trimesh_env = LightweightEnv(
-                str(stl_path), seed=adapt_seed
+                str(stl_path), seed=adapt_seed, mesh_name=Path(stl_path).stem
             )
 
             # ═══ Paths ═══

@@ -161,7 +161,7 @@ def generate_episode_pools(
     """
     np.random.seed(seed)
     random.seed(seed)
-    env = LightweightEnv(mesh_path, seed=seed)
+    env = LightweightEnv(mesh_path, seed=seed, mesh_name=Path(mesh_path).stem)
     curr_levels = list(
         (curriculum_config or {}).get("levels", [])
     )
@@ -212,7 +212,7 @@ def generate_episode_pools(
                 require_handle_between = False
 
         max_attempts = (
-            100
+            200
             if (
                 require_same_side is not None
                 or require_path_blocked is not None

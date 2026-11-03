@@ -91,7 +91,7 @@ class RLGoalPolicy(MotorPolicy):
 
             if mesh_path:
                 from tbp.hybrid_rl.lightweight_env import LightweightEnv
-                trimesh_env = LightweightEnv(mesh_path)
+                trimesh_env = LightweightEnv(mesh_path, mesh_name=Path(mesh_path).stem)
             else:
                 trimesh_env = None
 

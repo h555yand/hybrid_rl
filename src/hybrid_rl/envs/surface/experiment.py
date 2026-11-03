@@ -1954,7 +1954,7 @@ class RLGoalApproachExperiment:
                 num_episodes,
                 pool_seed,
             )
-            env = LightweightEnv(mesh_path)
+            env = LightweightEnv(mesh_path, mesh_name=Path(mesh_path).stem)
             controller = RLGoalApproachController(
                 agent_id=f"sac_{mesh_name}",
                 config={**self.rl_config, "mode": "eval"},
@@ -2213,7 +2213,7 @@ class RLGoalApproachExperiment:
                 np.random.seed(eval_seed)  # noqa: NPY002
                 torch.manual_seed(eval_seed)
 
-                env = LightweightEnv(mesh_path, seed=eval_seed)
+                env = LightweightEnv(mesh_path, seed=eval_seed, mesh_name=Path(mesh_path).stem)
                 controller = RLGoalApproachController(
                     agent_id=f"sac_eval_L{level_idx}_{eval_seed}",
                     config={**self.rl_config, "mode": "eval"},
