@@ -1452,30 +1452,20 @@ class LightweightEnv:
                 self._passed_through = True
                 
     def _orient_horizontal(self, rotation_degrees, forward_distance, left_distance):
-        """Moves the agent forward and sideways (left/right), projects onto surface, and yaws.
-        
-        Args:
-            rotation_degrees: additional yaw rotation (e.g. +45 for right turn)
-            forward_distance: mm to move forward (+) or backward (-)
-            left_distance: mm to move left (+) or right (-)
-        """
-        # Local movement direction
         local_dir = np.array([
-            -left_distance,        # +left → -X (left), -left → +X (right)
+            -left_distance,
             0.0,
-            -forward_distance      # +forward → -Z, -forward → +Z
+            -forward_distance
         ])
 
         if np.linalg.norm(local_dir) < 1e-8:
-            local_dir = np.array([0.0, 0.0, -1.0])  # default: forward
+            local_dir = np.array([0.0, 0.0, -1.0])
         else:
             local_dir = local_dir / np.linalg.norm(local_dir)
 
-        # Rotate to world
         rot = R.from_euler("xyz", self.agent_rot, degrees=True)
         world_dir = rot.apply(local_dir)
 
-        # Project onto tangent plane
         sensor_data = self.get_sensor_data()
         if sensor_data["point_normal"] is not None:
             normal = np.array(sensor_data["point_normal"])
@@ -1484,38 +1474,32 @@ class LightweightEnv:
             if norm > 1e-8:
                 world_dir /= norm
 
-        # Total step distance in mm
         step = np.linalg.norm([forward_distance, left_distance])
+        
+        # ═══ Through-wall detection ═══
+        old_pos = self.agent_pos.copy()
         self.agent_pos += world_dir * step
+        
+        if step > 0.5 and self._check_through_wall(old_pos, self.agent_pos):
+            self._passed_through = True
 
-        # Apply yaw rotation
-        self.agent_rot[1] += rotation_degrees  # Y-axis = yaw
+        self.agent_rot[1] += rotation_degrees
 
     def _orient_vertical(self, rotation_degrees, forward_distance, down_distance):
-        """Moves the agent forward and down/up, projects onto surface, and pitches.
-        
-        Args:
-            rotation_degrees: additional pitch rotation (e.g. +10 for look down)
-            forward_distance: mm to move forward (+) or backward (-)
-            down_distance: mm to move down (+) or up (-)
-        """
-        # Local movement: X=0, Y=-down, Z=-forward
         local_dir = np.array([
             0.0,
-            -down_distance,        # +down → -Y, -down → +Y (up)
-            -forward_distance      # +forward → -Z
+            -down_distance,
+            -forward_distance
         ])
 
         if np.linalg.norm(local_dir) < 1e-8:
-            local_dir = np.array([0.0, 0.0, -1.0])  # default: forward
+            local_dir = np.array([0.0, 0.0, -1.0])
         else:
             local_dir = local_dir / np.linalg.norm(local_dir)
 
-        # Rotate to world
         rot = R.from_euler("xyz", self.agent_rot, degrees=True)
         world_dir = rot.apply(local_dir)
 
-        # Project onto tangent plane
         sensor_data = self.get_sensor_data()
         if sensor_data["point_normal"] is not None:
             normal = np.array(sensor_data["point_normal"])
@@ -1524,12 +1508,16 @@ class LightweightEnv:
             if norm > 1e-8:
                 world_dir /= norm
 
-        # Total step distance
         step = np.linalg.norm([forward_distance, down_distance])
+        
+        # ═══ Through-wall detection ═══
+        old_pos = self.agent_pos.copy()
         self.agent_pos += world_dir * step
+        
+        if step > 0.5 and self._check_through_wall(old_pos, self.agent_pos):
+            self._passed_through = True
 
-        # Apply pitch rotation (around X axis)
-        self.agent_rot[0] += rotation_degrees  # X-axis = pitch
+        self.agent_rot[0] += rotation_degrees
 
     def _compute_up_direction(self):
         """Determine the 'up' direction for the object.

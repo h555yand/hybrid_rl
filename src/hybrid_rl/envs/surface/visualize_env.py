@@ -56,7 +56,7 @@ _TEXT_LINE_SPACING = 3
 _BG_ALPHA = 200
 _DETAIL_STEPS = 25
 _FRAME_INTERVAL = 50
-
+_SAVE_PER_EPOSIDE = 50
 
 # ═══════════════════════════════════════════════════
 # Environment render protocol
@@ -340,10 +340,13 @@ class EpisodeVisualizer:
             for result in ("success", "collision", "timeout"):
                 self.counts[f"level_{level}_{result}"] = 0
 
-    def should_save(self, level: int, result: str) -> bool:
+    def should_save(self, level: int, result: str, episode=None) -> bool:
         """Check if we should save this episode."""
         key = f"level_{level}_{result}"
-        return self.counts.get(key, 0) < self.max_per_type
+        res_level_result = self.counts.get(key, 0) < self.max_per_type
+        if episode is not None:
+            res_episode = (episode + 1) % _SAVE_PER_EPOSIDE == 0
+        return res_level_result or res_episode
 
     def save_episode(
         self,
@@ -373,7 +376,7 @@ class EpisodeVisualizer:
             actions_header: Custom header for actions.txt.
                 If provided, replaces auto-generated header.
         """
-        if not self.should_save(level, result):
+        if not self.should_save(level, result, episode):
             return
 
         key = f"level_{level}_{result}"

@@ -123,15 +123,18 @@ class AdaptiveTrainingManager:
 
         # Components
         self.sac_trainer: PSACTrainer | None = None
-        self.action_space = controller.action_space
+        self.action_space = controller.action_space if controller is not None else None
         mesh_name = Path(mesh_path).stem if mesh_path else "unknown"
         self.extractor = ExperienceExtractor(
             config=config, mesh_name=mesh_name
         )
-        self.arbitrator = Arbitrator(
+        if controller is not None:
+            self.arbitrator = Arbitrator(
                 controller=controller,
                 temperature_override=config.get("temperature_override", None)
             )
+        else:
+            self.arbitrator = None
         self.mode_changes: List[Dict[str, Any]] = []
         self._level_success_history: Dict[int, deque] = {}
         self._offline_just_completed = False
@@ -147,6 +150,192 @@ class AdaptiveTrainingManager:
         return sum(self.success_history) / len(
             self.success_history
         )
+
+    def sleep_sac_consolidation(
+        self,
+        object_name: str,
+        success_trails: List[List[Dict[str, Any]]],
+        failure_trails: List[List[Dict[str, Any]]],
+        level: int = 0,
+        sac_update_steps: int = 3000,
+        critic_warmup_steps: int = 200,
+        actor_update_every: int = 5,
+        actor_lr_scale: float = 0.3,
+        bc_lambda_init: float = 3.0,
+        bc_lambda_decay: float = 0.999,
+        bc_lambda_min: float = 0.3,
+        use_cql: bool = True,
+        cql_alpha: float = 0.5,
+        current_mesh_ratio: float = 0.7,
+        bc_ratio: float = 0.2,
+        elite_ratio: float = 0.1,
+    ) -> Dict[str, Any]:
+        """Offline SAC consolidation using accumulated trails.
+
+        Like _maybe_online_sac_update() but:
+        - More SGD steps (3000 vs 40)
+        - More aggressive actor updates (every 5th vs 10th)
+        - Higher actor lr (0.3x vs 0.1x)
+        - Faster critic warmup (200 steps vs 300 episodes)
+        - Uses all accumulated trails, not just recent
+
+        Actor learns from success trails (BC).
+        Critic learns from both success and failure (replay buffer).
+        """
+        if self.sac_trainer is None:
+            logger.warning("Sleep SAC skipped: no SAC trainer loaded")
+            return {"status": "skipped", "reason": "no_sac_trainer"}
+
+        if not success_trails:
+            logger.warning("Sleep SAC skipped: no success trails")
+            return {"status": "skipped", "reason": "no_success_trails"}
+
+        mesh_name = object_name
+
+        # ═══ 1. Convert trails to PSACTransition ═══
+        success_psac = self.extractor.convert_all_trajectories(
+            success_trails, level=level
+        )
+        failure_psac = self.extractor.convert_all_trajectories(
+            failure_trails, level=level
+        ) if failure_trails else []
+
+        logger.info(
+            "Sleep SAC: %d success transitions from %d trails, "
+            "%d failure transitions from %d trails",
+            len(success_psac), len(success_trails),
+            len(failure_psac), len(failure_trails),
+        )
+
+        # ═══ 2. Normalize and load into buffer ═══
+        all_psac = success_psac + failure_psac
+        all_normalized = self.sac_trainer._normalize_bc_transitions(all_psac)
+
+        self.sac_trainer.buffer.set_current_mesh(mesh_name)
+        added = 0
+        for tr in all_normalized:
+            if tr.next_state is None:
+                continue
+            self.sac_trainer.buffer.add(
+                state=tr.state,
+                action_type=tr.action_type,
+                action_params=tr.action_params,
+                reward=tr.reward,
+                next_state=tr.next_state,
+                done=tr.done,
+                mesh_name=mesh_name,
+            )
+            added += 1
+
+        # ═══ 3. Update BC data (success only → actor BC loss) ═══
+        success_normalized = self.sac_trainer._normalize_bc_transitions(
+            success_psac
+        )
+        if self.sac_trainer.bc_data is not None:
+            combined_bc = self.sac_trainer.bc_data + list(success_normalized)
+            if len(combined_bc) > self.max_bc_transitions * 2:
+                # Keep all new + sample from old
+                old_count = len(self.sac_trainer.bc_data)
+                keep_old = min(old_count, self.max_bc_transitions)
+                old_indices = np.random.choice(old_count, keep_old, replace=False)
+                combined_bc = (
+                    [self.sac_trainer.bc_data[i] for i in old_indices]
+                    + list(success_normalized)
+                )
+            self.sac_trainer.bc_data = combined_bc
+        else:
+            self.sac_trainer.bc_data = list(success_normalized)
+
+        if len(self.sac_trainer.buffer) < self.sac_trainer.batch_size:
+            logger.warning(
+                "Sleep SAC skipped: buffer too small (%d < %d)",
+                len(self.sac_trainer.buffer), self.sac_trainer.batch_size,
+            )
+            return {"status": "skipped", "reason": "buffer_too_small", "added": added}
+
+        # ═══ 4. Save original settings ═══
+        old_use_cql = self.sac_trainer.use_cql
+        old_cql_alpha = self.sac_trainer.cql_alpha
+        old_bc_lambda = self.sac_trainer.bc_lambda
+        old_actor_lr = self.sac_trainer.actor_optimizer.param_groups[0]["lr"]
+
+        # ═══ 5. Apply sleep settings ═══
+        self.sac_trainer.use_cql = use_cql
+        self.sac_trainer.cql_alpha = cql_alpha
+        self.sac_trainer.bc_lambda = bc_lambda_init
+        sleep_actor_lr = old_actor_lr * actor_lr_scale
+        self.sac_trainer.actor_optimizer.param_groups[0]["lr"] = sleep_actor_lr
+
+        # ═══ 6. SGD loop ═══
+        critic_losses = []
+        actor_losses = []
+
+        for step_i in range(sac_update_steps):
+            batch = self.sac_trainer.buffer.sample_balanced(
+                self.sac_trainer.batch_size,
+                current_mesh=mesh_name,
+                current_ratio=current_mesh_ratio,
+                bc_ratio=bc_ratio,
+                elite_ratio=elite_ratio,
+            )
+
+            # Critic every step
+            self.sac_trainer.update_critic_cql(batch)
+
+            # Actor: after warmup, every N-th step
+            if step_i >= critic_warmup_steps and step_i % actor_update_every == 0:
+                self.sac_trainer.update_actor(batch)
+                self.sac_trainer.update_alpha(batch)
+
+            self.sac_trainer.soft_update_target()
+
+            # BC lambda decay
+            self.sac_trainer.bc_lambda = max(
+                self.sac_trainer.bc_lambda * bc_lambda_decay,
+                bc_lambda_min,
+            )
+
+            # Logging
+            if (step_i + 1) % 500 == 0:
+                logger.info(
+                    "Sleep SAC step %d/%d: bc_lambda=%.3f, actor=%s",
+                    step_i + 1, sac_update_steps,
+                    self.sac_trainer.bc_lambda,
+                    "active" if step_i >= critic_warmup_steps else "warmup",
+                )
+
+        # ═══ 7. Restore settings ═══
+        self.sac_trainer.use_cql = old_use_cql
+        self.sac_trainer.cql_alpha = old_cql_alpha
+        # Keep decayed bc_lambda (don't restore — it's the new state)
+        self.sac_trainer.actor_optimizer.param_groups[0]["lr"] = old_actor_lr
+
+        # ═══ 8. Save ═══
+        self.sac_trainer.save(self.sac_save_dir)
+
+        result = {
+            "status": "completed",
+            "object": object_name,
+            "level": level,
+            "sac_update_steps": sac_update_steps,
+            "transitions_added": added,
+            "success_trails": len(success_trails),
+            "failure_trails": len(failure_trails),
+            "success_transitions": len(success_psac),
+            "failure_transitions": len(failure_psac),
+            "bc_data_size": len(self.sac_trainer.bc_data) if self.sac_trainer.bc_data else 0,
+            "final_bc_lambda": round(self.sac_trainer.bc_lambda, 4),
+            "buffer_size": len(self.sac_trainer.buffer),
+        }
+
+        logger.info(
+            "Sleep SAC complete: object=%s, level=%d, steps=%d, "
+            "added=%d, bc=%d, final_bc_lambda=%.3f",
+            object_name, level, sac_update_steps,
+            added, result["bc_data_size"], self.sac_trainer.bc_lambda,
+        )
+
+        return result
 
     def _get_level_success_rate(self, level: int) -> float:
         history = self._level_success_history.get(level)

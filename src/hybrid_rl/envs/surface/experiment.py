@@ -747,6 +747,8 @@ class RLGoalApproachExperiment:
             self._run_ycb_mujoco_eval()
         if self.do_ycb_mujoco_adaptive:
             self._run_ycb_mujoco_adaptive()
+        if self.config.get("do_sleep", False):
+            self._run_sleep()
 
         elapsed = time.time() - start_time
         logger.info("Experiment complete in %.1fs", elapsed)
@@ -2445,6 +2447,15 @@ class RLGoalApproachExperiment:
             Final results dict.
         """
         from collections import Counter
+        import pickle
+
+        # ═══ Sleep trails collection ═══
+        _MAX_SUCCESS_TRAILS_PER_LEVEL = 200
+        _MAX_FAILURE_TRAILS_PER_LEVEL = 100
+        _SLEEP_TRAILS_SAVE_EVERY = 200  # save periodically
+
+        sleep_success_trails: dict[int, list] = {}
+        sleep_failure_trails: dict[int, list] = {}
 
         logger.info("=" * 60)
         logger.info(
@@ -2478,6 +2489,14 @@ class RLGoalApproachExperiment:
             config=adaptive_cfg,
         )
         controller._collision_stats = {}
+
+        # ═══ Q-store diagnostics: initial sizes ═══
+        q_store_initial_free = len(controller.q_store_free.points)
+        q_store_initial_surface = len(controller.q_store_surface.points)
+        logger.info(
+            "Q-store initial: free=%d, surface=%d",
+            q_store_initial_free, q_store_initial_surface,
+        )
 
         # ═══ Load SAC ═══
         sac_trainer = None
@@ -2673,6 +2692,9 @@ class RLGoalApproachExperiment:
             last_transitions: list = []
             collision_stats_before = dict(controller._collision_stats)
             action_short_labels: list[str] = []
+            ep_q_confidences: list[float] = []
+            ep_q_reliable_steps = 0
+            ep_q_total_steps = 0
 
             # ═══ Step loop ═══
             for step in range(adaptive_max_steps):
@@ -2685,6 +2707,13 @@ class RLGoalApproachExperiment:
                     manager.get_action(state, pose, sensor)
                 )
                 controller._current_source = source
+
+                # ═══ Per-episode Q diagnostics ═══
+                # Q confidence уже посчитан внутри arbitrator._get_q_action
+                # Берём из последних значений arbitrator
+                if manager.arbitrator.q_confidence_history:
+                    ep_q_confidences.append(manager.arbitrator.q_confidence_history[-1])
+                ep_q_total_steps += 1
 
                 # Discrete index for Q-store learning
                 discrete_idx = sac_to_discrete(action_type, action_params)
@@ -2742,6 +2771,10 @@ class RLGoalApproachExperiment:
                     source_key = "sac"
                 elif source.startswith("q_"):
                     source_key = "q_store"
+                elif source.startswith("calibration_sac"):
+                    source_key = "sac"
+                elif source.startswith("calibration_heuristic"):
+                    source_key = "heuristic"
                 else:
                     source_key = "heuristic"
 
@@ -2795,6 +2828,24 @@ class RLGoalApproachExperiment:
                 controller._total_goals_reached > goals_before
             )
             ep_successes.append(success)
+            # ═══ Collect sleep trails ═══
+            if last_transitions:
+                if success:
+                    sleep_success_trails.setdefault(adaptive_level, [])
+                    sleep_success_trails[adaptive_level].append(last_transitions)
+                    if len(sleep_success_trails[adaptive_level]) > _MAX_SUCCESS_TRAILS_PER_LEVEL:
+                        sleep_success_trails[adaptive_level] = (
+                            sleep_success_trails[adaptive_level][-_MAX_SUCCESS_TRAILS_PER_LEVEL:]
+                        )
+                else:
+                    # Failures for critic: sample ~30%
+                    if np.random.random() < 0.3:
+                        sleep_failure_trails.setdefault(adaptive_level, [])
+                        sleep_failure_trails[adaptive_level].append(last_transitions)
+                        if len(sleep_failure_trails[adaptive_level]) > _MAX_FAILURE_TRAILS_PER_LEVEL:
+                            sleep_failure_trails[adaptive_level] = (
+                                sleep_failure_trails[adaptive_level][-_MAX_FAILURE_TRAILS_PER_LEVEL:]
+                            )
 
             all_episode_steps.append(ep_steps)
             if success:
@@ -2922,6 +2973,12 @@ class RLGoalApproachExperiment:
                 "rolling_success_rate": round(rolling_rate, 3),
                 "mode": manager.mode,
                 "curriculum_level": adaptive_level,
+                "ep_q_confidence_mean": round(
+                    float(np.mean(ep_q_confidences)) if ep_q_confidences else 0.0, 4
+                ),
+                "ep_q_confidence_max": round(
+                    float(np.max(ep_q_confidences)) if ep_q_confidences else 0.0, 4
+                ),
             })
 
             # Visualization
@@ -2952,7 +3009,32 @@ class RLGoalApproachExperiment:
                 successes_count = sum(
                     1 for e in episode_log if e["success"]
                 )
-
+                # ═══ Q-store diagnostics for snapshot ═══
+                q_store_diagnostics = {
+                    "q_store_free_size": len(controller.q_store_free.points),
+                    "q_store_surface_size": len(controller.q_store_surface.points),
+                    "q_store_free_growth": len(controller.q_store_free.points) - q_store_initial_free,
+                    "q_store_surface_growth": len(controller.q_store_surface.points) - q_store_initial_surface,
+                    # Running Q stats
+                    "running_q_free_count": manager.arbitrator._running_q_stats_free.count,
+                    "running_q_free_warmed": manager.arbitrator._running_q_stats_free.is_warmed_up,
+                    "running_q_free_mean": round(manager.arbitrator._running_q_stats_free.mean, 4),
+                    "running_q_free_std": round(manager.arbitrator._running_q_stats_free.std, 4),
+                    "running_q_surface_count": manager.arbitrator._running_q_stats_surface.count,
+                    "running_q_surface_warmed": manager.arbitrator._running_q_stats_surface.is_warmed_up,
+                    "running_q_surface_mean": round(manager.arbitrator._running_q_stats_surface.mean, 4),
+                    "running_q_surface_std": round(manager.arbitrator._running_q_stats_surface.std, 4),
+                    # Best Q norm
+                    "running_best_q_free_warmed": manager.arbitrator._running_best_q_free.is_warmed_up,
+                    "running_best_q_free_mean": round(manager.arbitrator._running_best_q_free.mean, 4),
+                    "running_best_q_surface_warmed": manager.arbitrator._running_best_q_surface.is_warmed_up,
+                    "running_best_q_surface_mean": round(manager.arbitrator._running_best_q_surface.mean, 4),
+                    # Thresholds
+                    "q_reliable_threshold_free": manager.arbitrator._q_reliable_threshold_free,
+                    "q_reliable_threshold_surface": manager.arbitrator._q_reliable_threshold_surface,
+                    # Per-level from arbitrator
+                    "per_level": arb_stats.get("q_diagnostics_per_level", {}),
+                }
                 snapshot = self._build_adaptive_snapshot(
                     episode=episode + 1,
                     rolling_rate=rolling_rate,
@@ -2969,6 +3051,7 @@ class RLGoalApproachExperiment:
                     all_success_steps=all_success_steps,
                     per_level_source_stats=per_level_source_stats,
                 )
+                snapshot["q_store_diagnostics"] = q_store_diagnostics
                 snapshot_log.append(snapshot)
 
                 snap_path = (
@@ -2977,11 +3060,34 @@ class RLGoalApproachExperiment:
                 with snap_path.open("w") as f:
                     json.dump(snapshot, f, indent=2)
 
+                # ═══ Periodic sleep trails save ═══
+                if (episode + 1) % _SLEEP_TRAILS_SAVE_EVERY == 0:
+                    self._save_sleep_trails(
+                        log_dir, object_name, episode + 1,
+                        sleep_success_trails, sleep_failure_trails,
+                        ep_successes, adaptive_level,
+                        level_episode_steps, level_success_steps,
+                    )
                 logger.info(
                     "Adaptive ep %d: rate=%.3f, mode=%s",
                     episode + 1, rolling_rate, stats["mode"],
                 )
 
+        # ═══ Final sleep trails save ═══
+        self._save_sleep_trails(
+            log_dir, object_name, len(episode_log),
+            sleep_success_trails, sleep_failure_trails,
+            ep_successes, adaptive_level,
+            level_episode_steps, level_success_steps,
+        )
+        # ═══ Final Q-store diagnostics ═══
+        q_final_free = len(controller.q_store_free.points)
+        q_final_surface = len(controller.q_store_surface.points)
+        logger.info(
+            "Q-store final: free=%d (+%d), surface=%d (+%d)",
+            q_final_free, q_final_free - q_store_initial_free,
+            q_final_surface, q_final_surface - q_store_initial_surface,
+        )
         # ═══ Save models ═══
         controller.save(adapt_q_dir)
         logger.info("Adaptive Q-store saved to %s", adapt_q_dir)
@@ -3067,6 +3173,12 @@ class RLGoalApproachExperiment:
             "per_source_analysis": self._build_per_source_analysis(
                 per_level_source_stats
             ),
+            "q_store_final": {
+                "free_size": q_final_free,
+                "surface_size": q_final_surface,
+                "free_growth": q_final_free - q_store_initial_free,
+                "surface_growth": q_final_surface - q_store_initial_surface,
+            },
         }
 
         # Save results
@@ -3103,6 +3215,55 @@ class RLGoalApproachExperiment:
     # ══════════════════════════════════════════════════════
     # Adaptive helpers (extracted from inline code)
     # ══════════════════════════════════════════════════════
+    @staticmethod
+    def _save_sleep_trails(
+        log_dir: Path,
+        mesh_name: str,
+        episode: int,
+        success_trails: dict[int, list],
+        failure_trails: dict[int, list],
+        ep_successes: list[bool],
+        current_level: int,
+        level_episode_steps: dict[int, list],
+        level_success_steps: dict[int, list],
+    ) -> None:
+        """Save sleep trails to disk for offline SAC consolidation."""
+        # Per-level success rates
+        success_rate_by_level = {}
+        trails_count_by_level = {}
+        
+        for lvl in sorted(set(list(success_trails.keys()) + list(failure_trails.keys()))):
+            s_count = len(success_trails.get(lvl, []))
+            f_count = len(failure_trails.get(lvl, []))
+            total = s_count + f_count
+            success_rate_by_level[lvl] = round(s_count / max(total, 1), 3)
+            trails_count_by_level[lvl] = {"success": s_count, "failure": f_count}
+
+        sleep_data = {
+            "mesh_name": mesh_name,
+            "episode": episode,
+            "current_level": current_level,
+            "success_trails_by_level": success_trails,
+            "failure_trails_by_level": failure_trails,
+            "stats": {
+                "total_episodes": episode,
+                "overall_success_rate": round(
+                    sum(ep_successes) / max(len(ep_successes), 1), 3
+                ),
+                "success_rate_by_level": success_rate_by_level,
+                "trails_count_by_level": trails_count_by_level,
+            },
+        }
+
+        path = log_dir / "sleep_trails.pkl"
+        with path.open("wb") as f:
+            pickle.dump(sleep_data, f)
+
+        logger.info(
+            "Sleep trails saved: ep=%d, levels=%s, path=%s",
+            episode, trails_count_by_level, path,
+        )
+
     @staticmethod
     def _format_action_params(action_type: int, action_params: np.ndarray) -> str:
         """Human-readable action parameters for logging."""
@@ -3381,6 +3542,158 @@ class RLGoalApproachExperiment:
             visualizer=visualizer,
         )
 
+    # ══════════════════════════════════════════════════════
+    # SLEEP
+    # ══════════════════════════════════════════════════════
+    def _run_sleep(self) -> None:
+        """Sleep consolidation: offline SAC fine-tune from adaptive trails.
+
+        Reads sleep_trails.pkl from last adaptive run,
+        checks conditions, runs SGD-only SAC consolidation.
+        """
+        import pickle
+
+        sleep_cfg = self.config.get("sleep_config", {})
+        success_threshold = sleep_cfg.get("success_threshold", 0.80)
+        min_success_trails = sleep_cfg.get("min_success_trails", 20)
+
+        mesh_name = self.adaptive_mesh
+        log_dir = self.data_dir / f"adaptive_logs_{mesh_name}"
+        trails_path = log_dir / "sleep_trails.pkl"
+
+        if not trails_path.exists():
+            logger.warning("Sleep skipped: no trails file at %s", trails_path)
+            return
+
+        # ═══ Load trails ═══
+        with trails_path.open("rb") as f:
+            sleep_data = pickle.load(f)
+
+        stats = sleep_data.get("stats", {})
+        success_trails_by_level = sleep_data.get("success_trails_by_level", {})
+        failure_trails_by_level = sleep_data.get("failure_trails_by_level", {})
+
+        logger.info(
+            "Sleep: loaded trails for %s — %s",
+            mesh_name, stats.get("trails_count_by_level", {}),
+        )
+
+        # ═══ Check conditions per level ═══
+        levels_to_consolidate = []
+        rate_by_level = stats.get("success_rate_by_level", {})
+
+        for level in sorted(success_trails_by_level.keys()):
+            level_rate = rate_by_level.get(level, 0.0)
+            level_trails = success_trails_by_level.get(level, [])
+
+            if level_rate >= success_threshold:
+                logger.info(
+                    "Sleep L%d: skipped (rate=%.3f >= %.3f, already good)",
+                    level, level_rate, success_threshold,
+                )
+                continue
+
+            if len(level_trails) < min_success_trails:
+                logger.info(
+                    "Sleep L%d: skipped (trails=%d < %d)",
+                    level, len(level_trails), min_success_trails,
+                )
+                continue
+
+            levels_to_consolidate.append(level)
+            logger.info(
+                "Sleep L%d: will consolidate (rate=%.3f, trails=%d)",
+                level, level_rate, len(level_trails),
+            )
+
+        if not levels_to_consolidate:
+            logger.info("Sleep: nothing to consolidate for %s", mesh_name)
+            return
+
+        # ═══ Load SAC trainer ═══
+        num_types = len(ExperienceExtractor.get_type_names())
+        adapt_sac_dir = str(
+            self.runs_dir / f"adaptive_sac_seed_{self.sac_seed}"
+        )
+        sac_model_dir = self._sac_model_dir(self.sac_seed)
+
+        sac_trainer = PSACTrainer(
+            state_dim=self.rl_config.get("state_dim", 20),
+            num_types=num_types,
+        )
+
+        # Prefer adaptive SAC (already fine-tuned), fallback to training SAC
+        if (Path(adapt_sac_dir) / "sac_actor.pt").exists():
+            sac_trainer.load(adapt_sac_dir)
+            logger.info("Sleep: SAC loaded from adaptive: %s", adapt_sac_dir)
+        elif (Path(sac_model_dir) / "sac_actor.pt").exists():
+            sac_trainer.load(sac_model_dir)
+            logger.info("Sleep: SAC loaded from training: %s", sac_model_dir)
+        else:
+            logger.warning("Sleep: no SAC model found, skipping")
+            return
+
+        # ═══ Create manager for consolidation ═══
+        adaptive_cfg = {**self.rl_config, "mode": "adaptive"}
+        adapt_q_dir = str(
+            self.runs_dir / f"adaptive_q_seed_{self.train_seeds[0]}"
+        )
+
+        manager = AdaptiveTrainingManager(
+            controller=None,
+            env=None,
+            config=adaptive_cfg,
+            runs_dir=str(self.runs_dir),
+            mesh_path=str(self.data_dir / f"{mesh_name}.stl"),
+            q_save_dir=adapt_q_dir,
+            sac_save_dir=adapt_sac_dir,
+        )
+
+        manager.sac_trainer = sac_trainer
+
+        # ═══ Consolidate each level ═══
+        sleep_results = []
+
+        for level in levels_to_consolidate:
+            success_trails = success_trails_by_level.get(level, [])
+            failure_trails = failure_trails_by_level.get(level, [])
+
+            result = manager.sleep_sac_consolidation(
+                object_name=mesh_name,
+                success_trails=success_trails,
+                failure_trails=failure_trails,
+                level=level,
+                sac_update_steps=sleep_cfg.get("sac_update_steps", 3000),
+                critic_warmup_steps=sleep_cfg.get("critic_warmup_steps", 200),
+                actor_update_every=sleep_cfg.get("actor_update_every", 5),
+                actor_lr_scale=sleep_cfg.get("actor_lr_scale", 0.3),
+                bc_lambda_init=sleep_cfg.get("bc_lambda_init", 3.0),
+                bc_lambda_decay=sleep_cfg.get("bc_lambda_decay", 0.999),
+                bc_lambda_min=sleep_cfg.get("bc_lambda_min", 0.3),
+                use_cql=sleep_cfg.get("use_cql", True),
+                cql_alpha=sleep_cfg.get("cql_alpha", 0.5),
+                current_mesh_ratio=sleep_cfg.get("current_mesh_ratio", 0.7),
+                bc_ratio=sleep_cfg.get("bc_ratio", 0.2),
+                elite_ratio=sleep_cfg.get("elite_ratio", 0.1),
+            )
+            sleep_results.append(result)
+
+        # ═══ Save sleep report ═══
+        import json
+        report = {
+            "mesh_name": mesh_name,
+            "levels_consolidated": levels_to_consolidate,
+            "results": sleep_results,
+            "config": sleep_cfg,
+        }
+        report_path = log_dir / "sleep_report.json"
+        with report_path.open("w") as f:
+            json.dump(report, f, indent=2)
+
+        logger.info(
+            "Sleep complete for %s: %d levels consolidated, report at %s",
+            mesh_name, len(levels_to_consolidate), report_path,
+        )
     # ══════════════════════════════════════════════════════
     # YCB Evaluation
     # ══════════════════════════════════════════════════════
