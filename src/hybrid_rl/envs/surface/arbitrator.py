@@ -184,8 +184,8 @@ class Arbitrator:
         self.agreement_count = 0
         self.both_proposed_count = 0
         # Q confidence calibrated thresholds
-        self._q_reliable_threshold_surface = 0.25
-        self._q_reliable_threshold_free = 0.25
+        self._q_reliable_threshold_surface = 0.2
+        self._q_reliable_threshold_free = 0.2
 
         # Running best_Q stats for best_q_norm
         self._running_best_q_free = RunningQStats(warmup=200)
@@ -926,6 +926,100 @@ class Arbitrator:
         return np.zeros(3, dtype=np.float32)
 
     def _get_q_action(self, state):
+        store = self.controller._select_store(state)
+        running_stats = (
+            self._running_q_stats_surface
+            if state[11] > 0.5
+            else self._running_q_stats_free
+        )
+        running_best = (
+            self._running_best_q_surface
+            if state[11] > 0.5
+            else self._running_best_q_free
+        )
+
+        if store.next_id == 0:
+            return 0, 0.0, 0.0, 0.5, 0.0
+
+        q_values, confidence_info = (
+            store.get_q_values_with_confidence(state)
+        )
+
+        recency = confidence_info.get("recency", 0.5)
+
+        # Update running stats (diagnostic only)
+        if np.max(np.abs(q_values)) > 1e-8:
+            running_stats.update(q_values)
+
+        # ═══ q_confidence = overall from Q-store (no recalculation) ═══
+        q_confidence = confidence_info["overall"]
+
+        # ═══ best_q_norm (diagnostic only) ═══
+        best_q = float(np.max(q_values))
+        if np.max(np.abs(q_values)) > 1e-8:
+            running_best.update(np.array([best_q]))
+        if running_best.is_warmed_up:
+            best_q_norm = running_best.normalize_value(best_q)
+        else:
+            best_q_norm = 0.0
+
+        # ═══ Q diagnostics collection ═══
+        self._q_diag_confidence_sum += q_confidence
+        self._q_diag_confidence_count += 1
+
+        on_object_diag = state[11] > 0.5
+        q_rel_thresh = (
+            self._q_reliable_threshold_surface if on_object_diag
+            else self._q_reliable_threshold_free
+        )
+        if q_confidence >= q_rel_thresh:
+            self._q_diag_reliable_count += 1
+        self._q_diag_total_count += 1
+
+        # Per-level diagnostics
+        lvl = self._current_level
+        d = self._q_diag_per_level[lvl]
+        d["confidence_sum"] += q_confidence
+        d["confidence_count"] += 1
+        if q_confidence >= q_rel_thresh:
+            d["reliable_count"] += 1
+        d["total_count"] += 1
+
+        # Confidence breakdown components
+        d["distance_comp_sum"] += confidence_info.get("proximity", 0.0)
+        d["consistency_comp_sum"] += confidence_info.get("consistency", 0.0)
+        d["recency_comp_sum"] += confidence_info.get("recency", 0.0)
+        d["count_comp_sum"] += confidence_info.get("experience", 0.0)
+        d["top2_spread_comp_sum"] += confidence_info.get("top2_spread", 0.0)
+        d["comp_count"] += 1
+
+        # ═══ Action selection ═══
+        q_values = self.controller.apply_action_mask(q_values, state)
+
+        valid = q_values > -1e8
+        if valid.sum() > 1:
+            q_spread = float(
+                np.max(q_values[valid]) - np.min(q_values[valid])
+            )
+        else:
+            q_spread = 0.0
+
+        eps = self.controller._get_current_epsilon()
+        temperature = max(np.clip(0.5 * eps, 0.01, 0.5), 0.05)
+        if self.temperature_override is not None:
+            temperature = self.temperature_override
+
+        v = q_values.copy()
+        v[~valid] = -1e9
+        v = v / temperature
+        v = v - np.max(v)
+        exp_v = np.exp(v)
+        probs = exp_v / exp_v.sum()
+        q_action = int(np.random.choice(len(probs), p=probs))
+
+        return q_action, q_confidence, q_spread, recency, best_q_norm
+
+    def _get_q_action_old(self, state):
         store = self.controller._select_store(state)
         running_stats = (
             self._running_q_stats_surface

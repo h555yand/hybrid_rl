@@ -299,6 +299,163 @@ class HNSWStateStore:
     ) -> tuple:
         """Get Q-values and confidence estimate via KNN interpolation.
 
+        Confidence = top2_spread gated by proximity.
+        
+        top2_spread: gap between best and second-best Q-value.
+            Direct indicator of "Q knows the right action".
+            t2s > 0.5 = Q reliably picks correct action.
+        proximity: fraction of max kernel weight achieved.
+            Gates t2s to prevent false confidence from distant neighbors.
+
+        Args:
+            state: Raw (unnormalized) state vector [state_dim].
+
+        Returns:
+            Tuple of (q_values, confidence_info).
+        """
+        empty_confidence = {
+            "proximity": 0.0,
+            "experience": 0.0,
+            "consistency": 0.0,
+            "top2_spread": 0.0,
+            "overall": 0.0,
+            "v_mean": 0.0,
+            "v_max": 0.0,
+            "v_spread": 0.0,
+        }
+
+        if self.next_id == 0:
+            return np.zeros(self.num_actions), empty_confidence
+
+        norm_state = self._normalize(state)
+        k = min(self.k_neighbors, self.next_id)
+
+        labels, distances = self._index.knn_query(
+            norm_state.reshape(1, -1), k=k
+        )
+        labels = labels[0]
+        distances = distances[0]
+
+        # ═══ Exact match ═══
+        if distances[0] < self.insert_threshold ** 2 and labels[0] in self.points:
+            point = self.points[labels[0]]
+            point.visit_count += 1
+            point.last_step = self.global_step
+
+            visit_conf = min(point.visit_count / 10.0, 1.0)
+
+            q = point.q_values
+            valid_q = q[q > -1e8]
+            if len(valid_q) >= 2:
+                sorted_q = np.sort(valid_q)[::-1]
+                t2s = float(sorted_q[0] - sorted_q[1])
+            else:
+                t2s = 0.0
+
+            # Overall: t2s with proximity gate (exact match = proximity 1.0)
+            t2s_norm = float(np.clip(t2s / 1.0, 0.0, 1.0))
+            overall = float(np.clip(t2s_norm, 0.0, 0.95))
+
+            return point.q_values.copy(), {
+                "proximity": 1.0,
+                "experience": visit_conf,
+                "consistency": 1.0,
+                "top2_spread": t2s,
+                "overall": overall,
+                "v_mean": float(np.mean(q)),
+                "v_max": float(np.max(q)),
+                "v_spread": float(np.max(q) - np.min(q)),
+            }
+
+        # ═══ Kernel weights ═══
+        sigma = self._get_sigma(distances)
+        weights = self._gaussian_kernel(distances, sigma)
+        weight_sum = weights.sum()
+
+        if weight_sum < self.min_weight_threshold:
+            return np.zeros(self.num_actions), empty_confidence
+
+        # ═══ Confidence components ═══
+
+        # 1. Proximity
+        proximity = float(min(weight_sum / k, 1.0))
+
+        # 2. Experience (diagnostic only, not used in overall)
+        visit_counts = np.array([
+            self.points[l].visit_count if l in self.points else 0
+            for l in labels
+        ], dtype=float)
+        weighted_visits = float(
+            np.sum(weights * visit_counts) / weight_sum
+        )
+        experience = float(min(weighted_visits / 10.0, 1.0))
+
+        # 3. Consistency (diagnostic only, not used in overall)
+        neighbor_best_actions = [
+            int(np.argmax(self.points[l].q_values))
+            for l in labels
+            if l in self.points
+        ]
+        if not neighbor_best_actions:
+            return np.zeros(self.num_actions), empty_confidence
+        from collections import Counter
+        action_counts = Counter(neighbor_best_actions)
+        most_common_count = action_counts.most_common(1)[0][1]
+        consistency = float(
+            most_common_count / len(neighbor_best_actions)
+        )
+
+        # 4. Recency (diagnostic only)
+        valid_steps = [
+            self.points[l].last_step for l in labels
+            if l in self.points
+        ]
+        max_last_step = float(max(valid_steps)) if valid_steps else 0.0
+        age = self.global_step - max_last_step
+        window = max(self.global_step * 0.15, 1000.0)
+        recency = float(max(1.0 - age / window, 0.0))
+
+        # ═══ Q-value interpolation ═══
+        weights /= weight_sum
+        q_values = np.zeros(self.num_actions)
+        for i, label in enumerate(labels):
+            if label in self.points:
+                q_values += weights[i] * self.points[label].q_values
+
+        # 5. Top-2 spread (on interpolated Q-values)
+        valid_q = q_values[q_values > -1e8]
+        if len(valid_q) >= 2:
+            sorted_q = np.sort(valid_q)[::-1]
+            t2s = float(sorted_q[0] - sorted_q[1])
+        else:
+            t2s = 0.0
+
+        # ═══ Overall: t2s gated by proximity ═══
+        # t2s = direct indicator of "Q knows the right action"
+        # proximity gate = protection against false spread from distant neighbors
+        t2s_norm = float(np.clip(t2s / 1.0, 0.0, 1.0))
+        prox_gate = float(np.clip(proximity / 0.3, 0.0, 1.0))
+        overall = float(np.clip(t2s_norm * prox_gate, 0.0, 0.95))
+
+        confidence_info = {
+            "proximity": proximity,
+            "experience": experience,
+            "consistency": consistency,
+            "recency": recency,
+            "top2_spread": t2s,
+            "overall": overall,
+            "v_mean": float(np.mean(q_values)),
+            "v_max": float(np.max(q_values)),
+            "v_spread": float(np.max(q_values) - np.min(q_values)),
+        }
+
+        return q_values, confidence_info
+
+    def get_q_values_with_confidence_old(
+        self, state: np.ndarray
+    ) -> tuple:
+        """Get Q-values and confidence estimate via KNN interpolation.
+
         Confidence components:
             proximity: fraction of max possible kernel weight achieved.
             experience: weighted average visit count of neighbors.

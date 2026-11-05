@@ -2755,28 +2755,40 @@ class RLGoalApproachExperiment:
                 )
 
                 # Track source
-                if source.startswith("blend"):
-                    source_key = "blend"
-                elif source.startswith("q_confirms_sac"):
-                    source_key = "blend"
-                elif source.startswith("q_sac_conflict"):
-                    source_key = "heuristic"
-                elif source.startswith("q_confident"):
-                    source_key = "blend"
-                elif source.startswith("forced_heuristic"):  # ← ДОБАВИТЬ
-                    source_key = "heuristic"
-                elif source.startswith("heuristic"):
-                    source_key = "heuristic"
-                elif source.startswith("sac"):
-                    source_key = "sac"
-                elif source.startswith("q_"):
-                    source_key = "q_store"
-                elif source.startswith("calibration_sac"):
-                    source_key = "sac"
-                elif source.startswith("calibration_heuristic"):
-                    source_key = "heuristic"
-                else:
-                    source_key = "heuristic"
+                # Track source — explicit mapping by reason name
+                SOURCE_MAP = {
+                    "forced_heuristic": "heuristic",
+                    "calibration_sac": "sac",
+                    "calibration_heuristic": "heuristic",
+                    "q_NOT_reliable_sac_proven": "sac",
+                    "q_NOT_reliable_heuristic_default": "heuristic",
+                    "blend_crawl": "blend",
+                    "q_crawl_sac_other": "q_store",
+                    "q_crawl_disagree": "q_store",
+                    "sac_non_crawl": "sac",
+                    "q_non_crawl": "q_store",
+                    "blend_agree": "blend",
+                    "sac_moderate_agree": "sac",
+                    "sac_proven": "sac",
+                    "sac_proven_disagree": "sac",
+                    "q_reliable_disagree": "q_store",
+                    "q_agree": "q_store",
+                    "q_moderate": "q_store",
+                    "heuristic_default": "heuristic",
+                    "heuristic_disagree": "heuristic",
+                    "heuristic_fallback": "heuristic",
+                    "q_explore": "q_store",
+                }
+                
+                # Extract reason name (before first parenthesis)
+                reason_name = source.split("(")[0] if "(" in source else source
+                source_key = SOURCE_MAP.get(reason_name, "unknown")
+                
+                if reason_name not in SOURCE_MAP:
+                    logger.warning(
+                        "Unknown source reason: %s, defaulting to unknown",
+                        reason_name,
+                    )
 
                 source_counts[source_key] = (
                     source_counts.get(source_key, 0) + 1
