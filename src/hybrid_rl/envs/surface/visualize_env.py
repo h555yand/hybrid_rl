@@ -237,7 +237,9 @@ def create_video_from_frames(
     output_path: Path | None = None,
     fps: int = 5,
 ) -> Path | None:
-    """Create MP4 video from saved PNG frames."""
+    """Create MP4 video from saved PNG frames.
+     pip install imageio[ffmpeg] or pip install imageio[pyav]')
+    """
     import glob
 
     frame_paths = sorted(glob.glob(str(episode_dir / "step_*.png")))
@@ -253,7 +255,7 @@ def create_video_from_frames(
         imageio.mimwrite(str(output_path), frames, fps=fps, codec='libx264')
         logger.info("Video saved: %s (%d frames)", output_path, len(frames))
         return output_path
-    except Exception:
+    except Exception as exc:
         try:
             import cv2
             first = cv2.imread(frame_paths[0])
