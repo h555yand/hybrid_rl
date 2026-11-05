@@ -428,7 +428,7 @@ class Arbitrator:
             return 0, q_params, (
                 f"q_crawl_sac_other("
                 f"sac_type={sac_type},"
-                f"conf={q_confidence:.2f})"
+                f"q_conf={q_confidence:.2f})"
             )
 
         # Both propose MoveTangentially — compare directions
@@ -455,7 +455,7 @@ class Arbitrator:
                 f"q_angle={q_angle:.0f},"
                 f"sac_angle={sac_angle:.0f},"
                 f"diff={angle_diff:.0f},"
-                f"conf={q_confidence:.2f})"
+                f"q_conf={q_confidence:.2f})"
             )
 
         # Direction disagree > 45° → Q knows better
@@ -467,7 +467,7 @@ class Arbitrator:
             f"q_angle={q_angle:.0f},"
             f"sac_angle={sac_angle:.0f},"
             f"diff={angle_diff:.0f},"
-            f"conf={q_confidence:.2f})"
+            f"q_conf={q_confidence:.2f})"
         )
     
     def _compute_agreement(
@@ -648,6 +648,7 @@ class Arbitrator:
                 self._current_episode_sources.append("sac")
                 return sac_type, sac_params, (
                     f"calibration_sac(level={level},"
+                    f"q_conf={q_confidence:.2f},"
                     f"sac_evals={len(self._level_sac_results[level])})"
                 )
 
@@ -693,7 +694,7 @@ class Arbitrator:
                 f"sac_non_crawl("
                 f"q_type={q_name},"
                 f"sac_type={sac_n},"
-                f"conf={q_confidence:.2f})"
+                f"q_conf={q_confidence:.2f})"
             )
 
         # No SAC → Q
@@ -701,7 +702,7 @@ class Arbitrator:
         self.q_chosen_actions[q_name] += 1
         self._current_episode_sources.append("q_store")
         return q_type, q_params, (
-            f"q_non_crawl(conf={q_confidence:.2f})"
+            f"q_non_crawl(q_conf={q_confidence:.2f})"
         )
     
     def _decide_heuristic(self, state, current_pose, sensor_data, reason):

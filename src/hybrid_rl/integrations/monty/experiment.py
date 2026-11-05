@@ -1503,7 +1503,7 @@ class RLGoalApproachExperiment:
         )
         trainer = BCTrainer(
             state_dim=self.rl_config.get(
-                "state_dim", 20
+                "state_dim", 23
             ),
             num_types=num_types,
         )

@@ -698,10 +698,8 @@ class RLGoalApproachController:
             self._compute_movement_efficiency(window=20)
         )
         # Projected goal direction on tangent plane
-        # Expressed in tangent basis (tb1, tb2) so that
-        # p2d directly maps to action directions:
-        #   p2d=[1,0] → action 0° is best
-        #   p2d=[0,1] → action 90° is best
+        # path_blocked=0: project goal direction (crawl to goal)
+        # path_blocked=1: project edge direction (crawl to edge/bypass)
         if (
             on_object > 0.5
             and np.linalg.norm(local_normal) > 1e-8
@@ -716,40 +714,71 @@ class RLGoalApproachController:
             n_len = np.linalg.norm(normal_world)
             if n_len > 1e-8:
                 n_hat = normal_world / n_len
-                # Goal direction in world frame
-                goal_dir_world = rot_mat.apply(
-                    local_pos_error
-                )
-                # Project onto tangent plane
-                projected = (
-                    goal_dir_world
-                    - np.dot(goal_dir_world, n_hat)
-                    * n_hat
-                )
-                proj_len = np.linalg.norm(projected)
-                
-                # Build tangent basis (same as heuristic uses)
+
+                # Build tangent basis
                 tb1, tb2 = self._build_tangent_basis(
                     rot_mat, n_hat
                 )
-                
-                if (
-                    proj_len > 1e-8
-                    and tb1 is not None
-                ):
-                    projected_unit = projected / proj_len
-                    # Express in tangent basis
-                    projected_2d = np.array([
-                        float(np.dot(projected_unit, tb1)),
-                        float(np.dot(projected_unit, tb2)),
-                    ])
+
+                if tb1 is not None:
+                    path_blocked_now = sensor_data.get(
+                        "path_blocked", False
+                    )
+
+                    if path_blocked_now:
+                        # Path blocked → edge direction
+                        edge_dir = self._compute_crawl_to_edge_direction(
+                            current_pose, sensor_data
+                        )
+                        if edge_dir is not None:
+                            projected_2d = np.array([
+                                float(np.dot(edge_dir, tb1)),
+                                float(np.dot(edge_dir, tb2)),
+                            ])
+                        else:
+                            # Fallback: goal projection
+                            goal_dir_world = rot_mat.apply(
+                                local_pos_error
+                            )
+                            projected = (
+                                goal_dir_world
+                                - np.dot(goal_dir_world, n_hat)
+                                * n_hat
+                            )
+                            proj_len = np.linalg.norm(projected)
+                            if proj_len > 1e-8:
+                                projected_unit = projected / proj_len
+                                projected_2d = np.array([
+                                    float(np.dot(projected_unit, tb1)),
+                                    float(np.dot(projected_unit, tb2)),
+                                ])
+                            else:
+                                projected_2d = np.zeros(2)
+                    else:
+                        # Path clear → goal projection (original logic)
+                        goal_dir_world = rot_mat.apply(
+                            local_pos_error
+                        )
+                        projected = (
+                            goal_dir_world
+                            - np.dot(goal_dir_world, n_hat)
+                            * n_hat
+                        )
+                        proj_len = np.linalg.norm(projected)
+                        if proj_len > 1e-8:
+                            projected_unit = projected / proj_len
+                            projected_2d = np.array([
+                                float(np.dot(projected_unit, tb1)),
+                                float(np.dot(projected_unit, tb2)),
+                            ])
+                        else:
+                            projected_2d = np.zeros(2)
                 else:
                     projected_2d = np.zeros(2)
             else:
                 projected_2d = np.zeros(2)
         else:
-            # In air or no normal: use
-            # local_pos_error direction (unchanged)
+            # In air or no normal
             if distance > 1e-8:
                 projected_2d = (
                     local_pos_error[:2]
@@ -762,6 +791,25 @@ class RLGoalApproachController:
             local_pos_direction = local_pos_error / distance
         else:
             local_pos_direction = np.zeros(3)
+        
+        # ═══ Normal agreement (world frame) ═══
+        # dot(agent_normal, goal_normal) — detects same/different side
+        raw_normal = sensor_data.get("point_normal")
+        raw_goal_normal = sensor_data.get("goal_normal")
+        if raw_normal is not None and raw_goal_normal is not None:
+            an = np.array(raw_normal, dtype=float)
+            gn = np.array(raw_goal_normal, dtype=float)
+            an_len = np.linalg.norm(an)
+            gn_len = np.linalg.norm(gn)
+            if an_len > 1e-8 and gn_len > 1e-8:
+                normal_agreement = float(np.dot(an / an_len, gn / gn_len))
+            else:
+                normal_agreement = 0.0
+        else:
+            normal_agreement = 0.0
+        
+        if on_object < 0.5:
+            normal_agreement = 0.0
 
         state = np.concatenate(
             [
@@ -777,7 +825,8 @@ class RLGoalApproachController:
                 goal_normal_local,    # [15:18] 3D
                 [path_blocked_val],   # [18]    1D
                 [movement_efficiency],# [19]    1D
-                projected_2d,         # [20:22] 2D NEW
+                projected_2d,         # [20:22]
+                [normal_agreement],       # [22]    1D  NEW
             ]
         )
 

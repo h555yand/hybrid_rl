@@ -128,7 +128,7 @@ from tbp.hybrid_rl.rl_policy_selector import RLPolicySelector
 from tbp.monty.frameworks.models.motor_system import MotorSystem
 
 rl_config = {
-    "state_dim": 22,
+    "state_dim": 23,
     "num_actions": 24,
     "surface_step": 3.0,
     "free_step": 8.0,

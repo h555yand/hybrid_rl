@@ -39,7 +39,7 @@ experiment:
             sensor_id: view_finder
             model_path: /home/aeisaev/Downloads/github/hybrid_RL_prototype/results/adapt-baseline/data/runs/q_store_seed_11
             rl_config:
-              state_dim: 22
+              state_dim: 23
               num_actions: 24
               surface_step: 3.0
               free_step: 8.0

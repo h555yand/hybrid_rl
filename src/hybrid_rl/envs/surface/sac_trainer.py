@@ -62,7 +62,7 @@ class PSACTrainer:
 
     def __init__(
         self,
-        state_dim: int = 15,
+        state_dim: int = 23,
         num_types: int = 8,
         max_params: int = 3,
         gamma: float = 0.99,

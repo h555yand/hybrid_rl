@@ -80,7 +80,7 @@ EXPERIMENT_OVERRIDES = [
 
 # ═══ RL config (shared between rl_no_de and rl_de5) ═══
 RL_CONFIG_BASE = {
-    "state_dim": 22,
+    "state_dim": 23,
     "num_actions": 24,
     "surface_step": 3.0,
     "free_step": 8.0,
