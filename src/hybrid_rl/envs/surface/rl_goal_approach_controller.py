@@ -205,6 +205,17 @@ class RLGoalApproachController:
             name="surface",
         )
 
+        bypass_weights = self.config.get(
+            "feature_weights_bypass", None
+        )
+        self.q_store_surface_bypass = HNSWStateStore(
+            config={
+                **self.config,
+                "feature_weights": bypass_weights,
+            },
+            name="surface_bypass",
+        )
+
         # Strategic Q-stores (2 actions: stay=0, switch=1)
         strategic_detach_config = {
             **self.config,
@@ -364,6 +375,7 @@ class RLGoalApproachController:
         self._episode_phase_counts: Dict[str, int] = {}
         self._episode_steps_history: List[int] = []
         self._success_steps_history: List[int] = []
+        self._prev_pose_height = None
 
         logger.info(
             f"RLGoalApproachController initialized: "
@@ -372,13 +384,296 @@ class RLGoalApproachController:
             f"epsilon={self.epsilon}"
         )
 
-    def _select_store(self, state: np.ndarray) -> HNSWStateStore:
-        return self.q_store_surface if state[11] > 0.5 else self.q_store_free
+    def _select_store(
+        self,
+        state: np.ndarray,
+        sensor_data: Optional[Dict[str, Any]] = None,
+    ) -> HNSWStateStore:
+        on_object = state[11] > 0.5
+        if not on_object:
+            return self.q_store_free
+
+        # check for surface store
+        # Prefer explicit same_side from env (more reliable for hollow objects)
+        path_blocked = bool(
+            sensor_data.get("path_blocked", False)
+            if sensor_data is not None
+            else (state[18] > 0.5)
+        )
+        same_side = bool(
+            sensor_data.get("same_side", True)
+            if sensor_data is not None
+            else True
+        )
+
+        if path_blocked and (not same_side):
+            if self.q_store_surface_bypass.next_id > 0:
+                return self.q_store_surface_bypass
+
+        # Fallback (when same_side not available / legacy logs):
+        # keep old heuristic based on normal_agreement
+        if sensor_data is None:
+            normal_agreement = float(state[22]) if len(state) > 22 else 0.0
+            if path_blocked and normal_agreement < 0:
+                if self.q_store_surface_bypass.next_id > 0:
+                    return self.q_store_surface_bypass
+
+        return self.q_store_surface
 
     # ══════════════════════════════════════════════════════════
     # PUBLIC API
     # ══════════════════════════════════════════════════════════
     def get_state_debug_info(
+        self,
+        state: np.ndarray,
+        current_pose: np.ndarray,
+        sensor_data: Dict[str, Any],
+        *,
+        # Optional Q diagnostics (pass from _choose_action when explain=True)
+        store: Optional["HNSWStateStore"] = None,
+        q_values: Optional[np.ndarray] = None,
+        q_confidence: Optional[Dict[str, float]] = None,
+        nn_debug: Optional[str] = None,
+        probs: Optional[np.ndarray] = None,
+        chosen_action: Optional[int] = None,
+        strategic_source: Optional[str] = None,
+    ) -> str:
+        """Heavy debug string builder.
+
+        Works in two modes:
+        - Base (adaptive/external chooser): call with only (state, pose, sensor_data).
+        - Full (_choose_action explain): pass store/q_values/q_confidence/nn_debug/probs.
+
+        Returns:
+        One debug string with as much info as available.
+        """
+        # ─────────────────────────────────────────────
+        # Phase/subgoal (always)
+        # ─────────────────────────────────────────────
+        phase, subgoal_dir, phase_desc = self._determine_phase(
+            state, sensor_data, current_pose
+        )
+        self._current_phase = phase
+        self._current_subgoal_dir = subgoal_dir
+        self._current_phase_desc = phase_desc
+
+        same_side = bool(sensor_data.get("same_side", True))
+        path_blocked = bool(sensor_data.get("path_blocked", False))
+        depth = float(sensor_data.get("depth", 100.0))
+        alignment = float(state[12]) if len(state) > 12 else 0.0
+        eff = float(self._compute_movement_efficiency(window=20))
+
+        # ─────────────────────────────────────────────
+        # Store name (prefer actual store if passed)
+        # ─────────────────────────────────────────────
+        if store is None:
+            try:
+                store = self._select_store(state, sensor_data)
+            except Exception:
+                store = None
+        store_name = getattr(store, "name", None)
+        if store_name is None:
+            # fallback to readable labels
+            on_object = bool(state[11] > 0.5) if len(state) > 11 else False
+            store_name = (
+                "bypass"
+                if (on_object and path_blocked and (not same_side))
+                else ("direct" if on_object else "free")
+            )
+
+        # ─────────────────────────────────────────────
+        # Common strings: normals/pos/subgoal/fly/snap
+        # ─────────────────────────────────────────────
+        normal_str = ""
+        pn = sensor_data.get("point_normal")
+        if pn is not None:
+            normal_str = f"|n=[{pn[0]:.2f},{pn[1]:.2f},{pn[2]:.2f}]"
+
+        pos_str = (
+            f"|pos=[{current_pose[0]:.1f},"
+            f"{current_pose[1]:.1f},"
+            f"{current_pose[2]:.1f}]"
+        )
+
+        subgoal_str = ""
+        if subgoal_dir is not None:
+            subgoal_str = (
+                f"|sd=[{subgoal_dir[0]:.2f},"
+                f"{subgoal_dir[1]:.2f},"
+                f"{subgoal_dir[2]:.2f}]"
+            )
+
+        fly_debug_str = ""
+        if phase == "FLY_TO_EDGE":
+            if getattr(self, "_fly_edge_debug", None):
+                fly_debug_str = f"|fly={self._fly_edge_debug}"
+            if getattr(self, "_cross_side_debug", None):
+                fly_debug_str += f"|cs={self._cross_side_debug}"
+
+        snap_dbg = sensor_data.get("snap_debug", "")
+        snap_str = f"|snap={snap_dbg}" if snap_dbg else ""
+
+        # ─────────────────────────────────────────────
+        # Crawl diagnostics (reused from old _choose_action)
+        # ─────────────────────────────────────────────
+        pos_len = len(getattr(self, "_position_history", []))
+
+        crawl_debug = ""
+        if phase in ("CRAWL_TO_EDGE", "CRAWL_TO_GOAL"):
+            goal = getattr(self, "_current_goal", None)
+            if goal is not None:
+                goal_dir_dbg = goal[:3] - current_pose[:3]
+                pn2 = sensor_data.get("point_normal")
+                if pn2 is not None:
+                    n_dbg = np.asarray(pn2, dtype=float)
+                    n_len_dbg = float(np.linalg.norm(n_dbg))
+                    if n_len_dbg > 1e-8:
+                        n_dbg /= n_len_dbg
+                        dist_dbg = float(np.linalg.norm(goal_dir_dbg))
+                        crawl_proj = goal_dir_dbg - np.dot(goal_dir_dbg, n_dbg) * n_dbg
+                        cl = float(np.linalg.norm(crawl_proj))
+                        ratio = cl / max(dist_dbg, 1e-8)
+                        al_dbg = float(np.dot(goal_dir_dbg / max(dist_dbg, 1e-8), n_dbg))
+                        k1_dbg = float(sensor_data.get("k1", 0.0))
+                        k2_dbg = float(sensor_data.get("k2", 0.0))
+                        is_flat_dbg = abs(k1_dbg) < 0.01 and abs(k2_dbg) < 0.01
+                        degen = (
+                            cl < 1.0
+                            or (dist_dbg > 10.0 and ratio < 0.15)
+                            or (is_flat_dbg and al_dbg < -0.85)
+                        )
+                        crawl_debug = (
+                            f"|cl={cl:.1f}"
+                            f"|ratio={ratio:.3f}"
+                            f"|flat={int(is_flat_dbg)}"
+                            f"|degen={int(degen)}"
+                            f"|k1={k1_dbg:.4f}"
+                        )
+
+        crawl_edge_dbg = getattr(self, "_crawl_edge_debug", "")
+        ce_str = f"|ce={crawl_edge_dbg}" if crawl_edge_dbg else ""
+
+        # ─────────────────────────────────────────────
+        # State quick fields
+        # ─────────────────────────────────────────────
+        # p2d still printed even if zeros
+        p2d_str = ""
+        if len(state) > 21:
+            p2d_str = (
+                f"|p2d=[{float(state[20]):.2f},{float(state[21]):.2f}]"
+                f"|lpe=[{float(state[0]):.1f},{float(state[1]):.1f},{float(state[2]):.1f}]"
+            )
+
+        na_val = float(state[22]) if len(state) > 22 else 0.0
+        nh_val = float(state[23]) if len(state) > 23 else 0.0
+
+        # up_local and same_side flag (if you added them)
+        up_local_str = ""
+        if len(state) > 26:
+            up_local_str = (
+                f"|ul=[{float(state[24]):.2f},{float(state[25]):.2f},{float(state[26]):.2f}]"
+            )
+        ss_state_str = ""
+        if len(state) > 27:
+            ss_state_str = f"|ssS={int(float(state[27]) > 0.5)}"
+
+        # ─────────────────────────────────────────────
+        # Q diagnostics (optional)
+        # ─────────────────────────────────────────────
+        conf_str = ""
+        t2s_str = ""
+        norm_str = ""
+        nn_str = ""
+
+        if q_values is not None and q_confidence is not None:
+            # surface-only top3
+            surface_q = q_values[:8] if len(q_values) >= 8 else q_values
+            if len(surface_q) > 0:
+                top3_idx = np.argsort(surface_q)[-3:][::-1]
+                top3_str = "|".join(f"a{i}={surface_q[i]:.2f}" for i in top3_idx)
+            else:
+                top3_str = ""
+
+            # top2 spread for surface actions
+            valid_sq = surface_q[surface_q > -1e8]
+            if len(valid_sq) >= 2:
+                sorted_sq = np.sort(valid_sq)[::-1]
+                top2_spread = float(sorted_sq[0] - sorted_sq[1])
+            else:
+                top2_spread = 0.0
+            t2s_str = f"|t2s={top2_spread:.2f}"
+
+            conf_str = (
+                f"|prox={q_confidence.get('proximity', 0.0):.2f}"
+                f"|exp={q_confidence.get('experience', 0.0):.2f}"
+                f"|cons={q_confidence.get('consistency', 0.0):.1f}"
+                f"|ovr={q_confidence.get('overall', 0.0):.2f}"
+                f"|vm={q_confidence.get('v_mean', 0.0):.1f}"
+                f"|vs={q_confidence.get('v_spread', 0.0):.1f}"
+                f"|qtop=[{top3_str}]"
+            )
+
+            if store is not None and hasattr(store, "_normalize"):
+                try:
+                    norm_state = store._normalize(state)
+                    norm_str = (
+                        f"|np2d=[{float(norm_state[20]):.1f},{float(norm_state[21]):.1f}]"
+                        f"|nlpe=[{float(norm_state[0]):.1f},{float(norm_state[1]):.1f},{float(norm_state[2]):.1f}]"
+                    )
+                except Exception:
+                    norm_str = ""
+
+            if nn_debug:
+                nn_str = f"|nn={nn_debug}"
+
+        # Chosen probability (optional)
+        p_chosen_str = ""
+        if probs is not None and chosen_action is not None:
+            try:
+                p_chosen_str = f"|p={float(probs[int(chosen_action)]):.2f}"
+            except Exception:
+                p_chosen_str = ""
+
+        # Phase efficiency debug (kept from old)
+        phase_eff = float(self._compute_movement_efficiency(window=20))
+        phase_thr = float(self.config.get("stuck_threshold", 0.15))
+
+        # ─────────────────────────────────────────────
+        # Final assembly (single heavy string)
+        # ─────────────────────────────────────────────
+        base = (
+            f"[phase={phase}"
+            f"{conf_str}"
+            f"{t2s_str}"
+            f"{p2d_str}"
+            f"{norm_str}"
+            f"ss={int(same_side)}{ss_state_str}|"
+            f"pb={int(path_blocked)}|"
+            f"d={depth:.1f}"
+            f"|al={alignment:.2f}"
+            f"|eff={eff:.2f}"
+            f"|plen={pos_len}"
+            f"{crawl_debug}"
+            f"{ce_str}"
+            f"{up_local_str}"
+            f"{subgoal_str}"
+            f"{normal_str}"
+            f"{pos_str}"
+            f"{snap_str}"
+            f"{nn_str}"
+            f"|na={na_val:.2f}|nh={nh_val:.2f}|store={store_name}"
+            f"{fly_debug_str}"
+            f"{p_chosen_str}"
+            f"]"
+            f"|peff={phase_eff:.2f}|pthr={phase_thr}"
+        )
+
+        if strategic_source:
+            base += f"[strat={strategic_source}]"
+
+        return base
+
+    def get_state_debug_info_old(
         self,
         state: np.ndarray,
         current_pose: np.ndarray,
@@ -438,6 +733,12 @@ class RLGoalApproachController:
         snap_dbg = sensor_data.get("snap_debug", "")
         snap_str = f"|{snap_dbg}" if snap_dbg else ""
 
+        na_val = float(state[22]) if len(state) > 22 else 0.0
+        nh_val = float(state[23]) if len(state) > 23 else 0.0
+        on_object = state[11] > 0.5
+        store_name1 = "bypass" if (path_blocked and na_val < 0 and on_object) else ("direct" if on_object else "free")
+        store_name2 = "bypass" if (path_blocked and (not same_side) and on_object) else  ("direct" if on_object else "free")
+
         return (
             f"[phase={phase}"
             f"|pb={int(path_blocked)}"
@@ -449,6 +750,7 @@ class RLGoalApproachController:
             f"{subgoal_str}"
             f"{fly_debug_str}"
             f"{snap_str}]"
+            f"|na={na_val:.2f}|nh={nh_val:.2f}|store={store_name1}/{store_name2}"
         )
     
     @property
@@ -512,7 +814,8 @@ class RLGoalApproachController:
         self._strategic_sac_pending = []
         self._prev_subgoal_alignment = None
         self._prev_goal_alignment = None
-
+        self._prev_pose_height = None
+        
     def step(
         self,
         current_pose: np.ndarray,
@@ -552,8 +855,8 @@ class RLGoalApproachController:
         done = False
 
         if self._prev_state is not None:
-            prev_store = self._select_store(self._prev_state)
-        next_store = self._select_store(state)
+            prev_store = self._select_store(self._prev_state, self._prev_sensor_data)
+        next_store = self._select_store(state, sensor_data)
 
         if self._prev_state is not None:
             reward, done, termination_reason = self._compute_reward(
@@ -697,9 +1000,13 @@ class RLGoalApproachController:
         movement_efficiency = (
             self._compute_movement_efficiency(window=20)
         )
+
         # Projected goal direction on tangent plane
         # path_blocked=0: project goal direction (crawl to goal)
         # path_blocked=1: project edge direction (crawl to edge/bypass)
+        # dont use, needs to remove
+        projected_2d = np.zeros(2)
+        """
         if (
             on_object > 0.5
             and np.linalg.norm(local_normal) > 1e-8
@@ -786,6 +1093,7 @@ class RLGoalApproachController:
                 )
             else:
                 projected_2d = np.zeros(2)
+        """
 
         if distance > 1e-8:
             local_pos_direction = local_pos_error / distance
@@ -811,6 +1119,42 @@ class RLGoalApproachController:
         if on_object < 0.5:
             normal_agreement = 0.0
 
+        # ═══ Normalized height on object ═══
+        center_raw = sensor_data.get("object_center")
+        extents_raw = sensor_data.get("object_extents")
+        up_dir_raw = sensor_data.get("up_direction", [0, 0, 1])
+
+        if center_raw is not None and extents_raw is not None:
+            _center = np.array(center_raw, dtype=float)
+            _extents = np.array(extents_raw, dtype=float)
+            _up_dir = np.array(up_dir_raw, dtype=float)
+            _height_axis = int(np.argmax(np.abs(_up_dir)))
+
+            _agent_h = current_pose[_height_axis]
+            _obj_min = _center[_height_axis] - _extents[_height_axis] / 2.0
+            _obj_max = _center[_height_axis] + _extents[_height_axis] / 2.0
+            _h_range = _obj_max - _obj_min
+
+            if _h_range > 1e-8:
+                norm_height = float(np.clip(
+                    (_agent_h - _obj_min) / _h_range, -0.5, 1.5
+                ))
+            else:
+                norm_height = 0.5
+        else:
+            norm_height = 0.5
+
+        # ── Up direction in agent local frame (NEW) ──
+        up_world = np.array(sensor_data.get("up_direction", [0, 0, 1]), dtype=float)
+        up_len = np.linalg.norm(up_world)
+        if up_len > 1e-8:
+            up_world /= up_len
+        else:
+            up_world = np.array([0.0, 0.0, 1.0], dtype=float)
+        up_local = self._world_to_local(up_world, current_pose)
+
+        same_side_flag = float(sensor_data.get("same_side", True))
+
         state = np.concatenate(
             [
                 local_pos_direction,      # [0:3]   3D
@@ -827,6 +1171,9 @@ class RLGoalApproachController:
                 [movement_efficiency],# [19]    1D
                 projected_2d,         # [20:22]
                 [normal_agreement],       # [22]    1D  NEW
+                [norm_height],            # [23]    1D  NEW
+                up_local,                 # [24:27]  NEW
+                [same_side_flag],         # [27]   NEW
             ]
         )
 
@@ -1587,7 +1934,60 @@ class RLGoalApproachController:
         if phase in (
             "CRAWL_TO_EDGE", "DETACH_NEEDED"
         ):
-            progress = progress_raw * 0.1
+            # Bypass (diff_side): height progress instead of distance
+            # before: progress_raw = prev_distance - distance
+            progress_raw = prev_distance - distance
+            progress = progress_raw
+
+            same_side = True
+            if sensor_data is not None:
+                same_side = bool(sensor_data.get("same_side", True))
+
+            # ...
+            if phase in ("CRAWL_TO_EDGE", "DETACH_NEEDED"):
+                # Different-side rim navigation: reward ONLY rim progress
+                if (on_object > 0.5) and (not same_side):
+                    progress = 0.0  # disable distance shaping entirely
+
+                    # Rim-based shaping using open_edge_height + up_direction sign
+                    if sensor_data is not None and current_pose is not None:
+                        up_dir = np.asarray(sensor_data.get("up_direction", [0, 0, 1]), dtype=float)
+                        height_axis = int(np.argmax(np.abs(up_dir)))
+                        up_sign = float(np.sign(up_dir[height_axis])) if abs(up_dir[height_axis]) > 1e-8 else 1.0
+
+                        rim_h = sensor_data.get("open_edge_height", None)
+                        if rim_h is not None:
+                            # distance-to-rim along up axis (positive if below rim)
+                            prev_h = getattr(self, "_prev_pose_height", None)
+                            if prev_h is None:
+                                h_prev = float(current_pose[height_axis])
+                            else:
+                                h_prev = float(prev_h)
+                            
+                            h_curr = float(current_pose[height_axis])
+
+                            drim_prev = (float(rim_h) - h_prev) * up_sign
+                            drim_curr = (float(rim_h) - h_curr) * up_sign
+                            rim_progress = drim_prev - drim_curr  # >0 when moving toward rim
+
+                            # scale: pick something that beats step_penalty (-0.2) for typical movement
+                            # start with 1.0..3.0, tune later
+                            RIM_SCALE = float(cfg.get("reward_rim_progress_scale", 2.0))
+                            reward += (rim_progress / max(surface_step, 1e-6)) * RIM_SCALE
+
+                            # optional: small penalty for moving away from rim
+                            if rim_progress < 0:
+                                reward += -0.2
+
+                    # fallback if rim_h missing: keep your old norm_height shaping
+                    else:
+                        if len(state) > 23 and len(prev_state) > 23:
+                            height_progress = float(state[23] - prev_state[23])
+                            reward += height_progress * 30.0
+
+                else:
+                    # Same-side bypass: keep existing behavior (weak distance shaping)
+                    progress = progress_raw * 0.1
 
         detour_mode = (
             prev_alignment
@@ -1624,15 +2024,17 @@ class RLGoalApproachController:
                 reward += -0.3
 
         # ═══ 1.5 Subgoal shaping ═══
-        phi_current = self._subgoal_potential(state)
-        phi_prev = self._subgoal_potential(prev_state)
-        subgoal_shaping = (
-            self.gamma * phi_current - phi_prev
-        )
-        subgoal_shaping = float(
-            np.clip(subgoal_shaping, -3.0, 3.0)
-        )
-        reward += subgoal_shaping
+        use_alignment_potential = True
+        if sensor_data is not None:
+            if (state[11] > 0.5) and (not sensor_data.get("same_side", True)) and (phase in ("CRAWL_TO_EDGE","DETACH_NEEDED")):
+                use_alignment_potential = False  # rim shaping handles it better
+
+        if use_alignment_potential:
+            phi_current = self._subgoal_potential(state)
+            phi_prev = self._subgoal_potential(prev_state)
+            subgoal_shaping = self.gamma * phi_current - phi_prev
+            subgoal_shaping = float(np.clip(subgoal_shaping, -3.0, 3.0))
+            reward += subgoal_shaping
 
         # ═══ 2. Goal reached ═══
         if distance < cfg["goal_threshold"]:
@@ -1695,13 +2097,9 @@ class RLGoalApproachController:
 
         # ═══ 5. Near goal on surface ═══
         near_radius = surface_step * 3
-        if (
-            distance < near_radius
-            and on_object > 0.5
-        ):
-            reward += cfg[
-                "reward_near_goal_on_surface"
-            ]
+        if distance < near_radius and on_object > 0.5:
+            if sensor_data is None or sensor_data.get("same_side", True):
+                reward += cfg["reward_near_goal_on_surface"]
 
         # ═══ 6.2 Successful landing ═══
         curr_path_blocked = (
@@ -1840,6 +2238,11 @@ class RLGoalApproachController:
             done = True
             if termination_reason is None:
                 termination_reason = "timeout"
+
+        if current_pose is not None and sensor_data is not None:
+            up_dir = np.asarray(sensor_data.get("up_direction", [0, 0, 1]), dtype=float)
+            height_axis = int(np.argmax(np.abs(up_dir)))
+            self._prev_pose_height = float(current_pose[height_axis])
 
         return reward, done, termination_reason
     
@@ -2071,7 +2474,11 @@ class RLGoalApproachController:
         for depth, tr in enumerate(reversed(tail)):
             g_return = tr["reward"] + self.gamma * g_return
             lr = base_alpha * (self.success_backup_lambda ** depth)
-            store = self._select_store(tr["state"])
+            fake_sd = {
+                "path_blocked": bool(tr.get("path_blocked", False)),
+                "same_side": bool(tr.get("same_side", True)),
+            }
+            store = self._select_store(tr["state"], fake_sd)
             store.update_q_value(
                 tr["state"],
                 tr["action"],
@@ -2192,7 +2599,7 @@ class RLGoalApproachController:
         sensor_data: Dict[str, Any],
         explain: bool = False,
     ):
-        store = self._select_store(state)
+        store = self._select_store(state, sensor_data)
         # q_values = store.get_q_values(state)
         q_values, q_confidence = store.get_q_values_with_confidence(state)
 
@@ -2514,7 +2921,8 @@ class RLGoalApproachController:
                 same_side = sensor_data.get("same_side", True)
                 path_blocked = sensor_data.get("path_blocked", False)
                 t_state = self._compute_detach_transition_state(
-                    state, sensor_data,
+                    state,
+                    sensor_data,
                     movement_efficiency=self._compute_movement_efficiency(window=20),
                 )
                 self._pending_strategic_detach.append({
@@ -2533,6 +2941,7 @@ class RLGoalApproachController:
         if not explain:
             return action_index, None
 
+        # Heuristic contribution summary (kept for explanation dict)
         contributions = {
             name: float(np.max(bias))
             for name, bias in heuristic_components.items()
@@ -2603,147 +3012,41 @@ class RLGoalApproachController:
             ),
         }
 
+        # consecutive detach tracking (kept)
         chosen_name = self.action_space.get_info(action_index).name
         if chosen_name == "detach":
             self._consecutive_detach_count += 1
         else:
             self._consecutive_detach_count = 0
 
+        # Keep phase/strategic tags (kept)
         explanation["interpretation"] = (
-            f"[phase={current_phase}] "
-            + explanation["interpretation"]
+            f"[phase={current_phase}] " + explanation["interpretation"]
         )
         if strategic_source:
             explanation["interpretation"] = (
-                f"[strategic={strategic_source}] "
-                + explanation["interpretation"]
+                f"[strategic={strategic_source}] " + explanation["interpretation"]
             )
 
-        same_side = sensor_data.get("same_side", True)
-        path_blocked = sensor_data.get("path_blocked", False)
-        depth = sensor_data.get("depth", 100.0)
-
-        subgoal_str = ""
-        if getattr(self, "_current_subgoal_dir", None) is not None:
-            sd = self._current_subgoal_dir
-            subgoal_str = f"|sd=[{sd[0]:.2f},{sd[1]:.2f},{sd[2]:.2f}]"
-
-        normal_str = ""
-        pn = sensor_data.get("point_normal")
-        if pn is not None:
-            normal_str = f"|n=[{pn[0]:.2f},{pn[1]:.2f},{pn[2]:.2f}]"
-
-        pos_str = (
-            f"|pos=[{current_pose[0]:.1f},"
-            f"{current_pose[1]:.1f},"
-            f"{current_pose[2]:.1f}]"
+        # ═══ Unified heavy debug prefix (NEW единственный) ═══
+        debug_prefix = self.get_state_debug_info(
+            state=state,
+            current_pose=current_pose,
+            sensor_data=sensor_data,
+            store=store,
+            q_values=q_values,
+            q_confidence=q_confidence,
+            nn_debug=_dbg_nn_str,
+            probs=probs,
+            chosen_action=action_index,
+            strategic_source=strategic_source,
         )
-
-        fly_debug_str = ""
-        if current_phase == "FLY_TO_EDGE":
-            if hasattr(self, '_fly_edge_debug') and self._fly_edge_debug:
-                fly_debug_str = f"|fly={self._fly_edge_debug}"
-            if hasattr(self, '_cross_side_debug') and self._cross_side_debug:
-                fly_debug_str += f"|cs={self._cross_side_debug}"
-
-        # ═══ Diagnostic: movement efficiency ═══
-        eff = self._compute_movement_efficiency(window=20)
-        pos_len = len(getattr(self, '_position_history', []))
-        
-        # ═══ Diagnostic: crawl direction debug ═══
-        crawl_debug = ""
-        if current_phase in ("CRAWL_TO_EDGE", "CRAWL_TO_GOAL"):
-            # Recompute what _compute_crawl_to_edge_direction sees
-            goal_dir_dbg = self._current_goal[:3] - current_pose[:3]
-            pn = sensor_data.get("point_normal")
-            if pn is not None:
-                n_dbg = np.asarray(pn, dtype=float)
-                n_len_dbg = np.linalg.norm(n_dbg)
-                if n_len_dbg > 1e-8:
-                    n_dbg = n_dbg / n_len_dbg
-                    dist_dbg = float(np.linalg.norm(goal_dir_dbg))
-                    crawl_proj = goal_dir_dbg - np.dot(goal_dir_dbg, n_dbg) * n_dbg
-                    cl = float(np.linalg.norm(crawl_proj))
-                    ratio = cl / max(dist_dbg, 1e-8)
-                    al_dbg = float(np.dot(goal_dir_dbg / max(dist_dbg, 1e-8), n_dbg))
-                    k1_dbg = float(sensor_data.get("k1", 0.0))
-                    k2_dbg = float(sensor_data.get("k2", 0.0))
-                    is_flat_dbg = abs(k1_dbg) < 0.01 and abs(k2_dbg) < 0.01
-                    
-                    # Check degenerate conditions
-                    degen = (
-                        cl < 1.0
-                        or (dist_dbg > 10.0 and ratio < 0.15)
-                        or (is_flat_dbg and al_dbg < -0.85)
-                    )
-                    
-                    crawl_debug = (
-                        f"|cl={cl:.1f}"
-                        f"|ratio={ratio:.3f}"
-                        f"|flat={int(is_flat_dbg)}"
-                        f"|degen={int(degen)}"
-                        f"|k1={k1_dbg:.4f}"
-                    )
-
-        snap_dbg = sensor_data.get("snap_debug", "")
-        snap_str = f"|snap={snap_dbg}" if snap_dbg else ""
-        crawl_edge_dbg = getattr(self, '_crawl_edge_debug', '')
-        ce_str = f"|ce={crawl_edge_dbg}" if crawl_edge_dbg else ""
-
-        surface_q = q_values[:8]
-        top3_idx = np.argsort(surface_q)[-3:][::-1]
-        top3_str = "|".join(f"a{i}={surface_q[i]:.2f}" for i in top3_idx)
-
-        sorted_sq = np.sort(surface_q[surface_q > -1e8])[::-1]
-        top2_spread = float(sorted_sq[0] - sorted_sq[1]) if len(sorted_sq) >= 2 else 0.0
-        t2s_str = f"|t2s={top2_spread:.2f}"
-        
-        conf_str = (
-            f"|prox={q_confidence['proximity']:.2f}"
-            f"|exp={q_confidence['experience']:.2f}"
-            f"|cons={q_confidence['consistency']:.1f}"
-            f"|ovr={q_confidence['overall']:.2f}"
-            f"|vm={q_confidence['v_mean']:.1f}"
-            f"|vs={q_confidence['v_spread']:.1f}"
-            f"|qtop=[{top3_str}]"
-        )
-
-        p2d_str = f"|p2d=[{state[20]:.2f},{state[21]:.2f}]|lpe=[{state[0]:.1f},{state[1]:.1f},{state[2]:.1f}]"
-
-        norm_state = store._normalize(state)
-        norm_str = f"|np2d=[{norm_state[20]:.1f},{norm_state[21]:.1f}]|nlpe=[{norm_state[0]:.1f},{norm_state[1]:.1f},{norm_state[2]:.1f}]"
-
-        debug_prefix = (
-            f"[phase={current_phase}|"
-            f"{conf_str}" 
-            f"{t2s_str}" 
-            f"{p2d_str}" 
-            f"{norm_str}" 
-            f"ss={int(same_side)}|"
-            f"pb={int(path_blocked)}|"
-            f"d={depth:.1f}"
-            f"|al={float(state[12]):.2f}"
-            f"|eff={eff:.2f}"
-            f"|plen={pos_len}"
-            f"{crawl_debug}"
-            f"{ce_str}"
-            f"{subgoal_str}"
-            f"{normal_str}"
-            f"{pos_str}"
-            f"{snap_str}"
-            f"|nn={_dbg_nn_str}" 
-            f"{fly_debug_str}]"
-            f"|peff={phase_eff:.2f}|pthr={phase_thr}"
-        )
-
-        if strategic_source:
-            debug_prefix += f"[strat={strategic_source}]"
 
         explanation["interpretation"] = (
             debug_prefix + " " + explanation["interpretation"]
         )
         return action_index, explanation
-    
+        
     def _can_detach(self, state: np.ndarray) -> bool:
         """Check if detach is allowed (anti-spam guards)."""
         recent_detach = sum(
@@ -6142,6 +6445,7 @@ class RLGoalApproachController:
             "termination_rates": termination_rates,
             "q_store_free": self.q_store_free.get_stats(),
             "q_store_surface": self.q_store_surface.get_stats(),
+            "q_store_surface_bypass": self.q_store_surface_bypass.get_stats(),
             "collision_stats": dict(self._collision_stats),
             "global_action_counts": dict(self._global_action_counts),
             "collision_rate_per_action": collision_rate_per_action,
@@ -6478,8 +6782,8 @@ class RLGoalApproachController:
         done = False
 
         if self._prev_state is not None:
-            prev_store = self._select_store(self._prev_state)
-            next_store = self._select_store(state)
+            prev_store = self._select_store(self._prev_state, self._prev_sensor_data)
+            next_store = self._select_store(state, sensor_data)
 
             reward, done, termination_reason = self._compute_reward(
                 state, self._prev_state, self._last_action, collision,
@@ -6545,6 +6849,9 @@ class RLGoalApproachController:
         )
         self.q_store_surface.save_with_index(
             os.path.join(dirpath, "q_store_surface")
+        )
+        self.q_store_surface_bypass.save_with_index(
+            os.path.join(dirpath, "q_store_surface_bypass")
         )
 
         # Save transition memories
@@ -6657,6 +6964,34 @@ class RLGoalApproachController:
                 name="surface",
             )
         )
+
+        bypass_base = os.path.join(dirpath, "q_store_surface_bypass")
+        if pathlib.Path(bypass_base + ".npz").exists():
+            bypass_cfg = {
+                **(config or {}),
+                "feature_weights": (config or {}).get(
+                    "feature_weights_bypass", None
+                ),
+            }
+            controller.q_store_surface_bypass = (
+                HNSWStateStore.load_with_index(
+                    bypass_base,
+                    extra_cfg=bypass_cfg,
+                    name="surface_bypass",
+                )
+            )
+        else:
+            # New store — no saved data yet
+            bypass_weights = (config or {}).get(
+                "feature_weights_bypass", None
+            )
+            controller.q_store_surface_bypass = HNSWStateStore(
+                config={
+                    **(config or {}),
+                    "feature_weights": bypass_weights,
+                },
+                name="surface_bypass",
+            )
 
         # Load transition memories
         detach_base = os.path.join(dirpath, "strategic_detach")

@@ -1,14 +1,14 @@
 seed: 42
 # Visualization: null | text | pictures | video
-visualise: text
-regenerate_scripts: true
-do_train: true
-do_eval: true
+visualise: video
+regenerate_scripts: false
+do_train: false
+do_eval: false
 do_heur_eval: false
 do_bc_train: false
 do_sac_train: false
 do_sac_eval: false
-do_adaptive: false
+do_adaptive: true
 do_sleep: false
 do_ycb_eval: false
 
@@ -31,7 +31,7 @@ curriculum_levels:
 curriculum_filters:
   - {same_side: true, path_blocked: false}
   - {same_side: true, path_blocked: true}
-  - {} #{same_side: false}
+  - {same_side: false}
   #- {"handle_between": True, same_side: true, path_blocked: true}
 
 # ═══════════════════════════════════════════
@@ -65,57 +65,57 @@ training_stages:
       - {same_side: true, path_blocked: true}
       - {}
 
-  - mesh: cylinder
-    episodes: 1000
-    epsilon_start: 1.0
-    epsilon_min: 0.95
-    load_mode: auto
-    warmup_episodes: 100
-    promote_threshold: 0.7
-    promote_window: 200
-    curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
-      - {}
+  #- mesh: cylinder
+  #  episodes: 1000
+  #  epsilon_start: 1.0
+  #  epsilon_min: 0.95
+  #  load_mode: auto
+  #  warmup_episodes: 100
+  #  promote_threshold: 0.7
+  #  promote_window: 200
+  #  curriculum_filters:
+  #   - {same_side: true, path_blocked: false}
+  #   - {same_side: true, path_blocked: true}
+  #   - {}
 
-  - mesh: flat_square
-    episodes: 500
-    epsilon_start: 1.0
-    epsilon_min: 0.95
-    load_mode: auto
-    warmup_episodes: 100
-    promote_threshold: 0.7
-    promote_window: 100
-    curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
-      - {}
+  #- mesh: flat_square
+  #  episodes: 500
+  #  epsilon_start: 1.0
+  #  epsilon_min: 0.95
+  #  load_mode: auto
+  #  warmup_episodes: 100
+  #  promote_threshold: 0.7
+  #  promote_window: 100
+  #  curriculum_filters:
+  #    - {same_side: true, path_blocked: false}
+  #    - {same_side: true, path_blocked: true}
+  #    - {}
   
-  - mesh: cone
-    episodes: 1000
-    epsilon_start: 1.0
-    epsilon_min: 0.95
-    load_mode: auto
-    warmup_episodes: 100
-    promote_threshold: 0.7
-    promote_window: 200
-    curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
-      - {}
+  #- mesh: cone
+  #  episodes: 1000
+  #  epsilon_start: 1.0
+  #  epsilon_min: 0.95
+  #  load_mode: auto
+  #  warmup_episodes: 100
+  #  promote_threshold: 0.7
+  #  promote_window: 200
+  #  curriculum_filters:
+  #    - {same_side: true, path_blocked: false}
+  #    - {same_side: true, path_blocked: true}
+  #    - {}
 
-  - mesh: thin_cylinder
-    episodes: 500
-    epsilon_start: 1.0
-    epsilon_min: 0.95
-    load_mode: auto
-    warmup_episodes: 100
-    promote_threshold: 0.7
-    promote_window: 100
-    curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
-      - {}
+  #- mesh: thin_cylinder
+  #  episodes: 500
+  #  epsilon_start: 1.0
+  #  epsilon_min: 0.95
+  #  load_mode: auto
+  #  warmup_episodes: 100
+  #  promote_threshold: 0.7
+  #  promote_window: 100
+  #  curriculum_filters:
+  #    - {same_side: true, path_blocked: false}
+  #    - {same_side: true, path_blocked: true}
+  #    - {}
 
   # ── Phase 2: Primitives ──
   #- mesh: cube
@@ -252,34 +252,34 @@ eval_meshes:
       - {same_side: true, path_blocked: false}
       - {same_side: true, path_blocked: true}
       - {}
-  - mesh: sphere
-    curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
-      - {}
-  - mesh: cylinder
-    curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
-      - {}
-  - mesh: flat_square
-    curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
-      - {}
-  - mesh: cone
-    curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
-      - {}
-  - mesh: thin_cylinder
-    curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
-      - {}
+  #- mesh: sphere
+  #  curriculum_filters:
+  #    - {same_side: true, path_blocked: false}
+  #    - {same_side: true, path_blocked: true}
+  #    - {}
+  #- mesh: cylinder
+  #  curriculum_filters:
+  #    - {same_side: true, path_blocked: false}
+  #    - {same_side: true, path_blocked: true}
+  #    - {}
+  #- mesh: flat_square
+  #  curriculum_filters:
+  #    - {same_side: true, path_blocked: false}
+  #    - {same_side: true, path_blocked: true}
+  #    - {}
+  #- mesh: cone
+  #  curriculum_filters:
+  #    - {same_side: true, path_blocked: false}
+  #    - {same_side: true, path_blocked: true}
+  #    - {}
+  #- mesh: thin_cylinder
+  #  curriculum_filters:
+  #    - {same_side: true, path_blocked: false}
+   #   - {same_side: true, path_blocked: true}
+  #    - {}
   
   # Train set — hollow
-  #- vase
+  - vase
   #- mug
   # Held-out — hollow
   #- mesh: cup
@@ -324,7 +324,8 @@ bc_action_min_absolute: 100
 bc_q_store_fraction: 0.3
 
 rl_config:
-  state_dim: 23
+  state_dim: 28
+  reward_rim_progress_scale: 2.0
   stuck_threshold: 0.05
   warmup_episodes: 100     # per level warmup
   air_start_enabled: true
@@ -349,30 +350,70 @@ rl_config:
     20: 0.0
     21: 0.0
     22: 0.0
+    23: 0.0
+    24: 0.0
+    25: 0.0
+    26: 0.0
+
+  # Direct store: crawl to goal / same-side bypass
   feature_weights_surface:
-    0: 0.0    # lpe[0] — убран
-    1: 0.0    # lpe[1]
-    2: 0.0    # lpe[2]
-    3: 0.0    # rot_error
+    0: 2.0    # lpe[0]
+    1: 2.0    # lpe[1]
+    2: 0.5    # lpe[2]
+    3: 0.0
     4: 0.0
     5: 0.0
-    6: 0.3    # local_normal[0] — контекст (с na менее нужен)
-    7: 0.3    # local_normal[1]
-    8: 0.3    # local_normal[2]
-    9: 0.3    # k1 — контекст (не меняет направление)
-    10: 0.0   # k2 — убрать (k1 достаточно)
-    11: 0.0   # on_object
-    12: 1.0   # alignment — средний (полезен при pb=0)
-    13: 0.3   # distance — контекст
-    14: 0.0   # norm_depth
-    15: 0.3   # goal_normal[0] — контекст (na важнее)
-    16: 0.3   # goal_normal[1]
-    17: 0.3   # goal_normal[2]
-    18: 2.0   # path_blocked — высокий (меняет стратегию)
-    19: 0.0   # movement_efficiency — убрать (не для направления)
-    20: 2.0   # p2d[0] — высокий (правильное направление всегда)
-    21: 2.0   # p2d[1]
-    22: 2.0   # normal_agreement — высокий (same/diff side)
+    6: 0.2    # local_normal — неинформативен
+    7: 0.2
+    8: 0.2
+    9: 0.3    # k1
+    10: 0.0
+    11: 0.0
+    12: 1.5   # alignment
+    13: 0.3   # distance
+    14: 0.0
+    15: 0.3   # goal_normal
+    16: 0.3
+    17: 0.3
+    18: 1.0   # path_blocked
+    19: 0.0
+    20: 0.0   # p2d — убран
+    21: 0.0
+    22: 0.0   # na — store selector
+    23: 0.0   # norm_height — не нужен для direct
+    24: 0.3
+    25: 0.3
+    26: 0.3
+
+  # Bypass store: crawl to edge / different-side
+  feature_weights_bypass:
+    0: 0.5    # lpe[0] — снижен
+    1: 0.5    # lpe[1]
+    2: 0.3    # lpe[2]
+    3: 0.0
+    4: 0.0
+    5: 0.0
+    6: 0.7    # local_normal
+    7: 0.7
+    8: 0.7
+    9: 0.3    # k1
+    10: 0.0
+    11: 0.0
+    12: 1.0   # alignment
+    13: 0.3   # distance
+    14: 0.0
+    15: 0.5   # goal_normal
+    16: 0.5
+    17: 0.5
+    18: 0.0   # path_blocked — всегда 1
+    19: 0.0
+    20: 0.0   # p2d — убран
+    21: 0.0
+    22: 0.0   # na — store selector
+    23: 2.0   # norm_height — ключевой для bypass
+    24: 1.0   # NEW up_local
+    25: 1.0
+    26: 1.0
 
   mode: train_adapt_epsilon
   goal_threshold: 4.0

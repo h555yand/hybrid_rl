@@ -909,7 +909,7 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
                     _cal_pose, _cal_sensor
                 )
                 _cal_on_obj = _cal_state[11] > 0.5
-                _cal_store = controller._select_store(_cal_state)
+                _cal_store = controller._select_store(_cal_state, _cal_sensor)
                 if _cal_store.next_id > 0:
                     _cal_q, _cal_conf = (
                         _cal_store.get_q_values_with_confidence(

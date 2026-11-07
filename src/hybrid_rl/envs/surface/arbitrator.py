@@ -183,13 +183,12 @@ class Arbitrator:
 
         self.agreement_count = 0
         self.both_proposed_count = 0
-        # Q confidence calibrated thresholds
-        self._q_reliable_threshold_surface = 0.2
-        self._q_reliable_threshold_free = 0.2
 
         # Running best_Q stats for best_q_norm
         self._running_best_q_free = RunningQStats(warmup=200)
         self._running_best_q_surface = RunningQStats(warmup=200)
+        self._running_q_stats_bypass = RunningQStats(warmup=200)
+        self._running_best_q_bypass = RunningQStats(warmup=200)
 
         self.q_confidence_history = deque(maxlen=100)
         self.q_spread_history = deque(maxlen=100)
@@ -284,6 +283,27 @@ class Arbitrator:
         self._calibration_episodes_per_source = 10
         self._level_calibration_done: Dict[int, bool] = {}
 
+        # Q hysteresis (NEW)
+        # Рекомендуемые значения порогов (старт)
+        #- `q_reliable_threshold_surface` = 0.2 (как у тебя)
+        #- `self._q_enter_threshold` = **0.65**
+        #- `self._q_exit_threshold` = **0.35**
+        #- `self._q_streak_to_enter` = **3**
+        #- `self._q_streak_to_exit` = **2**
+        #- `self._q_instant_threshold` = **0.90** (если слишком редко срабатывает — 0.85; если слишком часто — 0.95)
+        #Почему это работает: `overall` у тебя ограничен 0.95, так что 0.90 — это реально “очень уверенно”.
+        # Q confidence calibrated thresholds
+        self._q_reliable_threshold_surface = 0.2
+        self._q_reliable_threshold_free = 0.2
+        self._q_mode_active = False          # currently trusting Q for crawl
+        self._q_reliable_streak = 0          # consecutive reliable steps
+        self._q_enter_threshold = 0.65       # q_conf needed to enter Q-mode
+        self._q_exit_threshold = 0.35        # q_conf below -> exit Q-mode
+        self._q_streak_to_enter = 3          # need N consecutive steps to enter
+        self._q_streak_to_exit = 2           # need N consecutive low steps to exit
+        self._q_unreliable_streak = 0
+        self._q_instant_threshold = 0.90  # можно 0.85..0.95
+
     def _needs_calibration(self, level: int) -> Optional[str]:
         """Check if SAC needs calibration on this level.
         
@@ -315,6 +335,9 @@ class Arbitrator:
             (self.controller.q_store_surface,
              self._running_q_stats_surface,
              self._running_best_q_surface),
+            (self.controller.q_store_surface_bypass,
+             self._running_q_stats_bypass,
+             self._running_best_q_bypass),
         ]:
             if not store.points:
                 continue
@@ -395,6 +418,9 @@ class Arbitrator:
             self._episodes_on_level = 0
         self._episodes_on_level += 1
         self._current_episode_sources = []
+        self._q_mode_active = False
+        self._q_reliable_streak = 0
+        self._q_unreliable_streak = 0
 
     def _decide_crawl(
         self,
@@ -561,25 +587,26 @@ class Arbitrator:
         self.stats["total_decisions"] += 1
         level = self._current_level
         has_sac = self.sac_actor is not None
+        has_sac = False
         self._level_total_decisions[level] += 1
 
         # ═══ Force heuristic when stuck ═══
         if self._force_heuristic:
-            return self._decide_heuristic(
+            return *self._decide_heuristic(
                 state, current_pose, sensor_data,
                 "forced_heuristic(mode=force_all)",
-            )
+            ), None, None
 
         phase = getattr(self.controller, '_current_phase', 'CRAWL_TO_GOAL')
         if phase == "DETACH_NEEDED":
-            return self._decide_heuristic(
+            return *self._decide_heuristic(
                 state, current_pose, sensor_data,
                 "forced_heuristic(phase=DETACH_NEEDED)",
-            )
+            ), None, None
 
         # ═══ Get proposals ═══
-        q_action, q_confidence, q_spread, q_recency, q_best_norm = (
-            self._get_q_action(state)
+        q_action, q_confidence, q_spread, q_recency, q_best_norm, q_values, confidence_info = (
+            self._get_q_action(state, sensor_data)
         )
         q_type = ExperienceExtractor.DISCRETE_TO_PSAC[q_action][0]
         q_params = self._discrete_to_params(q_action)
@@ -622,7 +649,42 @@ class Arbitrator:
             self._q_reliable_threshold_surface if on_object
             else self._q_reliable_threshold_free
         )
-        q_is_reliable = q_confidence >= q_reliable_threshold
+
+        # --- Hysteresis gate for trusting Q (only q_confidence) ---
+        # 0) Hard floor: below old reliability threshold -> treat as unreliable
+        if q_confidence < q_reliable_threshold:
+            self._q_mode_active = False
+            self._q_reliable_streak = 0
+            self._q_unreliable_streak = 0
+            q_is_reliable = False
+
+        else:
+            # 1) Instant trust on very high confidence (familiar states)
+            if q_confidence >= self._q_instant_threshold:
+                self._q_mode_active = True
+                self._q_reliable_streak = self._q_streak_to_enter
+                self._q_unreliable_streak = 0
+                q_is_reliable = True
+
+            else:
+                # 2) Normal hysteresis in the mid zone
+                if q_confidence >= self._q_enter_threshold:
+                    self._q_reliable_streak += 1
+                    self._q_unreliable_streak = 0
+                elif q_confidence <= self._q_exit_threshold:
+                    self._q_unreliable_streak += 1
+                    self._q_reliable_streak = 0
+                else:
+                    # middle band: decay
+                    self._q_reliable_streak = max(self._q_reliable_streak - 1, 0)
+                    self._q_unreliable_streak = max(self._q_unreliable_streak - 1, 0)
+
+                if (not self._q_mode_active) and (self._q_reliable_streak >= self._q_streak_to_enter):
+                    self._q_mode_active = True
+                elif self._q_mode_active and (self._q_unreliable_streak >= self._q_streak_to_exit):
+                    self._q_mode_active = False
+
+                q_is_reliable = self._q_mode_active
 
         # ═══ sac_proven: combined SAC + blend track ═══
         sac_results = self._level_sac_results[level]
@@ -650,7 +712,7 @@ class Arbitrator:
                     f"calibration_sac(level={level},"
                     f"q_conf={q_confidence:.2f},"
                     f"sac_evals={len(self._level_sac_results[level])})"
-                )
+                ), q_values, confidence_info
 
         # ═══════════════════════════════════════════════════════
         # DECISION TREE
@@ -666,23 +728,26 @@ class Arbitrator:
                 return sac_type, sac_params, (
                     f"q_NOT_reliable_sac_proven("
                     f"q_conf={q_confidence:.2f},"
-                    f"sac_track={combined_track:.2f})"
-                )
+                    f"q_mode={int(self._q_mode_active)},"
+                    f"r_streak={self._q_reliable_streak},"
+                    f"u_streak={self._q_unreliable_streak},"
+                    f"level={level})"
+                ), q_values, confidence_info
 
-            return self._decide_heuristic(
+            return *self._decide_heuristic(
                 state, current_pose, sensor_data,
                 f"q_NOT_reliable_heuristic_default("
                 f"q_conf={q_confidence:.2f},"
                 f"level={level})",
-            )
+            ), q_values, confidence_info
         
         # --- 2. Q RELIABLE ---
         # MoveTangentially (type 0): Q decides direction
         if q_type == 0:
-            return self._decide_crawl(
+            return *self._decide_crawl(
                 q_action, q_params, q_confidence,
                 sac_type, sac_params, has_sac,
-            )
+            ), q_values, confidence_info
 
         # All other actions: SAC (continuous params better)
         if has_sac:
@@ -695,7 +760,7 @@ class Arbitrator:
                 f"q_type={q_name},"
                 f"sac_type={sac_n},"
                 f"q_conf={q_confidence:.2f})"
-            )
+            ), q_values, confidence_info
 
         # No SAC → Q
         self._record_decision("q_store")
@@ -703,7 +768,7 @@ class Arbitrator:
         self._current_episode_sources.append("q_store")
         return q_type, q_params, (
             f"q_non_crawl(q_conf={q_confidence:.2f})"
-        )
+        ), q_values, confidence_info
     
     def _decide_heuristic(self, state, current_pose, sensor_data, reason):
         """Execute heuristic decision with standard bookkeeping."""
@@ -926,21 +991,21 @@ class Arbitrator:
 
         return np.zeros(3, dtype=np.float32)
 
-    def _get_q_action(self, state):
-        store = self.controller._select_store(state)
-        running_stats = (
-            self._running_q_stats_surface
-            if state[11] > 0.5
-            else self._running_q_stats_free
-        )
-        running_best = (
-            self._running_best_q_surface
-            if state[11] > 0.5
-            else self._running_best_q_free
-        )
+    def _get_q_action(self, state, sensor_data):
+        store = self.controller._select_store(state, sensor_data)
+
+        if store is self.controller.q_store_free:
+            running_stats = self._running_q_stats_free
+            running_best = self._running_best_q_free
+        elif store is self.controller.q_store_surface_bypass:
+            running_stats = self._running_q_stats_bypass
+            running_best = self._running_best_q_bypass
+        else:
+            running_stats = self._running_q_stats_surface
+            running_best = self._running_best_q_surface
 
         if store.next_id == 0:
-            return 0, 0.0, 0.0, 0.5, 0.0
+            return 0, 0.0, 0.0, 0.5, 0.0, None, None
 
         q_values, confidence_info = (
             store.get_q_values_with_confidence(state)
@@ -1018,7 +1083,7 @@ class Arbitrator:
         probs = exp_v / exp_v.sum()
         q_action = int(np.random.choice(len(probs), p=probs))
 
-        return q_action, q_confidence, q_spread, recency, best_q_norm
+        return q_action, q_confidence, q_spread, recency, best_q_norm, q_values, confidence_info
 
     def _get_q_action_old(self, state):
         store = self.controller._select_store(state)

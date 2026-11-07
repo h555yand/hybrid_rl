@@ -2703,7 +2703,7 @@ class RLGoalApproachExperiment:
                 state = controller._compute_state(pose, sensor)
 
                 # Arbitrator decides action
-                action_type, action_params, source = (
+                action_type, action_params, source, q_values, confidence_info = (
                     manager.get_action(state, pose, sensor)
                 )
                 controller._current_source = source
@@ -2720,7 +2720,7 @@ class RLGoalApproachExperiment:
 
                 # ═══ State debug BEFORE update_only (goal still set) ═══
                 state_debug = controller.get_state_debug_info(
-                    state, pose, sensor
+                    state, pose, sensor, q_values=q_values, q_confidence=confidence_info
                 )
 
                 # Save transitions before update_only clears them
@@ -2805,7 +2805,7 @@ class RLGoalApproachExperiment:
                     action_type, action_params
                 )
                 act_full = (
-                    f"{act_name}({params_str})" if params_str
+                    f"{act_name}-{discrete_idx} ({params_str})" if params_str
                     else act_name
                 )
 
