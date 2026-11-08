@@ -407,16 +407,14 @@ class RLGoalApproachController:
         )
 
         if path_blocked and (not same_side):
-            if self.q_store_surface_bypass.next_id > 0:
-                return self.q_store_surface_bypass
+            return self.q_store_surface_bypass
 
         # Fallback (when same_side not available / legacy logs):
         # keep old heuristic based on normal_agreement
         if sensor_data is None:
             normal_agreement = float(state[22]) if len(state) > 22 else 0.0
             if path_blocked and normal_agreement < 0:
-                if self.q_store_surface_bypass.next_id > 0:
-                    return self.q_store_surface_bypass
+                return self.q_store_surface_bypass
 
         return self.q_store_surface
 
@@ -2600,6 +2598,8 @@ class RLGoalApproachController:
         explain: bool = False,
     ):
         store = self._select_store(state, sensor_data)
+        if store.name == "surface_bypass" and store.next_id == 0:
+            store = self.q_store_surface
         # q_values = store.get_q_values(state)
         q_values, q_confidence = store.get_q_values_with_confidence(state)
 

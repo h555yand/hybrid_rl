@@ -247,11 +247,11 @@ training_stages:
 # ═══════════════════════════════════════════
 eval_meshes:
   # Train set — primitives
-  - mesh: cube
-    curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
-      - {}
+  #- mesh: cube
+  #  curriculum_filters:
+  #    - {same_side: true, path_blocked: false}
+  #    - {same_side: true, path_blocked: true}
+  #    - {}
   #- mesh: sphere
   #  curriculum_filters:
   #    - {same_side: true, path_blocked: false}
@@ -285,7 +285,7 @@ eval_meshes:
   #- mesh: cup
   #  pool_seed: 57
 
-eval_episodes_per_level: 100
+eval_episodes_per_level: 10
 
 # BC config (not used in Q-only pipeline)
 # ═══ BC data collection ═══
