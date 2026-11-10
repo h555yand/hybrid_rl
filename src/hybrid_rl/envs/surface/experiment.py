@@ -2454,6 +2454,36 @@ class RLGoalApproachExperiment:
         _MAX_FAILURE_TRAILS_PER_LEVEL = 100
         _SLEEP_TRAILS_SAVE_EVERY = 200  # save periodically
 
+        # ═══ Sleep-Q normalization data (NEW) ═══
+        _SLEEP_Q_SAVE_EVERY = _SLEEP_TRAILS_SAVE_EVERY
+        _SLEEP_Q_START_K = 5
+        _SLEEP_Q_STRIDE = 5
+        _SLEEP_Q_MAX_STATES_PER_LEVEL = 50_000
+        _SLEEP_Q_MAX_START_PER_LEVEL = 10_000
+
+        sleep_q_norm = {
+            "mesh_name": object_name,
+            "state_dim": int(self.rl_config.get("state_dim", 0)),
+            "meta": {
+                "start_k": _SLEEP_Q_START_K,
+                "stride": _SLEEP_Q_STRIDE,
+            },
+            "by_level": {},  # lvl -> dict
+        }
+
+        def _ensure_q_level(lvl: int) -> dict:
+            if lvl not in sleep_q_norm["by_level"]:
+                sleep_q_norm["by_level"][lvl] = {
+                    "start": {"states": [], "prox": [], "q_conf": []},
+                    "sample": {"free": [], "surface": [], "bypass": []},
+                    "counts": {"episodes": 0, "steps_seen": 0},
+                }
+            return sleep_q_norm["by_level"][lvl]
+
+        def _cap_list(lst, cap: int) -> None:
+            if len(lst) > cap:
+                del lst[:-cap]
+
         sleep_success_trails: dict[int, list] = {}
         sleep_failure_trails: dict[int, list] = {}
 
@@ -2708,6 +2738,56 @@ class RLGoalApproachExperiment:
                 )
                 controller._current_source = source
 
+                # ═══ Collect sleep-Q normalization stats (NEW) ═══
+                lvl_bucket = _ensure_q_level(adaptive_level)
+                lvl_bucket["counts"]["steps_seen"] += 1
+
+                # Start-of-episode states (first K steps)
+                if step < _SLEEP_Q_START_K:
+                    lvl_bucket["start"]["states"].append(
+                        state.astype(np.float32, copy=False)
+                    )
+                    if confidence_info is not None:
+                        lvl_bucket["start"]["prox"].append(
+                            float(confidence_info.get("proximity", 0.0))
+                        )
+                        lvl_bucket["start"]["q_conf"].append(
+                            float(confidence_info.get("overall", 0.0))
+                        )
+                    else:
+                        lvl_bucket["start"]["prox"].append(0.0)
+                        lvl_bucket["start"]["q_conf"].append(0.0)
+
+                    _cap_list(lvl_bucket["start"]["states"], _SLEEP_Q_MAX_START_PER_LEVEL)
+                    _cap_list(lvl_bucket["start"]["prox"], _SLEEP_Q_MAX_START_PER_LEVEL)
+                    _cap_list(lvl_bucket["start"]["q_conf"], _SLEEP_Q_MAX_START_PER_LEVEL)
+
+                # Sparse samples across episode for global normalization coverage
+                if (step % _SLEEP_Q_STRIDE) == 0:
+                    on_object = float(state[11]) > 0.5
+
+                    # same_side stored in state (ssS) at index 27 (state_dim=28)
+                    same_side_state = True
+                    if len(state) > 27:
+                        same_side_state = bool(float(state[27]) > 0.5)
+
+                    if not on_object:
+                        lvl_bucket["sample"]["free"].append(
+                            state.astype(np.float32, copy=False)
+                        )
+                        _cap_list(lvl_bucket["sample"]["free"], _SLEEP_Q_MAX_STATES_PER_LEVEL)
+                    else:
+                        if same_side_state:
+                            lvl_bucket["sample"]["surface"].append(
+                                state.astype(np.float32, copy=False)
+                            )
+                            _cap_list(lvl_bucket["sample"]["surface"], _SLEEP_Q_MAX_STATES_PER_LEVEL)
+                        else:
+                            lvl_bucket["sample"]["bypass"].append(
+                                state.astype(np.float32, copy=False)
+                            )
+                            _cap_list(lvl_bucket["sample"]["bypass"], _SLEEP_Q_MAX_STATES_PER_LEVEL)
+
                 # ═══ Per-episode Q diagnostics ═══
                 # Q confidence уже посчитан внутри arbitrator._get_q_action
                 # Берём из последних значений arbitrator
@@ -2840,6 +2920,10 @@ class RLGoalApproachExperiment:
                 controller._total_goals_reached > goals_before
             )
             ep_successes.append(success)
+            
+            # Count episodes for sleep-Q stats (NEW)
+            _ensure_q_level(adaptive_level)["counts"]["episodes"] += 1
+
             # ═══ Collect sleep trails ═══
             if last_transitions:
                 if success:
@@ -3079,6 +3163,7 @@ class RLGoalApproachExperiment:
                         sleep_success_trails, sleep_failure_trails,
                         ep_successes, adaptive_level,
                         level_episode_steps, level_success_steps,
+                        sleep_q_norm=sleep_q_norm,
                     )
                 logger.info(
                     "Adaptive ep %d: rate=%.3f, mode=%s",
@@ -3091,6 +3176,7 @@ class RLGoalApproachExperiment:
             sleep_success_trails, sleep_failure_trails,
             ep_successes, adaptive_level,
             level_episode_steps, level_success_steps,
+            sleep_q_norm=sleep_q_norm,
         )
         # ═══ Final Q-store diagnostics ═══
         q_final_free = len(controller.q_store_free.points)
@@ -3238,6 +3324,7 @@ class RLGoalApproachExperiment:
         current_level: int,
         level_episode_steps: dict[int, list],
         level_success_steps: dict[int, list],
+        sleep_q_norm: dict | None = None,
     ) -> None:
         """Save sleep trails to disk for offline SAC consolidation."""
         # Per-level success rates
@@ -3275,6 +3362,17 @@ class RLGoalApproachExperiment:
             "Sleep trails saved: ep=%d, levels=%s, path=%s",
             episode, trails_count_by_level, path,
         )
+
+        # ═══ Save sleep-Q normalization data (NEW) ═══
+        if sleep_q_norm is not None:
+            import pickle as _pickle
+            q_path = log_dir / "sleep_q_norm.pkl"
+            with q_path.open("wb") as f:
+                _pickle.dump(sleep_q_norm, f)
+            logger.info(
+                "Sleep Q-norm data saved: ep=%d, path=%s",
+                episode, q_path,
+            )
 
     @staticmethod
     def _format_action_params(action_type: int, action_params: np.ndarray) -> str:
@@ -3569,10 +3667,268 @@ class RLGoalApproachExperiment:
         success_threshold = sleep_cfg.get("success_threshold", 0.80)
         min_success_trails = sleep_cfg.get("min_success_trails", 20)
 
+        def _cap_list(lst, cap: int):
+            if len(lst) > cap:
+                return lst[-cap:]
+            return lst
+
+        def _to_np(states_list):
+            if not states_list:
+                return None
+            return np.asarray(states_list, dtype=np.float32)
+
+        def _compute_mean_std(states_arr: np.ndarray, min_std: float = 1e-4):
+            mean = states_arr.mean(axis=0)
+            std = states_arr.std(axis=0)
+            std = np.maximum(std, min_std)
+            return mean, std
+
+        def _sample_mix(current_list, replay_list, total: int, current_ratio: float):
+            """Return list of states (python list), sampled from current/replay."""
+            current_list = list(current_list) if current_list else []
+            replay_list = list(replay_list) if replay_list else []
+            if total <= 0:
+                return []
+
+            n_cur = int(total * current_ratio)
+            n_rep = total - n_cur
+
+            if len(current_list) <= n_cur:
+                cur = current_list
+            else:
+                idx = np.random.choice(len(current_list), n_cur, replace=False)
+                cur = [current_list[i] for i in idx]
+
+            if len(replay_list) <= n_rep:
+                rep = replay_list
+            else:
+                idx = np.random.choice(len(replay_list), n_rep, replace=False)
+                rep = [replay_list[i] for i in idx]
+
+            return cur + rep
+
         mesh_name = self.adaptive_mesh
         log_dir = self.data_dir / f"adaptive_logs_{mesh_name}"
         trails_path = log_dir / "sleep_trails.pkl"
 
+        # ═══ Load sleep-Q norm data ═══
+        q_norm_path = log_dir / "sleep_q_norm.pkl"
+        sleep_q_norm = None
+        if q_norm_path.exists():
+            with q_norm_path.open("rb") as f:
+                sleep_q_norm = pickle.load(f)
+            logger.info("Sleep Q-norm: loaded %s", q_norm_path)
+            for lvl, d in sleep_q_norm["by_level"].items():
+                logger.info(
+                    "sleep_q_norm L%d: start=%d sample_free=%d sample_surface=%d sample_bypass=%d episodes=%d",
+                    lvl,
+                    len(d["start"]["states"]),
+                    len(d["sample"]["free"]),
+                    len(d["sample"]["surface"]),
+                    len(d["sample"]["bypass"]),
+                    d["counts"]["episodes"],
+                )
+        else:
+            logger.info("Sleep Q-norm: no file at %s (skip Q-norm)", q_norm_path)
+
+        # ═══════════════════════════════════════
+        # Sleep Q-norm decision (NEW)
+        # ═══════════════════════════════════════
+        sleep_cfg = self.config.get("sleep_config", {})
+        qnorm_cfg = sleep_cfg.get("sleep_q_norm", {})
+        qnorm_enabled = bool(qnorm_cfg.get("enabled", True))
+
+        do_qnorm = False
+        qnorm_levels = []
+
+        if qnorm_enabled and sleep_q_norm is not None:
+            min_start_states = int(qnorm_cfg.get("min_start_states", 500))
+            prox_thr = float(qnorm_cfg.get("prox_median_threshold", 0.15))
+
+            by_level = sleep_q_norm.get("by_level", {})
+            for lvl, data in by_level.items():
+                start_prox = data.get("start", {}).get("prox", [])
+                start_states = data.get("start", {}).get("states", [])
+                if len(start_states) < min_start_states:
+                    continue
+                if start_prox:
+                    med_prox = float(np.median(start_prox))
+                else:
+                    med_prox = 0.0
+
+                if med_prox < prox_thr:
+                    qnorm_levels.append(int(lvl))
+
+            if qnorm_levels:
+                do_qnorm = True
+                logger.info(
+                    "Sleep Q-norm: will run for levels=%s (low start prox)",
+                    qnorm_levels,
+                )
+            else:
+                logger.info("Sleep Q-norm: skip (start prox OK / not enough data)")
+        else:
+            logger.info("Sleep Q-norm: disabled or no data")
+
+        # ═══════════════════════════════════════
+        # Sleep Q-norm consolidation (NEW)
+        # ═══════════════════════════════════════
+        if do_qnorm:
+            # 1) Load controller (Q-store) for rebuilding
+            # Prefer adaptive_q if exists, else training q dir
+            q_dir = str(self.runs_dir / f"adaptive_q_seed_{self.train_seeds[0]}")
+            if not (Path(q_dir) / "config.json").exists():
+                # fallback: use training q dir if you have it
+                q_dir = str(self._q_model_dir(self.train_seeds[0]))
+
+            controller = RLGoalApproachController.load(
+                q_dir,
+                agent_id=f"{mesh_name}_sleep_qnorm",
+                config={**self.rl_config, "mode": "adaptive"},
+            )
+
+            # 2) Build per-level state pools (current mesh only)
+            # We'll mix: (start_states oversampled) + sample_states
+            current_mesh_ratio = float(qnorm_cfg.get("current_mesh_ratio", 0.7))
+            start_oversample = int(qnorm_cfg.get("start_oversample", 3))
+            max_total = int(qnorm_cfg.get("max_states_total", 50000))
+
+            by_level = sleep_q_norm.get("by_level", {})
+
+            # We'll rebuild all stores using data from selected levels only
+            # If you want all levels, replace qnorm_levels with by_level.keys()
+            use_levels = qnorm_levels
+
+            # Accumulators per store
+            cur_free = []
+            cur_surface = []
+            cur_bypass = []
+
+            for lvl in use_levels:
+                lvl_data = by_level.get(lvl, {})
+                start_states = lvl_data.get("start", {}).get("states", [])
+                sample = lvl_data.get("sample", {})
+
+                # oversample start states to emphasize early-episode proximity
+                if start_states:
+                    for _ in range(max(1, start_oversample)):
+                        # classify by on_object + same_side in state
+                        for s in start_states:
+                            on_obj = float(s[11]) > 0.5
+                            ss = bool(float(s[27]) > 0.5) if len(s) > 27 else True
+                            if not on_obj:
+                                cur_free.append(s)
+                            else:
+                                if ss:
+                                    cur_surface.append(s)
+                                else:
+                                    cur_bypass.append(s)
+
+                # add sparse samples already split
+                cur_free.extend(sample.get("free", []))
+                cur_surface.extend(sample.get("surface", []))
+                cur_bypass.extend(sample.get("bypass", []))
+
+            # cap current pools
+            cur_free = _cap_list(cur_free, max_total)
+            cur_surface = _cap_list(cur_surface, max_total)
+            cur_bypass = _cap_list(cur_bypass, max_total)
+
+            # 3) Replay pool from primitive-trained Q-stores (base model)
+            rep_free, rep_surface, rep_bypass = [], [], []
+            try:
+                from .hnsw_state_store import HNSWStateStore
+
+                base_q_dir = str(self._q_model_dir(self.train_seeds[0]))
+                logger.info("Sleep Q-norm: loading replay states from base Q-dir: %s", base_q_dir)
+
+                # Load free store
+                base_free = HNSWStateStore.load_with_index(
+                    os.path.join(base_q_dir, "q_store_free"),
+                    extra_cfg={**self.rl_config, "feature_weights": self.rl_config.get("feature_weights_free", None)},
+                    name="free_replay",
+                )
+                rep_free = [p.raw_state.astype(np.float32, copy=False) for p in base_free.points.values()]
+
+                # Load surface store
+                base_surface = HNSWStateStore.load_with_index(
+                    os.path.join(base_q_dir, "q_store_surface"),
+                    extra_cfg={**self.rl_config, "feature_weights": self.rl_config.get("feature_weights_surface", None)},
+                    name="surface_replay",
+                )
+                rep_surface = [p.raw_state.astype(np.float32, copy=False) for p in base_surface.points.values()]
+
+                # Load bypass store if exists
+                bypass_path = os.path.join(base_q_dir, "q_store_surface_bypass")
+                if Path(bypass_path + ".npz").exists():
+                    base_bypass = HNSWStateStore.load_with_index(
+                        bypass_path,
+                        extra_cfg={**self.rl_config, "feature_weights": self.rl_config.get("feature_weights_bypass", None)},
+                        name="bypass_replay",
+                    )
+                    rep_bypass = [p.raw_state.astype(np.float32, copy=False) for p in base_bypass.points.values()]
+                else:
+                    rep_bypass = []
+
+                # Cap replay sizes (avoid huge memory)
+                replay_cap = int(qnorm_cfg.get("replay_per_store", max_total))
+                if len(rep_free) > replay_cap:
+                    idx = np.random.choice(len(rep_free), replay_cap, replace=False)
+                    rep_free = [rep_free[i] for i in idx]
+                if len(rep_surface) > replay_cap:
+                    idx = np.random.choice(len(rep_surface), replay_cap, replace=False)
+                    rep_surface = [rep_surface[i] for i in idx]
+                if len(rep_bypass) > replay_cap:
+                    idx = np.random.choice(len(rep_bypass), replay_cap, replace=False)
+                    rep_bypass = [rep_bypass[i] for i in idx]
+
+                logger.info(
+                    "Sleep Q-norm: replay states loaded: free=%d, surface=%d, bypass=%d",
+                    len(rep_free), len(rep_surface), len(rep_bypass),
+                )
+
+            except Exception as exc:
+                logger.warning("Sleep Q-norm: could not load replay states: %s", exc)
+                rep_free, rep_surface, rep_bypass = [], [], []
+
+            # 4) Sample mixed pools
+            mix_free = _sample_mix(cur_free, rep_free, max_total, current_mesh_ratio)
+            mix_surface = _sample_mix(cur_surface, rep_surface, max_total, current_mesh_ratio)
+            mix_bypass = _sample_mix(cur_bypass, rep_bypass, max_total, current_mesh_ratio)
+
+            # 5) Recompute mean/std + rebuild index for each store
+            def _apply_norm_and_rebuild(store, states_list, store_label: str):
+                if not states_list:
+                    logger.warning("Sleep Q-norm: no states for %s, skip", store_label)
+                    return
+
+                arr = _to_np(states_list)
+                mean, std = _compute_mean_std(arr, min_std=store.norm_min_std)
+
+                store._state_mean = mean
+                store._state_std = std
+
+                store._norm_frozen = True
+                store._freeze_done = True
+
+                # Rebuild index with new normalization
+                store._rebuild_index_with_renorm()
+
+                logger.info(
+                    "Sleep Q-norm rebuilt %s: n_states=%d, mean_std_ok",
+                    store_label, len(states_list),
+                )
+
+            _apply_norm_and_rebuild(controller.q_store_free, mix_free, "free")
+            _apply_norm_and_rebuild(controller.q_store_surface, mix_surface, "surface")
+            _apply_norm_and_rebuild(controller.q_store_surface_bypass, mix_bypass, "surface_bypass")
+
+            # 6) Save controller back
+            controller.save(q_dir)
+            logger.info("Sleep Q-norm: controller saved to %s", q_dir)
+
+
+        # ═══ Load sleep-SAC ═══
         if not trails_path.exists():
             logger.warning("Sleep skipped: no trails file at %s", trails_path)
             return
@@ -3706,6 +4062,7 @@ class RLGoalApproachExperiment:
             "Sleep complete for %s: %d levels consolidated, report at %s",
             mesh_name, len(levels_to_consolidate), report_path,
         )
+
     # ══════════════════════════════════════════════════════
     # YCB Evaluation
     # ══════════════════════════════════════════════════════

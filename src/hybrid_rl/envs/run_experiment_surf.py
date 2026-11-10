@@ -288,6 +288,7 @@ def main(argv: list[str] | None = None) -> int:
         ("do_ycb_eval", "YCB Evaluation"),
         ("do_ycb_mujoco_eval", "YCB MuJoCo Evaluation"),
         ("do_ycb_mujoco_adaptive", "YCB MuJoCo Adaptive"),
+        ("do_sleep", "Q SAC adaptive offline training"),
     ]
     active = [
         name for key, name in stages

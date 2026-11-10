@@ -283,26 +283,18 @@ class Arbitrator:
         self._calibration_episodes_per_source = 10
         self._level_calibration_done: Dict[int, bool] = {}
 
-        # Q hysteresis (NEW)
-        # Рекомендуемые значения порогов (старт)
-        #- `q_reliable_threshold_surface` = 0.2 (как у тебя)
-        #- `self._q_enter_threshold` = **0.65**
-        #- `self._q_exit_threshold` = **0.35**
-        #- `self._q_streak_to_enter` = **3**
-        #- `self._q_streak_to_exit` = **2**
-        #- `self._q_instant_threshold` = **0.90** (если слишком редко срабатывает — 0.85; если слишком часто — 0.95)
-        #Почему это работает: `overall` у тебя ограничен 0.95, так что 0.90 — это реально “очень уверенно”.
+        # Q hysteresis (NEW)ы
         # Q confidence calibrated thresholds
         self._q_reliable_threshold_surface = 0.2
         self._q_reliable_threshold_free = 0.2
         self._q_mode_active = False          # currently trusting Q for crawl
         self._q_reliable_streak = 0          # consecutive reliable steps
-        self._q_enter_threshold = 0.65       # q_conf needed to enter Q-mode
-        self._q_exit_threshold = 0.35        # q_conf below -> exit Q-mode
-        self._q_streak_to_enter = 3          # need N consecutive steps to enter
+        self._q_enter_threshold = 0.5       # q_conf needed to enter Q-mode
+        self._q_exit_threshold = 0.3        # q_conf below -> exit Q-mode
+        self._q_streak_to_enter = 2          # need N consecutive steps to enter
         self._q_streak_to_exit = 2           # need N consecutive low steps to exit
         self._q_unreliable_streak = 0
-        self._q_instant_threshold = 0.90  # можно 0.85..0.95
+        self._q_instant_threshold = 0.80  # можно 0.85..0.95
 
     def _needs_calibration(self, level: int) -> Optional[str]:
         """Check if SAC needs calibration on this level.
@@ -650,6 +642,21 @@ class Arbitrator:
             else self._q_reliable_threshold_free
         )
 
+        # Optional: boost confidence in near-tie states with high value
+        # (prevents low top2_spread from forcing heuristic when both actions are good)
+        if q_type == 0 and q_values is not None:
+            valid = q_values > -1e8
+            qv = q_values[valid]
+            if qv.size >= 2:
+                q_sorted = np.sort(qv)[::-1]
+                q1 = float(q_sorted[0])
+                q2 = float(q_sorted[1])
+                t2s = q1 - q2
+
+                # "near-tie but both good"
+                if (confidence_info.get("proximity", 0.0) >= 0.2) and (t2s <= 0.15) and (q2 >= 0.5):
+                    q_confidence = max(q_confidence, 0.55)
+                
         # --- Hysteresis gate for trusting Q (only q_confidence) ---
         # 0) Hard floor: below old reliability threshold -> treat as unreliable
         if q_confidence < q_reliable_threshold:

@@ -522,6 +522,14 @@ sleep_config:
   bc_ratio: 0.2
   elite_ratio: 0.1
 
+sleep_q_norm:
+  enabled: true
+  min_start_states: 500
+  prox_median_threshold: 0.15
+  current_mesh_ratio: 0.7      # доля текущего меша в смеси
+  start_oversample: 3          # насколько сильнее весим стартовые состояния
+  max_states_total: 50000      # сколько states использовать на нормализацию
+
 ycb_config:
   # MuJoCo data: textured.obj + texture_map.png + metadata.json
   mujoco_data_path: ~/Downloads/tbp/data/mujoco/objects/ycb
