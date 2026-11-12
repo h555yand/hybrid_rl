@@ -294,7 +294,7 @@ class Arbitrator:
         self._q_streak_to_enter = 2          # need N consecutive steps to enter
         self._q_streak_to_exit = 2           # need N consecutive low steps to exit
         self._q_unreliable_streak = 0
-        self._q_instant_threshold = 0.80  # можно 0.85..0.95
+        self._q_instant_threshold = 0.70  # можно 0.85..0.95
 
     def _needs_calibration(self, level: int) -> Optional[str]:
         """Check if SAC needs calibration on this level.
@@ -597,7 +597,7 @@ class Arbitrator:
             ), None, None
 
         # ═══ Get proposals ═══
-        q_action, q_confidence, q_spread, q_recency, q_best_norm, q_values, confidence_info = (
+        q_action, q_confidence, q_spread, q_recency, q_best_norm, q2_z, q_values, confidence_info = (
             self._get_q_action(state, sensor_data)
         )
         q_type = ExperienceExtractor.DISCRETE_TO_PSAC[q_action][0]
@@ -654,9 +654,15 @@ class Arbitrator:
                 t2s = q1 - q2
 
                 # "near-tie but both good"
-                if (confidence_info.get("proximity", 0.0) >= 0.2) and (t2s <= 0.15) and (q2 >= 0.5):
-                    q_confidence = max(q_confidence, 0.55)
-                
+                prox_ok = confidence_info.get("proximity", 0.0) >= 0.2
+                tie_thr = float(self.controller.config.get("tie_t2s_threshold", 0.25))
+                z_thr = float(self.controller.config.get("tie_q2_z_threshold", 0.0))
+                boost_to = float(self.controller.config.get("tie_confidence_boost", 0.55))
+
+                # "near-tie but both good" (scale-invariant via q2_z)
+                if prox_ok and (t2s <= tie_thr) and (q2_z is not None) and (q2_z >= z_thr):
+                    q_confidence = max(float(q_confidence), boost_to)      
+
         # --- Hysteresis gate for trusting Q (only q_confidence) ---
         # 0) Hard floor: below old reliability threshold -> treat as unreliable
         if q_confidence < q_reliable_threshold:
@@ -1012,7 +1018,7 @@ class Arbitrator:
             running_best = self._running_best_q_surface
 
         if store.next_id == 0:
-            return 0, 0.0, 0.0, 0.5, 0.0, None, None
+            return 0, 0.0, 0.0, 0.5, 0.0, None, None, None
 
         q_values, confidence_info = (
             store.get_q_values_with_confidence(state)
@@ -1036,6 +1042,18 @@ class Arbitrator:
         else:
             best_q_norm = 0.0
 
+        # NEW: q2_z for near-tie logic (scale-invariant "second-best is good")
+        q2_z = None
+        valid = q_values > -1e8
+        qv = q_values[valid]
+        if qv.size >= 2:
+            q_sorted = np.sort(qv)[::-1]
+            q2 = float(q_sorted[1])
+            if running_stats.is_warmed_up:
+                q2_z = float(running_stats.normalize_value(q2))
+            else:
+                q2_z = None
+                
         # ═══ Q diagnostics collection ═══
         self._q_diag_confidence_sum += q_confidence
         self._q_diag_confidence_count += 1
@@ -1090,8 +1108,8 @@ class Arbitrator:
         probs = exp_v / exp_v.sum()
         q_action = int(np.random.choice(len(probs), p=probs))
 
-        return q_action, q_confidence, q_spread, recency, best_q_norm, q_values, confidence_info
-
+        return q_action, q_confidence, q_spread, recency, best_q_norm, q2_z, q_values, confidence_info
+    
     def _get_q_action_old(self, state):
         store = self.controller._select_store(state)
         running_stats = (

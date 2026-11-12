@@ -857,7 +857,7 @@ class RLGoalApproachController:
         next_store = self._select_store(state, sensor_data)
 
         if self._prev_state is not None:
-            reward, done, termination_reason = self._compute_reward(
+            reward, done, termination_reason, rinfo = self._compute_reward(
                 state, self._prev_state, self._last_action, collision,
                 sensor_data=sensor_data,
                 prev_sensor_data=self._prev_sensor_data,
@@ -871,21 +871,51 @@ class RLGoalApproachController:
                     "reward": float(reward),
                     "path_blocked": sensor_data.get("path_blocked", False),
                     "same_side": sensor_data.get("same_side", True),
-                     "movement_efficiency": self._compute_movement_efficiency(window=20),  # NEW
+                    "movement_efficiency": self._compute_movement_efficiency(window=20),
+                    "rinfo": rinfo,
+                    "distance_progress": float(rinfo.get("distance_progress", 0.0)),
+                    "rim_progress": float(rinfo.get("rim_progress", 0.0)),
+                    "used_rim_shaping": bool(rinfo.get("used_rim_shaping", False)),
                 }
             )
             if self.is_training:
                 if done:
                     td_target = reward
                 else:
-                    next_q = next_store.get_q_values(state)
-                    td_target = reward + self.gamma * np.max(next_q)
+                    next_q, next_conf = next_store.get_q_values_with_confidence(state)
+                    next_q = self.apply_action_mask(next_q, state)
+                    max_next_q = float(np.max(next_q))
+                    # NEW: cap bootstrap to prevent Q blow-up
+                    q_cap = float(self.config.get("bootstrap_q_cap", 0.0) or 0.0)
+                    if q_cap > 0.0:
+                        max_next_q = float(np.clip(max_next_q, -q_cap, q_cap))
+
+                    prox = float(next_conf.get("proximity", 0.0)) if next_conf else 0.0
+                    # proximity gate like in confidence: prox/p0 clipped
+                    p0 = float(self.config.get("bootstrap_proximity_p0", 0.3))
+                    prox_gate = float(np.clip(prox / max(p0, 1e-8), 0.0, 1.0))
+
+                    progress = self._progress_for_insertion(rinfo)
+                    prog_gate = 1.0 if progress > float(self.config.get("bootstrap_progress_eps", 0.0)) else 0.0
+
+                    beta = prox_gate * prog_gate
+                    beta = float(np.clip(beta, 0.0, 1.0))
+
+                    td_target = reward + self.gamma * beta * max_next_q
+
+                # check progress for allow_insert
+                progress = self._progress_for_insertion(rinfo)
+                eps_prog = float(self.config.get("insert_progress_eps", 0.05))  # мм
+                allow_insert = (progress > eps_prog) and (collision is None)
+                # for training mode by heuristics do not check
+                # allow_insert = True
 
                 prev_store.update_q_value(
                     self._prev_state,
                     self._last_action,
                     td_target,
                     self._get_learning_rate(),
+                    count_visit=allow_insert
                 )
 
             if done:
@@ -1875,7 +1905,7 @@ class RLGoalApproachController:
         sensor_data: Optional[Dict] = None,
         prev_sensor_data: Optional[Dict] = None,
         current_pose: Optional[np.ndarray] = None,
-    ) -> Tuple[float, bool, Optional[str]]:
+    ) -> Tuple[float, bool, Optional[str], Dict[str, Any]]:
         """Common reward function for Q-store and SAC.
 
         Same logic as _compute_reward but accepts
@@ -1921,6 +1951,10 @@ class RLGoalApproachController:
         # ═══ 1. Progress ═══
         progress_raw = prev_distance - distance
         progress = progress_raw
+
+        distance_progress = float(prev_distance - distance)
+        rim_progress = 0.0
+        used_rim_shaping = False
 
         if (
             on_object < 0.5
@@ -1972,6 +2006,8 @@ class RLGoalApproachController:
                             # start with 1.0..3.0, tune later
                             RIM_SCALE = float(cfg.get("reward_rim_progress_scale", 2.0))
                             reward += (rim_progress / max(surface_step, 1e-6)) * RIM_SCALE
+
+                            used_rim_shaping = True
 
                             # optional: small penalty for moving away from rim
                             if rim_progress < 0:
@@ -2242,7 +2278,18 @@ class RLGoalApproachController:
             height_axis = int(np.argmax(np.abs(up_dir)))
             self._prev_pose_height = float(current_pose[height_axis])
 
-        return reward, done, termination_reason
+        info = {
+            "phase": phase,
+            "distance_progress": float(distance_progress),
+            "rim_progress": float(rim_progress),
+            "used_rim_shaping": bool(used_rim_shaping),
+            "same_side": bool(curr_same_side),
+            "path_blocked": bool(curr_path_blocked),
+            "on_object": bool(on_object > 0.5),
+            "depth": float(sensor_data.get("depth", 100.0)) if sensor_data is not None else None,
+        }
+
+        return reward, done, termination_reason, info
     
     def _compute_reward(
         self, state, prev_state, action,
@@ -2262,7 +2309,7 @@ class RLGoalApproachController:
             .DISCRETE_TO_PSAC[action][0]
         )
 
-        reward, done, termination_reason = (
+        reward, done, termination_reason, info = (
             self.compute_common_reward(
                 state=state,
                 prev_state=prev_state,
@@ -2292,7 +2339,7 @@ class RLGoalApproachController:
                 + 1
             )
 
-        return reward, done, termination_reason
+        return reward, done, termination_reason, info
     
     def _subgoal_potential(self, state: np.ndarray) -> float:
         """Potential function for subgoal reward shaping.
@@ -6769,7 +6816,7 @@ class RLGoalApproachController:
 
     def update_only(self, current_pose, sensor_data, action_index):
         if self._current_goal is None:
-            return None, True
+            return None, True, None
 
         self._steps += 1
         self._total_steps += 1
@@ -6779,13 +6826,15 @@ class RLGoalApproachController:
 
         state = self._compute_state(current_pose, sensor_data)
         collision = self._detect_collision(sensor_data)
+
         done = False
+        td_debug = None
 
         if self._prev_state is not None:
             prev_store = self._select_store(self._prev_state, self._prev_sensor_data)
             next_store = self._select_store(state, sensor_data)
 
-            reward, done, termination_reason = self._compute_reward(
+            reward, done, termination_reason, rinfo = self._compute_reward(
                 state, self._prev_state, self._last_action, collision,
                 sensor_data=sensor_data,
                 prev_sensor_data=self._prev_sensor_data,
@@ -6800,21 +6849,67 @@ class RLGoalApproachController:
                     "path_blocked": sensor_data.get("path_blocked", False),
                     "same_side": sensor_data.get("same_side", True),
                     "movement_efficiency": self._compute_movement_efficiency(window=20),
+                    "rinfo": rinfo,
+                    "distance_progress": float(rinfo.get("distance_progress", 0.0)),
+                    "rim_progress": float(rinfo.get("rim_progress", 0.0)),
+                    "used_rim_shaping": bool(rinfo.get("used_rim_shaping", False)),
                 }
             )
 
             if self.is_training:
+                progress = self._progress_for_insertion(rinfo)
+
                 if done:
                     td_target = reward
+                    beta = 0
+                    max_next_q = 0
+                    prox_gate = 0
                 else:
-                    next_q = next_store.get_q_values(state)
-                    td_target = reward + self.gamma * np.max(next_q)
+                    next_q, next_conf = next_store.get_q_values_with_confidence(state)
+                    next_q = self.apply_action_mask(next_q, state)
+                    max_next_q = float(np.max(next_q))
+                    # NEW: cap bootstrap to prevent Q blow-up
+                    q_cap = float(self.config.get("bootstrap_q_cap", 0.0) or 0.0)
+                    if q_cap > 0.0:
+                        max_next_q = float(np.clip(max_next_q, -q_cap, q_cap))
+
+                    prox = float(next_conf.get("proximity", 0.0)) if next_conf else 0.0
+                    # proximity gate like in confidence: prox/p0 clipped
+                    p0 = float(self.config.get("bootstrap_proximity_p0", 0.3))
+                    prox_gate = float(np.clip(prox / max(p0, 1e-8), 0.0, 1.0))
+
+                    prog_gate = 1.0 if progress > float(self.config.get("bootstrap_progress_eps", 0.0)) else 0.0
+
+                    beta = prox_gate * prog_gate
+                    beta = float(np.clip(beta, 0.0, 1.0))
+
+                    td_target = reward + self.gamma * beta * max_next_q
+
+                # check progress for allow_insert
+                eps_prog = float(self.config.get("insert_progress_eps", 0.05))  # мм
+                allow_insert = (progress > eps_prog) and (collision is None)
 
                 prev_store.update_q_value(
                     self._prev_state,
                     self._last_action,
                     td_target,
                     self._get_learning_rate(),
+                    count_visit=allow_insert
+                )
+
+                # td_debug for runner/visualizer
+                td_debug = (
+                    f"[allow_insert={bool(allow_insert)}"
+                    f"|beta={float(beta):.2f}"
+                    f"|reward={float(reward):.2f}"
+                    f"|distance_progress={float(rinfo.get("distance_progress", 0.0)) if rinfo else 0.0:.2f}"
+                    f"|rim_progress={float(rinfo.get("rim_progress", 0.0)) if rinfo else 0.0}"
+                    f"|used_rim_shaping={bool(rinfo.get("used_rim_shaping", False)) if rinfo else False}"
+                    f"|progress_used={float(progress):.2f}"
+                    f"|eps_prog={float(eps_prog):.2f}"
+                    f"|prox_gate={float(prox_gate):.2f}"
+                    f"|max_next_q={float(max_next_q):.2f}"
+                    f"|td_target={float(td_target):.2f} ]"
                 )
 
             if done:
@@ -6825,7 +6920,7 @@ class RLGoalApproachController:
                         self._episode_transitions.copy()
                     )
                 self._on_episode_done(state, termination_reason)
-                return state, True
+                return state, True, td_debug
 
         self._prev_state = state
         self._prev_sensor_data = sensor_data
@@ -6836,7 +6931,14 @@ class RLGoalApproachController:
             self.epsilon = self.eval_epsilon
             self.strategic_epsilon = self.config.get("strategic_eval_epsilon", 0.3)
 
-        return state, False
+        return state, False, td_debug
+
+    def _progress_for_insertion(self, rinfo: dict) -> float:
+        if not rinfo:
+            return 0.0
+        if rinfo.get("used_rim_shaping", False):
+            return float(rinfo.get("rim_progress", 0.0))
+        return float(rinfo.get("distance_progress", 0.0))
 
     # ══════════════════════════════════════════════════════════
     # PERSISTENCE

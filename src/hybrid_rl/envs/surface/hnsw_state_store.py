@@ -106,6 +106,7 @@ class HNSWStateStore:
         self._calibration_interval = 500  # recalculate every N steps
 
         self.min_weight_threshold = self.config["min_weight_threshold"]
+        self.td_error_clip = float(self.config.get("td_error_clip", 0.0) or 0.0)
 
         # HNSW index
         self.norm_warmup_steps = int(self.config.get("norm_warmup_steps", 5000))
@@ -765,9 +766,16 @@ class HNSWStateStore:
             and distances[nearest_valid_idx] < self.insert_threshold ** 2
         ):
             point = self.points[labels[nearest_valid_idx]]
-            point.q_values[action] += alpha * (
-                td_target - point.q_values[action]
-            )
+
+            q_sa = float(point.q_values[action])
+            td_error = float(td_target - q_sa)
+
+            # NEW: TD-error clipping for stability
+            if self.td_error_clip and self.td_error_clip > 0.0:
+                td_error = float(np.clip(td_error, -self.td_error_clip, self.td_error_clip))
+
+            point.q_values[action] = q_sa + alpha * td_error
+
             if count_visit:
                 point.visit_count += 1
             point.last_step = self.global_step
@@ -785,7 +793,12 @@ class HNSWStateStore:
         q_init = np.zeros(self.num_actions)
         interpolated_q = self._interpolate_q_init(norm_state)
         q_init[action] = interpolated_q[action]
-        q_init[action] += alpha * (td_target - q_init[action])
+        td_error = float(td_target - float(q_init[action]))
+
+        if self.td_error_clip and self.td_error_clip > 0.0:
+            td_error = float(np.clip(td_error, -self.td_error_clip, self.td_error_clip))
+
+        q_init[action] = float(q_init[action]) + alpha * td_error
 
         point_id = self.next_id
 
@@ -1289,6 +1302,12 @@ class HNSWStateStore:
             filepath: Base path. Extensions are appended automatically.
                       e.g. "model/store" → "model/store.npz" + "model/store.hnsw"
         """
+        if self.next_id == 0:
+            logger.info(
+                f"NO DATA to save HNSW: self.next_id = {self.next_id}"
+            )
+            return
+
         base = filepath[:-4] if filepath.endswith(".npz") else filepath
         npz_path = base + ".npz"
         hnsw_path = base + ".hnsw"

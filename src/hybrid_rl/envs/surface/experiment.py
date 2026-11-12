@@ -2523,6 +2523,7 @@ class RLGoalApproachExperiment:
         # ═══ Q-store diagnostics: initial sizes ═══
         q_store_initial_free = len(controller.q_store_free.points)
         q_store_initial_surface = len(controller.q_store_surface.points)
+        q_store_initial_bypass = len(controller.q_store_surface_bypass.points)
         logger.info(
             "Q-store initial: free=%d, surface=%d",
             q_store_initial_free, q_store_initial_surface,
@@ -2818,7 +2819,7 @@ class RLGoalApproachExperiment:
 
                 # Q-store learns from discrete action
                 pose_after = online_env.get_pose()
-                _, done = controller.update_only(
+                _, done, td_debug = controller.update_only(
                     pose_after, sensor_after, discrete_idx
                 )
 
@@ -2895,13 +2896,14 @@ class RLGoalApproachExperiment:
 
                 action_full = (
                     f"{act_full} "
-                    f"{state_debug} "
+                    f"| {state_debug} "
                     f"| {source} "
                     f"|mj=[{env_pos[0]:.4f},"
                     f"{env_pos[1]:.4f},"
                     f"{env_pos[2]:.4f}]"
-                    f"|depth={new_sensor.get('depth', 0):.1f}"
-                    f"|on={int(new_sensor.get('on_object', False))}"
+                    f" |depth={new_sensor.get('depth', 0):.1f}"
+                    f" |on={int(new_sensor.get('on_object', False))}"
+                    f" |td_debug={td_debug} "
                 )
                 action_explanations.append(action_full)
 
@@ -3109,25 +3111,15 @@ class RLGoalApproachExperiment:
                 q_store_diagnostics = {
                     "q_store_free_size": len(controller.q_store_free.points),
                     "q_store_surface_size": len(controller.q_store_surface.points),
+                    "q_store_bypass_size": len(controller.q_store_surface_bypass.points),
                     "q_store_free_growth": len(controller.q_store_free.points) - q_store_initial_free,
                     "q_store_surface_growth": len(controller.q_store_surface.points) - q_store_initial_surface,
-                    # Running Q stats
-                    "running_q_free_count": manager.arbitrator._running_q_stats_free.count,
-                    "running_q_free_warmed": manager.arbitrator._running_q_stats_free.is_warmed_up,
-                    "running_q_free_mean": round(manager.arbitrator._running_q_stats_free.mean, 4),
-                    "running_q_free_std": round(manager.arbitrator._running_q_stats_free.std, 4),
-                    "running_q_surface_count": manager.arbitrator._running_q_stats_surface.count,
-                    "running_q_surface_warmed": manager.arbitrator._running_q_stats_surface.is_warmed_up,
-                    "running_q_surface_mean": round(manager.arbitrator._running_q_stats_surface.mean, 4),
-                    "running_q_surface_std": round(manager.arbitrator._running_q_stats_surface.std, 4),
-                    # Best Q norm
-                    "running_best_q_free_warmed": manager.arbitrator._running_best_q_free.is_warmed_up,
-                    "running_best_q_free_mean": round(manager.arbitrator._running_best_q_free.mean, 4),
-                    "running_best_q_surface_warmed": manager.arbitrator._running_best_q_surface.is_warmed_up,
-                    "running_best_q_surface_mean": round(manager.arbitrator._running_best_q_surface.mean, 4),
-                    # Thresholds
-                    "q_reliable_threshold_free": manager.arbitrator._q_reliable_threshold_free,
-                    "q_reliable_threshold_surface": manager.arbitrator._q_reliable_threshold_surface,
+                    "q_store_bypass_growth": len(controller.q_store_surface_bypass.points) - q_store_initial_bypass,
+                    "store_stats": {
+                        "free": controller.q_store_free.get_stats(),
+                        "surface": controller.q_store_surface.get_stats(),
+                        "bypass": controller.q_store_surface_bypass.get_stats(),
+                    },
                     # Per-level from arbitrator
                     "per_level": arb_stats.get("q_diagnostics_per_level", {}),
                 }
@@ -3181,10 +3173,12 @@ class RLGoalApproachExperiment:
         # ═══ Final Q-store diagnostics ═══
         q_final_free = len(controller.q_store_free.points)
         q_final_surface = len(controller.q_store_surface.points)
+        q_final_bypass = len(controller.q_store_surface_bypass.points)
         logger.info(
-            "Q-store final: free=%d (+%d), surface=%d (+%d)",
+            "Q-store final: free=%d (+%d), surface=%d (+%d), bypass=%d (+%d)",
             q_final_free, q_final_free - q_store_initial_free,
             q_final_surface, q_final_surface - q_store_initial_surface,
+            q_final_bypass, q_final_bypass - q_store_initial_bypass,
         )
         # ═══ Save models ═══
         controller.save(adapt_q_dir)
@@ -3274,8 +3268,10 @@ class RLGoalApproachExperiment:
             "q_store_final": {
                 "free_size": q_final_free,
                 "surface_size": q_final_surface,
+                "bypass_size": q_final_bypass,
                 "free_growth": q_final_free - q_store_initial_free,
                 "surface_growth": q_final_surface - q_store_initial_surface,
+                "bypass_growth": q_final_bypass - q_store_initial_bypass,
             },
         }
 

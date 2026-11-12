@@ -1,7 +1,7 @@
 seed: 42
 # Visualization: null | text | pictures | video
-visualise: video
-regenerate_scripts: false
+visualise: text
+regenerate_scripts: true
 do_train: false
 do_eval: false
 do_heur_eval: false
@@ -40,7 +40,7 @@ curriculum_filters:
 training_stages:
   # ── Phase 1: Primitives ──
   - mesh: cube
-    episodes: 1000
+    episodes: 100
     epsilon_start: 1.0
     epsilon_min: 0.95
     load_mode: null
@@ -285,7 +285,7 @@ eval_meshes:
   #- mesh: cup
   #  pool_seed: 57
 
-eval_episodes_per_level: 10
+eval_episodes_per_level: 100
 
 # BC config (not used in Q-only pipeline)
 # ═══ BC data collection ═══
@@ -426,6 +426,16 @@ rl_config:
   adaptive_sigma: true
   insert_threshold: 0.50
   auto_calibrate: false
+
+  # insert update Q
+  insert_progress_eps: 0.05          # mm
+  bootstrap_progress_eps: 0.0        # mm
+  bootstrap_proximity_p0: 0.3
+  bootstrap_q_cap: 10.0
+  td_error_clip: 10.0          # клип TD-ошибки для стабилизации Q
+  tie_q2_z_threshold: 0.0      # насколько "q2 высокий" (z-score)
+  tie_t2s_threshold: 0.25      # насколько "почти ничья" по Q (в сырых Q-единицах, после стабилизации)
+  tie_confidence_boost: 0.55   # чему поднимать q_confidence в этом кейсе
 
   # Rewards
   reward_goal_reached: 30.0
