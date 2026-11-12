@@ -53,7 +53,7 @@ class AdaptiveTrainingManager:
         config: Dict[str, Any],
         runs_dir: str,
         mesh_path: str,
-        mastered_threshold: float = 0.95,
+        mastered_threshold: float = 0.90,
         offline_threshold: float = 0.40,
         monitor_window: int = 100,
         online_sac_update_every: int = 100,
@@ -373,6 +373,45 @@ class AdaptiveTrainingManager:
         )
 
     def decide_mode(self) -> str:
+        level_history_len = 50
+        current_level = self.arbitrator._current_level
+        level_history = self._level_success_history.get(current_level)
+
+        if level_history is None or len(level_history) < level_history_len:
+            return "online"
+
+        # --- Get per-level tracks and eval counts ---
+        q_results = self.arbitrator._level_q_results[current_level]
+        h_results = self.arbitrator._level_heuristic_results[current_level]
+        sac_results = self.arbitrator._level_sac_results[current_level]
+        blend_results = self.arbitrator._level_blend_results[current_level]
+
+        q_track = self.arbitrator._get_track(q_results)
+        h_track = self.arbitrator._get_track(h_results)
+        sac_track = self.arbitrator._get_track(sac_results)
+        blend_track = self.arbitrator._get_track(blend_results)
+        best_ml_track = max(q_track, sac_track, blend_track)
+        h_track = max(h_track, 0.1)
+
+        # --- Mastered hysteresis based on Q only ---
+        enter_thr = float(self.mastered_threshold)            # e.g. 0.95
+        exit_thr = float(getattr(self, "mastered_exit_threshold", enter_thr - 0.05))  # e.g. 0.90
+
+        min_q_evals = int(getattr(self, "mastered_min_q_evals", level_history_len))  # recommend 30-50
+        q_evals = len(q_results)
+
+        if self.mode == "mastered":
+            # stay mastered while Q remains good
+            if q_evals >= min_q_evals and q_track >= exit_thr:
+                return "mastered"
+            # else fall through
+        else:
+            if q_evals >= min_q_evals and q_track >= enter_thr:
+                return "mastered"
+
+        return "online"
+
+    def decide_mode_old(self) -> str:
         current_level = self.arbitrator._current_level
         level_history = self._level_success_history.get(current_level)
         if level_history is None or len(level_history) < self.monitor_window:
@@ -455,9 +494,12 @@ class AdaptiveTrainingManager:
             self.controller.mode = "adaptive"
             self.controller.epsilon = 0.02
             self.controller.strategic_epsilon = 0.02
+            # NEW: freeze learning
+            self.controller.learning_enabled = False
             return
 
         if self.mode == "online":
+            self.controller.learning_enabled = True
             self.controller.mode = "adaptive"
             eps = self._get_adaptive_epsilon()
             self.controller.epsilon = eps
@@ -468,6 +510,7 @@ class AdaptiveTrainingManager:
             return
 
         if self.mode == "offline":
+            self.controller.learning_enabled = True
             if not self.enable_offline_sac_retrain:
                 logger.info("OFFLINE SAC disabled (policy-only mode)")
             else:

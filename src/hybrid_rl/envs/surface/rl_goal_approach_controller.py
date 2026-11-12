@@ -376,6 +376,7 @@ class RLGoalApproachController:
         self._episode_steps_history: List[int] = []
         self._success_steps_history: List[int] = []
         self._prev_pose_height = None
+        self.learning_enabled = True
 
         logger.info(
             f"RLGoalApproachController initialized: "
@@ -878,7 +879,7 @@ class RLGoalApproachController:
                     "used_rim_shaping": bool(rinfo.get("used_rim_shaping", False)),
                 }
             )
-            if self.is_training:
+            if self.is_training and getattr(self, "learning_enabled", True):
                 if done:
                     td_target = reward
                 else:
@@ -6856,7 +6857,7 @@ class RLGoalApproachController:
                 }
             )
 
-            if self.is_training:
+            if self.is_training and getattr(self, "learning_enabled", True):
                 progress = self._progress_for_insertion(rinfo)
 
                 if done:
