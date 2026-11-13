@@ -53,7 +53,7 @@ class AdaptiveTrainingManager:
         config: Dict[str, Any],
         runs_dir: str,
         mesh_path: str,
-        mastered_threshold: float = 0.90,
+        mastered_threshold: float = 0.95,
         offline_threshold: float = 0.40,
         monitor_window: int = 100,
         online_sac_update_every: int = 100,

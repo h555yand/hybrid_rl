@@ -908,15 +908,16 @@ class RLGoalApproachController:
                 progress = self._progress_for_insertion(rinfo)
                 eps_prog = float(self.config.get("insert_progress_eps", 0.05))  # мм
                 allow_insert = (progress > eps_prog) and (collision is None)
-                # for training mode by heuristics do not check
-                # allow_insert = True
 
                 prev_store.update_q_value(
                     self._prev_state,
                     self._last_action,
                     td_target,
                     self._get_learning_rate(),
-                    count_visit=allow_insert
+                    update_q=True,
+                    allow_insert=allow_insert,
+                    count_visit=allow_insert,
+                    touch_recency=True,
                 )
 
             if done:
@@ -2530,7 +2531,10 @@ class RLGoalApproachController:
                 tr["action"],
                 g_return,
                 lr,
+                update_q=True,
+                allow_insert=False,
                 count_visit=False,
+                touch_recency=True,
             )
 
         # ═══ Critical Action Bonus — REMOVED ═══
@@ -6815,7 +6819,7 @@ class RLGoalApproachController:
             }
         return stats
 
-    def update_only(self, current_pose, sensor_data, action_index):
+    def update_only(self, current_pose, sensor_data, action_index, source: str = None):
         if self._current_goal is None:
             return None, True, None
 
@@ -6888,14 +6892,23 @@ class RLGoalApproachController:
 
                 # check progress for allow_insert
                 eps_prog = float(self.config.get("insert_progress_eps", 0.05))  # мм
-                allow_insert = (progress > eps_prog) and (collision is None)
+
+                if source == "heuristic":
+                    allow_insert = (progress > eps_prog) and (collision is None)
+                    allow_update = True
+                else:
+                    allow_insert = False
+                    allow_update = False
 
                 prev_store.update_q_value(
                     self._prev_state,
                     self._last_action,
                     td_target,
                     self._get_learning_rate(),
-                    count_visit=allow_insert
+                    update_q=allow_update,          # computed from source+progress
+                    allow_insert=allow_insert,      # computed from source+progress+eff
+                    count_visit=allow_insert,       # only count visits when we accept insertion-quality step
+                    touch_recency=allow_update,     # refresh recency only if we allow learning update
                 )
 
                 # td_debug for runner/visualizer

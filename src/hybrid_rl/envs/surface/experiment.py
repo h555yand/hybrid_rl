@@ -2817,12 +2817,6 @@ class RLGoalApproachExperiment:
                         discrete_idx, controller.action_space
                     )
 
-                # Q-store learns from discrete action
-                pose_after = online_env.get_pose()
-                _, done, td_debug = controller.update_only(
-                    pose_after, sensor_after, discrete_idx
-                )
-
                 ep_steps += 1
                 total_steps_adaptive += 1
                 current_poses.append(online_env.get_pose().copy())
@@ -2875,6 +2869,12 @@ class RLGoalApproachExperiment:
                     source_counts.get(source_key, 0) + 1
                 )
                 ep_sources.append(source_key)
+
+                # Q-store learns from discrete action
+                pose_after = online_env.get_pose()
+                _, done, td_debug = controller.update_only(
+                    pose_after, sensor_after, discrete_idx, source_key
+                )
 
                 # ═══ Action explanations ═══
                 dist_to_goal = float(

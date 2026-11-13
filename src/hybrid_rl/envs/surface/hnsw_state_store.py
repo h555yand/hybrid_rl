@@ -707,7 +707,10 @@ class HNSWStateStore:
         action,
         td_target,
         alpha=0.1,
+        update_q: bool = True,
+        allow_insert: bool = True,
         count_visit: bool = True,
+        touch_recency: bool = True,
     ):
         """Update Q(state, action) toward td_target.
 
@@ -729,20 +732,21 @@ class HNSWStateStore:
             action: Action index (0 to num_actions-1).
             td_target: Target value = reward + γ * max_a Q(s', a).
             alpha: Learning rate for Q-update.
-            count_visit: If True (default), increment visit_count and update
-                last_step. Pass False for offline/backup passes so that
-                synthetic Q-refinements do not inflate the eviction score
-                (which uses visit_count × recency). last_step is still
-                refreshed so successful-path points stay eviction-fresh.
+            - `update_q`: менять ли `q_values[action]`
+            - `allow_insert`: можно ли вставлять новую точку, если рядом нет
+            - `count_visit`: увеличивать ли `visit_count`
+            - `touch_recency`: обновлять ли `last_step` (делать точку “свежей” для eviction)
         """
         self.global_step += 1
         self._update_normalization(state)
         norm_state = self._normalize(state)
 
         if self.next_id == 0:
+            if not allow_insert:
+                return
             self._insert_point(state, norm_state, action, td_target, alpha)
             return
-
+            
         k = min(self.k_neighbors, self.next_id)
         labels, distances = self._index.knn_query(
             norm_state.reshape(1, -1), k=k
@@ -767,21 +771,28 @@ class HNSWStateStore:
         ):
             point = self.points[labels[nearest_valid_idx]]
 
-            q_sa = float(point.q_values[action])
-            td_error = float(td_target - q_sa)
+            if update_q:
+                q_sa = float(point.q_values[action])
+                td_error = float(td_target - q_sa)
 
-            # NEW: TD-error clipping for stability
-            if self.td_error_clip and self.td_error_clip > 0.0:
-                td_error = float(np.clip(td_error, -self.td_error_clip, self.td_error_clip))
+                # TD-error clipping
+                if self.td_error_clip and self.td_error_clip > 0.0:
+                    td_error = float(np.clip(
+                        td_error, -self.td_error_clip, self.td_error_clip
+                    ))
 
-            point.q_values[action] = q_sa + alpha * td_error
+                point.q_values[action] = q_sa + alpha * td_error
+                self._updates_existing_count += 1
 
             if count_visit:
                 point.visit_count += 1
-            point.last_step = self.global_step
-            self._updates_existing_count += 1
-        elif count_visit:
-            self._insert_point(state, norm_state, action, td_target, alpha)
+            if touch_recency:
+                point.last_step = self.global_step
+
+        else:
+            # no close neighbor → optional insert
+            if allow_insert:
+                self._insert_point(state, norm_state, action, td_target, alpha)
 
     # ══════════════════════════════════════════════════════════
     # POINT INSERTION
