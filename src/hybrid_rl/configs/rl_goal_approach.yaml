@@ -2,10 +2,10 @@ seed: 42
 # Visualization: null | text | pictures | video
 visualise: text
 regenerate_scripts: true
-do_train: true
-do_eval: true
-do_heur_eval: true
-do_bc_train: true
+do_train: false
+do_eval: false
+do_heur_eval: false
+do_bc_train: false
 do_sac_train: true
 do_sac_eval: true
 do_adaptive: false
@@ -31,7 +31,7 @@ curriculum_levels:
 curriculum_filters:
   - {same_side: true, path_blocked: false}
   - {same_side: true, path_blocked: true}
-  - {same_side: false}
+  - {} #{same_side: false}
   #- {"handle_between": True, same_side: true, path_blocked: true}
 
 # ═══════════════════════════════════════════
