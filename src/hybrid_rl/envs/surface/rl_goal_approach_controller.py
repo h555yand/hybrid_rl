@@ -407,7 +407,9 @@ class RLGoalApproachController:
             else True
         )
 
-        if path_blocked and (not same_side):
+        is_hollow = bool(sensor_data.get("is_hollow", False))  # NEW
+
+        if is_hollow and path_blocked and (not same_side):
             return self.q_store_surface_bypass
 
         # Fallback (when same_side not available / legacy logs):

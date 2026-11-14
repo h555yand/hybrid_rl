@@ -275,6 +275,7 @@ class LightweightEnv:
             "edge_traversed": getattr(self, "_edge_traversed", False),
             "open_edge_height": self.open_edge_height,
             "snap_debug": getattr(self, "_last_snap_debug", ""),
+            "is_hollow": getattr(self, "_is_hollow", False),
         }
 
     def _same_side_air(self, agent_pos, goal_pos, agent_normal):
