@@ -819,6 +819,7 @@ class RLGoalApproachController:
         self,
         current_pose: np.ndarray,
         sensor_data: Dict[str, Any],
+        source: str = None
     ) -> Tuple[Optional[str], Optional[Dict]]:
         if self._current_goal is None:
             logger.warning(
@@ -877,6 +878,9 @@ class RLGoalApproachController:
                     "distance_progress": float(rinfo.get("distance_progress", 0.0)),
                     "rim_progress": float(rinfo.get("rim_progress", 0.0)),
                     "used_rim_shaping": bool(rinfo.get("used_rim_shaping", False)),
+                    "source": str(source),
+                    #"allow_update": bool(allow_update),
+                    #"allow_insert": bool(allow_insert),
                 }
             )
             if self.is_training and getattr(self, "learning_enabled", True):
@@ -6858,6 +6862,9 @@ class RLGoalApproachController:
                     "distance_progress": float(rinfo.get("distance_progress", 0.0)),
                     "rim_progress": float(rinfo.get("rim_progress", 0.0)),
                     "used_rim_shaping": bool(rinfo.get("used_rim_shaping", False)),
+                    "source": str(source),
+                    #"allow_update": bool(allow_update),
+                    #"allow_insert": bool(allow_insert),
                 }
             )
 

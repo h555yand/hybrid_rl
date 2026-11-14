@@ -350,6 +350,7 @@ class AdaptiveTrainingManager:
         high success → low epsilon (exploit),
         low success → high epsilon (explore).
         """
+        return 0.02
         if len(self.success_history) < self.epsilon_warmup_episodes:
             return self.epsilon_default
         rate = self.success_rate

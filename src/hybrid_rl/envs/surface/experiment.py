@@ -2930,7 +2930,10 @@ class RLGoalApproachExperiment:
             if last_transitions:
                 if success:
                     sleep_success_trails.setdefault(adaptive_level, [])
-                    sleep_success_trails[adaptive_level].append(last_transitions)
+                    # sleep_success_trails[adaptive_level].append(last_transitions)
+                    sleep_success_trails[adaptive_level].extend(
+                        [t for t in last_transitions if t.get("source") == "heuristic"]
+                    )
                     if len(sleep_success_trails[adaptive_level]) > _MAX_SUCCESS_TRAILS_PER_LEVEL:
                         sleep_success_trails[adaptive_level] = (
                             sleep_success_trails[adaptive_level][-_MAX_SUCCESS_TRAILS_PER_LEVEL:]
@@ -2940,6 +2943,9 @@ class RLGoalApproachExperiment:
                     if np.random.random() < 0.3:
                         sleep_failure_trails.setdefault(adaptive_level, [])
                         sleep_failure_trails[adaptive_level].append(last_transitions)
+                        #sleep_failure_trails[adaptive_level].extend(
+                        #    [t for t in last_transitions if t.get("source") == "heuristic"]
+                        #)
                         if len(sleep_failure_trails[adaptive_level]) > _MAX_FAILURE_TRAILS_PER_LEVEL:
                             sleep_failure_trails[adaptive_level] = (
                                 sleep_failure_trails[adaptive_level][-_MAX_FAILURE_TRAILS_PER_LEVEL:]
