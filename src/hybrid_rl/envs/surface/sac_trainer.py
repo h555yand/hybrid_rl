@@ -1813,7 +1813,7 @@ class PSACTrainer:
                         )
                         + 1
                     )
-                reward, done, _ = (
+                reward, done, _, _ = (
                     controller.compute_common_reward(
                         state=next_state_raw,
                         prev_state=state_raw,
