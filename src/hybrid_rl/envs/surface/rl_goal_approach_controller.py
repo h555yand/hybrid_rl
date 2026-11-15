@@ -394,6 +394,8 @@ class RLGoalApproachController:
         on_object = state[11] > 0.5
         if not on_object:
             return self.q_store_free
+        else:
+            return self.q_store_surface
 
         # check for surface store
         # Prefer explicit same_side from env (more reliable for hollow objects)
@@ -1035,103 +1037,16 @@ class RLGoalApproachController:
         )
 
         # Movement efficiency
-        movement_efficiency = (
-            self._compute_movement_efficiency(window=20)
-        )
+        #movement_efficiency = (
+        #    self._compute_movement_efficiency(window=20)
+        #)
+        movement_efficiency = 0.0
 
         # Projected goal direction on tangent plane
         # path_blocked=0: project goal direction (crawl to goal)
         # path_blocked=1: project edge direction (crawl to edge/bypass)
         # dont use, needs to remove
         projected_2d = np.zeros(2)
-        """
-        if (
-            on_object > 0.5
-            and np.linalg.norm(local_normal) > 1e-8
-            and distance > 1e-8
-        ):
-            rot_mat = R.from_euler(
-                "xyz", current_pose[3:6],
-                degrees=True,
-            )
-            # Surface normal in world frame
-            normal_world = rot_mat.apply(local_normal)
-            n_len = np.linalg.norm(normal_world)
-            if n_len > 1e-8:
-                n_hat = normal_world / n_len
-
-                # Build tangent basis
-                tb1, tb2 = self._build_tangent_basis(
-                    rot_mat, n_hat
-                )
-
-                if tb1 is not None:
-                    path_blocked_now = sensor_data.get(
-                        "path_blocked", False
-                    )
-
-                    if path_blocked_now:
-                        # Path blocked → edge direction
-                        edge_dir = self._compute_crawl_to_edge_direction(
-                            current_pose, sensor_data
-                        )
-                        if edge_dir is not None:
-                            projected_2d = np.array([
-                                float(np.dot(edge_dir, tb1)),
-                                float(np.dot(edge_dir, tb2)),
-                            ])
-                        else:
-                            # Fallback: goal projection
-                            goal_dir_world = rot_mat.apply(
-                                local_pos_error
-                            )
-                            projected = (
-                                goal_dir_world
-                                - np.dot(goal_dir_world, n_hat)
-                                * n_hat
-                            )
-                            proj_len = np.linalg.norm(projected)
-                            if proj_len > 1e-8:
-                                projected_unit = projected / proj_len
-                                projected_2d = np.array([
-                                    float(np.dot(projected_unit, tb1)),
-                                    float(np.dot(projected_unit, tb2)),
-                                ])
-                            else:
-                                projected_2d = np.zeros(2)
-                    else:
-                        # Path clear → goal projection (original logic)
-                        goal_dir_world = rot_mat.apply(
-                            local_pos_error
-                        )
-                        projected = (
-                            goal_dir_world
-                            - np.dot(goal_dir_world, n_hat)
-                            * n_hat
-                        )
-                        proj_len = np.linalg.norm(projected)
-                        if proj_len > 1e-8:
-                            projected_unit = projected / proj_len
-                            projected_2d = np.array([
-                                float(np.dot(projected_unit, tb1)),
-                                float(np.dot(projected_unit, tb2)),
-                            ])
-                        else:
-                            projected_2d = np.zeros(2)
-                else:
-                    projected_2d = np.zeros(2)
-            else:
-                projected_2d = np.zeros(2)
-        else:
-            # In air or no normal
-            if distance > 1e-8:
-                projected_2d = (
-                    local_pos_error[:2]
-                    / distance
-                )
-            else:
-                projected_2d = np.zeros(2)
-        """
 
         if distance > 1e-8:
             local_pos_direction = local_pos_error / distance

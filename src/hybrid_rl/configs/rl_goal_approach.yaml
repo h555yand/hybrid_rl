@@ -1,8 +1,8 @@
 seed: 42
 # Visualization: null | text | pictures | video
-visualise: text
-regenerate_scripts: true
-do_train: true
+visualise: video
+regenerate_scripts: false
+do_train: false
 do_eval: true
 do_heur_eval: false
 do_bc_train: false
@@ -78,44 +78,44 @@ training_stages:
      - {same_side: true, path_blocked: true}
      - {}
 
-  - mesh: flat_square
-    episodes: 500
-    epsilon_start: 1.0
-    epsilon_min: 0.95
-    load_mode: auto
-    warmup_episodes: 100
-    promote_threshold: 0.7
-    promote_window: 100
-    curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
-      - {}
+  #- mesh: flat_square
+  #  episodes: 500
+  #  epsilon_start: 1.0
+  #  epsilon_min: 0.95
+  #  load_mode: auto
+  #  warmup_episodes: 100
+  #  promote_threshold: 0.7
+  #  promote_window: 100
+  #  curriculum_filters:
+  #    - {same_side: true, path_blocked: false}
+  #    - {same_side: true, path_blocked: true}
+  #    - {}
   
-  - mesh: cone
-    episodes: 1000
-    epsilon_start: 1.0
-    epsilon_min: 0.95
-    load_mode: auto
-    warmup_episodes: 100
-    promote_threshold: 0.7
-    promote_window: 200
-    curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
-      - {}
+  #- mesh: cone
+  #  episodes: 1000
+  #  epsilon_start: 1.0
+  #  epsilon_min: 0.95
+  #  load_mode: auto
+  #  warmup_episodes: 100
+  #  promote_threshold: 0.7
+  #  promote_window: 200
+  #  curriculum_filters:
+  #    - {same_side: true, path_blocked: false}
+  #    - {same_side: true, path_blocked: true}
+  #    - {}
 
-  - mesh: thin_cylinder
-    episodes: 500
-    epsilon_start: 1.0
-    epsilon_min: 0.95
-    load_mode: auto
-    warmup_episodes: 100
-    promote_threshold: 0.7
-    promote_window: 100
-    curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
-      - {}
+  #- mesh: thin_cylinder
+  #  episodes: 500
+  #  epsilon_start: 1.0
+  #  epsilon_min: 0.95
+  #  load_mode: auto
+  #  warmup_episodes: 100
+  #  promote_threshold: 0.7
+  #  promote_window: 100
+  #  curriculum_filters:
+  #    - {same_side: true, path_blocked: false}
+  #    - {same_side: true, path_blocked: true}
+  #    - {}
 
   # ── Phase 2: Primitives ──
   #- mesh: cube
@@ -203,14 +203,14 @@ training_stages:
   #    - {}
 
   # ── Phase 2: Hollow objects ──
-  #- mesh: vase
-  #  episodes: 1000
-  #  epsilon_start: 1.0
-  #  epsilon_min: 0.95
-  #  load_mode: auto
-  #  warmup_episodes: 100
-  #  promote_threshold: 0.70
-  #  promote_window: 200
+  - mesh: vase
+    episodes: 1000
+    epsilon_start: 1.0
+    epsilon_min: 0.95
+    load_mode: auto
+    warmup_episodes: 100
+    promote_threshold: 0.70
+    promote_window: 200
 
   #- mesh: mug
   #  episodes: 2000
@@ -247,36 +247,36 @@ training_stages:
 # ═══════════════════════════════════════════
 eval_meshes:
   # Train set — primitives
-  - mesh: cube
-    curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
-      - {}
-  - mesh: sphere
-    curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
-      - {}
-  - mesh: cylinder
-    curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
-      - {}
-  - mesh: flat_square
-    curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
-      - {}
-  - mesh: cone
-    curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
-      - {}
-  - mesh: thin_cylinder
-    curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
-      - {}
+  #- mesh: cube
+  #  curriculum_filters:
+  #    - {same_side: true, path_blocked: false}
+  #    - {same_side: true, path_blocked: true}
+  #    - {}
+  #- mesh: sphere
+  #  curriculum_filters:
+  #    - {same_side: true, path_blocked: false}
+  #    - {same_side: true, path_blocked: true}
+  #    - {}
+  #- mesh: cylinder
+  #  curriculum_filters:
+  #    - {same_side: true, path_blocked: false}
+  #    - {same_side: true, path_blocked: true}
+  #    - {}
+  #- mesh: flat_square
+  #  curriculum_filters:
+  #    - {same_side: true, path_blocked: false}
+  #    - {same_side: true, path_blocked: true}
+  #    - {}
+  #- mesh: cone
+  #  curriculum_filters:
+  #    - {same_side: true, path_blocked: false}
+  #    - {same_side: true, path_blocked: true}
+  #    - {}
+  #- mesh: thin_cylinder
+  #  curriculum_filters:
+  #    - {same_side: true, path_blocked: false}
+  #    - {same_side: true, path_blocked: true}
+  #    - {}
   
   # Train set — hollow
   - vase
@@ -361,31 +361,31 @@ rl_config:
     0: 2.0    # lpe[0]
     1: 2.0    # lpe[1]
     2: 0.5    # lpe[2]
-    3: 0.0
+    3: 0.0    # rot_error_deg
     4: 0.0
     5: 0.0
     6: 0.2    # local_normal — неинформативен
     7: 0.2
     8: 0.2
     9: 0.3    # k1
-    10: 0.0
-    11: 0.0
+    10: 0.0   # k2
+    11: 0.0   # on_object
     12: 1.0   # alignment
     13: 0.3   # distance
-    14: 0.0
+    14: 0.0   # norm_depth
     15: 0.3   # goal_normal
     16: 0.3
     17: 0.3
     18: 1.0   # path_blocked
-    19: 0.0
+    19: 0.0   # move eff
     20: 0.0   # p2d — убран
     21: 0.0
-    22: 0.0   # na — store selector
-    23: 0.0   # norm_height — не нужен для direct
-    24: 0.0
-    25: 0.0
-    26: 0.0
-    27: 0.0
+    22: 1.0   # normal_agreement — store selector
+    23: 1.0   # norm_height — не нужен для direct
+    24: 1.0   # up_local
+    25: 1.0
+    26: 1.0
+    27: 10.0   # same_side_flag
 
   # Bypass store: crawl to edge / different-side
   feature_weights_bypass:
