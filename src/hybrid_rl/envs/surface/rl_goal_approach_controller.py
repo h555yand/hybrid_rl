@@ -377,6 +377,7 @@ class RLGoalApproachController:
         self._success_steps_history: List[int] = []
         self._prev_pose_height = None
         self.learning_enabled = True
+        self._prev_edge_dist = None
 
         logger.info(
             f"RLGoalApproachController initialized: "
@@ -816,6 +817,7 @@ class RLGoalApproachController:
         self._prev_subgoal_alignment = None
         self._prev_goal_alignment = None
         self._prev_pose_height = None
+        self._prev_edge_dist = None
         
     def step(
         self,
@@ -1985,51 +1987,102 @@ class RLGoalApproachController:
 
             # ...
             if phase in ("CRAWL_TO_EDGE", "DETACH_NEEDED"):
-                # Different-side rim navigation: reward ONLY rim progress
                 if (on_object > 0.5) and (not same_side):
                     progress = 0.0  # disable distance shaping entirely
 
-                    # Rim-based shaping using open_edge_height + up_direction sign
                     if sensor_data is not None and current_pose is not None:
-                        up_dir = np.asarray(sensor_data.get("up_direction", [0, 0, 1]), dtype=float)
-                        height_axis = int(np.argmax(np.abs(up_dir)))
-                        up_sign = float(np.sign(up_dir[height_axis])) if abs(up_dir[height_axis]) > 1e-8 else 1.0
+                        is_hollow = bool(sensor_data.get("is_hollow", False))
 
-                        rim_h = sensor_data.get("open_edge_height", None)
-                        if rim_h is not None:
-                            # distance-to-rim along up axis (positive if below rim)
-                            prev_h = getattr(self, "_prev_pose_height", None)
-                            if prev_h is None:
-                                h_prev = float(current_pose[height_axis])
-                            else:
-                                h_prev = float(prev_h)
-                            
-                            h_curr = float(current_pose[height_axis])
+                        # ─────────────────────────────────────────────
+                        # HOLLOW: rim-based shaping (as before)
+                        # ─────────────────────────────────────────────
+                        if is_hollow:
+                            up_dir = np.asarray(sensor_data.get("up_direction", [0, 0, 1]), dtype=float)
+                            height_axis = int(np.argmax(np.abs(up_dir)))
+                            up_sign = float(np.sign(up_dir[height_axis])) if abs(up_dir[height_axis]) > 1e-8 else 1.0
 
-                            drim_prev = (float(rim_h) - h_prev) * up_sign
-                            drim_curr = (float(rim_h) - h_curr) * up_sign
-                            rim_progress = drim_prev - drim_curr  # >0 when moving toward rim
+                            rim_h = sensor_data.get("open_edge_height", None)
+                            if rim_h is not None:
+                                prev_h = getattr(self, "_prev_pose_height", None)
+                                if prev_h is None:
+                                    h_prev = float(current_pose[height_axis])
+                                else:
+                                    h_prev = float(prev_h)
 
-                            # scale: pick something that beats step_penalty (-0.2) for typical movement
-                            # start with 1.0..3.0, tune later
-                            RIM_SCALE = float(cfg.get("reward_rim_progress_scale", 2.0))
-                            reward += (rim_progress / max(surface_step, 1e-6)) * RIM_SCALE
+                                h_curr = float(current_pose[height_axis])
 
-                            used_rim_shaping = True
+                                drim_prev = (float(rim_h) - h_prev) * up_sign
+                                drim_curr = (float(rim_h) - h_curr) * up_sign
+                                rim_progress = drim_prev - drim_curr  # >0 when moving toward rim
 
-                            # optional: small penalty for moving away from rim
-                            if rim_progress < 0:
-                                reward += -0.2
+                                RIM_SCALE = float(cfg.get("reward_rim_progress_scale", 2.0))
+                                reward += (rim_progress / max(surface_step, 1e-6)) * RIM_SCALE
 
-                    # fallback if rim_h missing: keep your old norm_height shaping
+                                used_rim_shaping = True
+                                if rim_progress < 0:
+                                    reward += -0.2
+
+                        # ─────────────────────────────────────────────
+                        # NON-HOLLOW THIN: edge-based shaping (NEW)
+                        # ─────────────────────────────────────────────
+                        else:
+                            center_raw = sensor_data.get("object_center", None)
+                            extents_raw = sensor_data.get("object_extents", None)
+                            if center_raw is not None and extents_raw is not None:
+                                center = np.asarray(center_raw, dtype=float)
+                                extents = np.asarray(extents_raw, dtype=float)
+
+                                # thin detection (same rule as _is_reachable_by_surface)
+                                min_extent = float(np.min(extents))
+                                max_extent = float(np.max(extents))
+                                is_thin = (max_extent > 1e-8) and (min_extent < max_extent * 0.15)
+
+                                if is_thin:
+                                    thin_axis = int(np.argmin(extents))
+                                    bbox_min = center - extents / 2.0
+                                    bbox_max = center + extents / 2.0
+
+                                    pos = np.asarray(current_pose[:3], dtype=float)
+
+                                    # distance to nearest edge in the 2 non-thin axes
+                                    edge_dist = None
+                                    for ax in range(3):
+                                        if ax == thin_axis:
+                                            continue
+                                        d1 = abs(pos[ax] - bbox_min[ax])
+                                        d2 = abs(pos[ax] - bbox_max[ax])
+                                        d = float(min(d1, d2))
+                                        edge_dist = d if edge_dist is None else min(edge_dist, d)
+
+                                    prev_edge = getattr(self, "_prev_edge_dist", None)
+                                    if prev_edge is None or edge_dist is None:
+                                        edge_progress = 0.0
+                                    else:
+                                        edge_progress = float(prev_edge - edge_dist)  # >0 when moving toward edge
+                                    
+                                    # store current for next step
+                                    self._prev_edge_dist = float(edge_dist) if edge_dist is not None else None
+                                    
+                                    # NEW: reuse rim_progress for insertion/td_debug pipeline
+                                    rim_progress = float(edge_progress)
+
+                                    EDGE_SCALE = float(cfg.get("reward_edge_progress_scale", 2.0))
+                                    reward += (edge_progress / max(surface_step, 1e-6)) * EDGE_SCALE
+                                    used_rim_shaping = True  # reuse the flag meaning "used bypass shaping"
+
+                                    if edge_progress < 0:
+                                        reward += -0.2
+
+                                else:
+                                    # Not thin and not hollow: fall back to weak distance shaping (or do nothing)
+                                    # Keeping your previous behavior: same-side bypass uses weak distance shaping.
+                                    progress = (prev_distance - distance) * 0.1
+
                     else:
+                        # Fallback (legacy): keep old norm_height shaping
                         if len(state) > 23 and len(prev_state) > 23:
                             height_progress = float(state[23] - prev_state[23])
                             reward += height_progress * 30.0
-
-                else:
-                    # Same-side bypass: keep existing behavior (weak distance shaping)
-                    progress = progress_raw * 0.1
 
         detour_mode = (
             prev_alignment
