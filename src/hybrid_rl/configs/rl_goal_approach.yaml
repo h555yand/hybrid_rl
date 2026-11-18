@@ -1,15 +1,15 @@
 seed: 42
 # Visualization: null | text | pictures | video
-visualise: video
-regenerate_scripts: false
-do_train: false
-do_eval: false
-do_heur_eval: false
-do_bc_train: false
-do_sac_train: false
-do_sac_eval: false
-do_adaptive: true
-do_sleep: true
+visualise: text
+regenerate_scripts: true
+do_train: true
+do_eval: true
+do_heur_eval: true
+do_bc_train: true
+do_sac_train: true
+do_sac_eval: true
+do_adaptive: false
+do_sleep: false
 do_ycb_eval: false
 
 train_seeds: [11]
@@ -22,15 +22,15 @@ promote_threshold: 0.5
 promote_window: 100
 
 curriculum_levels:
-  #- [10.0, 60.0]    # L0: same_side, no path_blocked
-  #- [10.0, 80.0]    # L1: same_side, path_blocked
+  - [10.0, 60.0]    # L0: same_side, no path_blocked
+  - [10.0, 80.0]    # L1: same_side, path_blocked
   - [10.0, 120.0]   # L2: different sides
   #- [10.0, 120.0]   # L3: handle as obstacle
 
 
 curriculum_filters:
-  #- {same_side: true, path_blocked: false}
-  #- {same_side: true, path_blocked: true}
+  - {same_side: true, path_blocked: false}
+  - {same_side: true, path_blocked: true}
   - {same_side: false}
   #- {"handle_between": True, same_side: true, path_blocked: true}
 
@@ -247,21 +247,21 @@ training_stages:
 # ═══════════════════════════════════════════
 eval_meshes:
   # Train set — primitives
-  #- mesh: cube
-  #  curriculum_filters:
-  #    - {same_side: true, path_blocked: false}
-  #    - {same_side: true, path_blocked: true}
-  #    - {}
-  #- mesh: sphere
-  #  curriculum_filters:
-  #    - {same_side: true, path_blocked: false}
-  #    - {same_side: true, path_blocked: true}
-  #    - {}
-  #- mesh: cylinder
-  #  curriculum_filters:
-  #    - {same_side: true, path_blocked: false}
-  #    - {same_side: true, path_blocked: true}
-  #    - {}
+  - mesh: cube
+    curriculum_filters:
+      - {same_side: true, path_blocked: false}
+      - {same_side: true, path_blocked: true}
+      - {}
+  - mesh: sphere
+    curriculum_filters:
+      - {same_side: true, path_blocked: false}
+      - {same_side: true, path_blocked: true}
+      - {}
+  - mesh: cylinder
+    curriculum_filters:
+      - {same_side: true, path_blocked: false}
+      - {same_side: true, path_blocked: true}
+      - {}
   #- mesh: flat_square
   #  curriculum_filters:
   #    - {same_side: true, path_blocked: false}
@@ -295,10 +295,10 @@ bc_mesh_names:
   - cube
   - sphere
   - cylinder
-  - flat_square
-  - cone
-  - thin_cylinder
-  #- vase
+  #- flat_square
+  #- cone
+  #- thin_cylinder
+  - vase
   #- mug
 
 # ═══ BC balancing ═══
@@ -310,7 +310,7 @@ bc_mesh_weights:
   #flat_square: 0.5   # очень простой, мало нового
   #cone: 1.0
   #thin_cylinder: 0.5
-  #vase: 2.0          # hollow навигация — ключевой для cup
+  vase: 2.0          # hollow навигация — ключевой для cup
   #mug: 2.5           # самый сложный, handle+rim — максимум данных
 
 bc_level_weights:
@@ -501,7 +501,7 @@ sac_episodes_per_mesh:
   #flat_square: 500
   #cone: 1000
   #thin_cylinder: 500
-  #vase: 1000
+  vase: 1000
   #mug: 1000
 
 #sac_episodes_per_mesh:
