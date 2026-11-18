@@ -1223,20 +1223,31 @@ class LightweightEnv:
         
         new_pos = snap["position"]
         
-        if self._check_through_wall(old_pos, new_pos):
-            # Try same-side fallback
+        # CCD-lite collision check for non-edge moves
+        if self._check_motion_collision_ccd(
+            old_pos,
+            new_pos,
+            radius=1.0,       # agent collision radius (mm)
+            sample_step=1.5,  # spacing along segment (mm)
+            max_samples=12,
+            end_margin=1.0,   # ignore 1mm near endpoints
+        ):
+            # Try same-side fallback (оставляем твою текущую логику 1-в-1)
             probe = old_pos + world_dir * step_size + old_normal * 3.0
             cl, d, f = self.mesh.nearest.on_surface([probe])
             n_fb = self.mesh.face_normals[f[0]].copy()
             n_fb /= np.linalg.norm(n_fb) + 1e-12
-            
+
             if np.dot(n_fb, old_normal) < 0:
                 n_fb = -n_fb
-            
+
             fallback_pos = cl[0] + n_fb * 2.0
-            
+
             if (
-                not self._check_through_wall(old_pos, fallback_pos)
+                not self._check_motion_collision_ccd(
+                    old_pos, fallback_pos,
+                    radius=1.0, sample_step=1.5, max_samples=12, end_margin=1.0
+                )
                 and np.dot(n_fb, old_normal) > -0.1
                 and d[0] < step_size * 3.0
             ):
@@ -1247,8 +1258,59 @@ class LightweightEnv:
         
         return snap
 
-    def _check_through_wall(self, old_pos, new_pos, margin=2.5):
+    def _check_motion_collision_ccd(
+        self,
+        old_pos: np.ndarray,
+        new_pos: np.ndarray,
+        radius: float = 1.0,
+        sample_step: float = 1.0,
+        max_samples: int = 25,
+        end_margin: float = 0.5,
+    ) -> bool:
+        """
+        Continuous collision check (CCD-lite) by sampling points along
+        the motion segment and measuring distance to mesh surface.
+
+        Returns True if the swept point (with given radius) would intersect
+        mesh somewhere between old_pos and new_pos.
+        """
+        old_pos = np.asarray(old_pos, dtype=float)
+        new_pos = np.asarray(new_pos, dtype=float)
+
+        move = new_pos - old_pos
+        dist = float(np.linalg.norm(move))
+        if dist < 1e-6:
+            return False
+
+        # Too short: ignore (would be dominated by endpoint numerical noise)
+        if dist <= 2.0 * end_margin:
+            return False
+
+        n = int(np.ceil(dist / sample_step))
+        n = max(n, 9)
+        n = min(n, max_samples)
+
+        # sample t in (0,1) excluding end_margin zones
+        t0 = end_margin / dist
+        t1 = 1.0 - end_margin / dist
+        if t1 <= t0:
+            return False
+
+        ts = np.linspace(t0, t1, n)
+        pts = old_pos[None, :] + ts[:, None] * move[None, :]
+
+        # Batch nearest query: distances to surface
+        _, dists, _ = self.mesh.nearest.on_surface(pts)
+
+        # Collision if anywhere closer than radius
+        return bool(np.any(dists < radius))
+
+    def _check_through_wall(self, old_pos, new_pos, margin=None):
         """Check if path passes through mesh geometry."""
+        if margin is None:
+            # Variant B
+            margin = 0.5 if self._is_hollow else 2.5
+
         move_vec = new_pos - old_pos
         move_dist = float(np.linalg.norm(move_vec))
         
