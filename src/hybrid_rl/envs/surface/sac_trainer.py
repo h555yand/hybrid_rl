@@ -62,7 +62,7 @@ class PSACTrainer:
 
     def __init__(
         self,
-        state_dim: int = 23,
+        state_dim: int = 27,
         num_types: int = 8,
         max_params: int = 3,
         gamma: float = 0.99,
@@ -127,7 +127,7 @@ class PSACTrainer:
             bc_capacity_per_object=int(
                 buffer_capacity * 0.15 / 8
             ),
-            elite_capacity_per_object=5000,
+            elite_capacity_per_object=20000,
         )
 
         self.bc_lambda = bc_lambda_init
@@ -588,6 +588,113 @@ class PSACTrainer:
 
         return reward, done
 
+    def _sample_random_params_bounded(
+        self,
+        random_types: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sample random action parameters in REAL scale within per-type bounds.
+        
+        random_types: (B,) int64
+        returns: (B, max_params) float32
+        """
+        from .sac_actor import ACTION_PARAM_BOUNDS
+
+        batch_size = int(random_types.shape[0])
+        rp = torch.zeros(batch_size, self.max_params, dtype=torch.float32)
+
+        # Ensure on same device as types (critic inputs are on CPU now, but keep correct)
+        rp = rp.to(random_types.device)
+
+        for tid in range(self.num_types):
+            mask = (random_types == tid)
+            n = int(mask.sum().item())
+            if n == 0:
+                continue
+
+            bounds = ACTION_PARAM_BOUNDS.get(int(tid), [])
+            if not bounds:
+                continue
+
+            dim = min(len(bounds), self.max_params)
+            lows = torch.tensor([b[0] for b in bounds[:dim]], dtype=torch.float32, device=rp.device)
+            highs = torch.tensor([b[1] for b in bounds[:dim]], dtype=torch.float32, device=rp.device)
+
+            u = torch.rand(n, dim, device=rp.device)
+            samp = lows + (highs - lows) * u
+            rp[mask, :dim] = samp
+
+        return rp
+
+    def actor_only_sac_finetune(
+        self,
+        mesh_name: str,
+        num_steps: int = 5000,
+        batch_size: int | None = None,
+        current_ratio: float = 0.5,
+        bc_ratio: float = 0.2,
+        elite_ratio: float = 0.3,
+        lr_scale: float = 0.05,
+        log_every: int = 500,
+    ) -> dict[str, float]:
+        """Fine-tune actor+alpha only, with critic frozen."""
+        if batch_size is None:
+            batch_size = self.batch_size
+
+        # freeze critic
+        for p in self.critic.parameters():
+            p.requires_grad = False
+        for p in self.critic_target.parameters():
+            p.requires_grad = False
+
+        old_lr = float(self.actor_optimizer.param_groups[0]["lr"])
+        self.actor_optimizer.param_groups[0]["lr"] = old_lr * float(lr_scale)
+
+        actor_losses = []
+        sac_losses = []
+        bc_losses = []
+
+        try:
+            self.actor.train()
+            for step_i in range(num_steps):
+                batch = self.buffer.sample_balanced(
+                    batch_size,
+                    current_mesh=mesh_name,
+                    current_ratio=current_ratio,
+                    bc_ratio=bc_ratio,
+                    elite_ratio=elite_ratio,
+                )
+                s_l, b_l = self.update_actor(batch)
+                self.update_alpha(batch)
+
+                sac_losses.append(float(s_l))
+                bc_losses.append(float(b_l))
+                # update_actor returns sac_loss; total loss not returned; keep sac/bc
+                if (step_i + 1) % log_every == 0:
+                    logger.info(
+                        "Actor-only %d/%d: sac=%.4f bc=%.4f bc_lambda=%.3f lr=%.2e",
+                        step_i + 1, num_steps,
+                        float(np.mean(sac_losses[-log_every:])),
+                        float(np.mean(bc_losses[-log_every:])),
+                        float(self.bc_lambda),
+                        float(self.actor_optimizer.param_groups[0]["lr"]),
+                    )
+
+            return {
+                "status": "completed",
+                "steps": int(num_steps),
+                "sac_loss_mean": float(np.mean(sac_losses)) if sac_losses else 0.0,
+                "bc_loss_mean": float(np.mean(bc_losses)) if bc_losses else 0.0,
+                "lr_scale": float(lr_scale),
+            }
+
+        finally:
+            # restore lr and unfreeze critic (optional)
+            self.actor_optimizer.param_groups[0]["lr"] = old_lr
+            for p in self.critic.parameters():
+                p.requires_grad = True
+            for p in self.critic_target.parameters():
+                p.requires_grad = True
+
     def update_critic(
         self, batch: dict[str, np.ndarray]
     ) -> float:
@@ -684,6 +791,26 @@ class PSACTrainer:
             + F.mse_loss(q2, target_q)
         )
 
+        if not torch.isfinite(target_q).all():
+            logger.error("NAN_GUARD critic: target_q non-finite")
+        if not torch.isfinite(q1).all() or not torch.isfinite(q2).all():
+            logger.error("NAN_GUARD critic: q1/q2 non-finite")
+        
+        if not hasattr(self, "_crit_diag_counter"):
+            self._crit_diag_counter = 0
+        self._crit_diag_counter += 1
+        if self._crit_diag_counter % 200 == 0:
+            with torch.no_grad():
+                logger.info(
+                    "CRIT_DIAG: r_mean=%.3f target_q[mean=%.3e std=%.3e min=%.3e max=%.3e] "
+                    "q1[mean=%.3e std=%.3e] q2[mean=%.3e std=%.3e]",
+                    float(rewards.mean().item()),
+                    float(target_q.mean().item()), float(target_q.std().item()),
+                    float(target_q.min().item()), float(target_q.max().item()),
+                    float(q1.mean().item()), float(q1.std().item()),
+                    float(q2.mean().item()), float(q2.std().item()),
+                )
+                
         # ═══ CQL penalty ═══
         # Q-values for actions sampled from current
         # policy (potentially out-of-distribution)
@@ -697,15 +824,14 @@ class PSACTrainer:
 
         # Q-values for random actions
         batch_size = states.shape[0]
-        random_types = torch.randint(
-            0, self.num_types, (batch_size,)
-        )
-        random_params = torch.randn(
-            batch_size, self.max_params
-        )
-        q1_random, q2_random = self.critic(
-            states, random_types, random_params
-        )
+        random_types = torch.randint(0, self.num_types, (batch_size,), device=states.device)
+        random_params = self._sample_random_params_bounded(random_types)
+        q1_random, q2_random = self.critic(states, random_types, random_params)
+
+        if not torch.isfinite(q1_policy).all() or not torch.isfinite(q2_policy).all():
+            logger.error("NAN_GUARD critic: q_policy non-finite")
+        if not torch.isfinite(q1_random).all() or not torch.isfinite(q2_random).all():
+            logger.error("NAN_GUARD critic: q_random non-finite")
 
         # CQL: push down Q for policy/random actions,
         # push up Q for data actions
@@ -729,8 +855,22 @@ class PSACTrainer:
         critic_loss = (
             td_loss + self.cql_alpha * cql_penalty
         )
+        if not torch.isfinite(cql_penalty):
+            logger.error("NAN_GUARD critic: cql_penalty non-finite: %s", cql_penalty.detach().cpu().numpy())
+        if not torch.isfinite(critic_loss):
+            logger.error(
+                "NAN_GUARD critic: critic_loss non-finite | td=%s cql=%s alpha=%.3f",
+                td_loss.detach().cpu().numpy(),
+                cql_penalty.detach().cpu().numpy(),
+                float(self.cql_alpha),
+            )
 
         self.critic_optimizer.zero_grad()
+
+        self._last_td_loss = float(td_loss.item())
+        self._last_cql_penalty = float(cql_penalty.item())
+        self._last_critic_loss = float(critic_loss.item())
+
         critic_loss.backward()
         torch.nn.utils.clip_grad_norm_(
             self.critic.parameters(), 1.0
@@ -738,6 +878,153 @@ class PSACTrainer:
         self.critic_optimizer.step()
 
         return critic_loss.item()
+
+    def bc_only_finetune(
+        self,
+        bc_transitions: list[PSACTransition],
+        num_steps: int = 2000,
+        batch_size: int = 128,
+        lr_scale: float = 0.05,
+        param_types: set[int] | None = None,
+        grad_clip: float = 0.5,
+        log_every: int = 200,
+    ) -> dict[str, float]:
+        """BC-only finetune of actor (no critic, no SAC loss).
+
+        Args:
+            bc_transitions: list of PSACTransition (preferably already normalized states).
+            num_steps: number of SGD steps.
+            batch_size: BC minibatch size.
+            lr_scale: temporary scale for actor LR during finetune.
+            param_types: which action types use param BC (pretanh MSE).
+                If None -> use param BC for all types with dim>0.
+                Recommended for stability: {0} (crawl only).
+            grad_clip: clip norm for actor grads.
+            log_every: logging interval.
+
+        Returns:
+            dict with mean losses.
+        """
+        if not bc_transitions:
+            logger.warning("BC-only finetune skipped: empty bc_transitions")
+            return {"status": "skipped", "reason": "empty"}
+
+        # temp LR scale
+        old_lr = float(self.actor_optimizer.param_groups[0]["lr"])
+        self.actor_optimizer.param_groups[0]["lr"] = old_lr * float(lr_scale)
+
+        param_dims = ExperienceExtractor.get_param_dims()
+        from .sac_actor import ACTION_PARAM_BOUNDS  # for debug only
+
+        losses = []
+        type_losses = []
+        param_losses = []
+
+        # default: all param-capable types
+        if param_types is None:
+            param_types = {tid for tid, d in param_dims.items() if d > 0}
+
+        # pre-pack numpy arrays for speed
+        states_np = np.asarray([tr.state for tr in bc_transitions], dtype=np.float32)
+        types_np = np.asarray([tr.action_type for tr in bc_transitions], dtype=np.int64)
+        params_np = np.asarray([tr.action_params for tr in bc_transitions], dtype=np.float32)
+
+        n = len(bc_transitions)
+
+        try:
+            self.actor.train()
+
+            for step_i in range(num_steps):
+                idx = np.random.randint(0, n, size=min(batch_size, n))  # noqa: NPY002
+
+                bc_states = torch.FloatTensor(states_np[idx])
+                bc_types = torch.LongTensor(types_np[idx])
+                bc_params = torch.FloatTensor(params_np[idx])
+
+                if (step_i + 1) % log_every == 0:
+                    mx = float(bc_states.abs().max().item())
+                    mn = float(bc_states.min().item())
+                    av = float(bc_states.mean().item())
+                    sd = float(bc_states.std().item())
+                    logger.info("BC_ONLY_STATE BEFORE: min=%.3e maxabs=%.3e mean=%.3e std=%.3e", mn, mx, av, sd)
+                
+                type_logits, param_mus, _param_log_stds = self.actor(bc_states)
+                type_loss = F.cross_entropy(type_logits, bc_types)
+
+                if (step_i + 1) % log_every == 0:
+                    logger.info(
+                        "BC_ONLY_LOGITS AFTER: min=%.3e max=%.3e mean=%.3e std=%.3e",
+                        float(type_logits.min().item()),
+                        float(type_logits.max().item()),
+                        float(type_logits.mean().item()),
+                        float(type_logits.std().item()),
+                    )
+
+                p_loss = torch.tensor(0.0)
+
+                for tid in range(self.num_types):
+                    dim = int(param_dims.get(tid, 0))
+                    if dim == 0:
+                        continue
+                    if tid not in param_types:
+                        continue
+
+                    mask = (bc_types == tid)
+                    if mask.sum() == 0:
+                        continue
+
+                    # pred mu in pretanh space
+                    pred_mu = param_mus[tid][mask]
+                    target_raw = bc_params[mask, :dim]
+
+                    scale = self.actor._scales.get(tid)
+                    center = self.actor._centers.get(tid)
+
+                    if scale is not None:
+                        target_norm = (target_raw - center[:dim]) / (scale[:dim] + 1e-8)
+                        target_norm = target_norm.clamp(-0.999, 0.999)
+                        target_pretanh = torch.atanh(target_norm)
+                    else:
+                        # fallback (shouldn't happen for dim>0 types)
+                        target_pretanh = target_raw
+
+                    p_loss = p_loss + F.mse_loss(pred_mu, target_pretanh)
+
+                loss = type_loss + p_loss
+
+                self.actor_optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), float(grad_clip))
+                self.actor_optimizer.step()
+
+                losses.append(float(loss.detach().cpu().item()))
+                type_losses.append(float(type_loss.detach().cpu().item()))
+                param_losses.append(float(p_loss.detach().cpu().item()))
+
+                if (step_i + 1) % log_every == 0:
+                    logger.info(
+                        "BC-only finetune %d/%d: loss=%.4f type=%.4f param=%.4f lr=%.2e param_types=%s",
+                        step_i + 1, num_steps,
+                        float(np.mean(losses[-log_every:])),
+                        float(np.mean(type_losses[-log_every:])),
+                        float(np.mean(param_losses[-log_every:])),
+                        float(self.actor_optimizer.param_groups[0]["lr"]),
+                        sorted(list(param_types))[:10],
+                    )
+
+            return {
+                "status": "completed",
+                "steps": int(num_steps),
+                "loss_mean": float(np.mean(losses)) if losses else 0.0,
+                "type_loss_mean": float(np.mean(type_losses)) if type_losses else 0.0,
+                "param_loss_mean": float(np.mean(param_losses)) if param_losses else 0.0,
+                "lr_final": float(self.actor_optimizer.param_groups[0]["lr"]),
+                "param_types": sorted(list(param_types)),
+            }
+
+        finally:
+            # restore LR
+            self.actor_optimizer.param_groups[0]["lr"] = old_lr
 
     def update_actor(
         self, batch: dict[str, np.ndarray]
@@ -758,6 +1045,15 @@ class PSACTrainer:
         q_val = self.critic.min_q(
             states, action_type, action_params
         )
+        if not torch.isfinite(log_prob).all():
+            logger.error("NAN_GUARD actor: log_prob non-finite")
+        if not torch.isfinite(q_val).all():
+            logger.error(
+                "NAN_GUARD actor: q_val non-finite | q[min=%.3e max=%.3e]",
+                float(q_val.min().item()), float(q_val.max().item())
+            )
+        if not torch.isfinite(action_params).all():
+            logger.error("NAN_GUARD actor: action_params non-finite")
 
         sac_loss = (
             (self.alpha_type + self.alpha_param) * log_prob
@@ -789,8 +1085,63 @@ class PSACTrainer:
             type_logits, param_mus, _ = self.actor(bc_states)
             type_loss = F.cross_entropy(type_logits, bc_types)
 
+            # ─────────────────────────────────────────────
+            # DIAG: BC target params ranges per type (raw)
+            # ─────────────────────────────────────────────
+            if not hasattr(self, "_bc_diag_once"):
+                self._bc_diag_once = True
+                from .sac_actor import ACTION_PARAM_BOUNDS
+                for tid in [5, 6, 1, 0, 2, 3]:
+                    param_dims = ExperienceExtractor.get_param_dims()
+                    dim = param_dims.get(tid, 0)
+                    if dim == 0:
+                        continue
+                    mask = (bc_types == tid).cpu().numpy()
+                    if mask.sum() == 0:
+                        continue
+                    arr = bc_params_raw[mask, :dim]
+                    lo = arr.min(axis=0); hi = arr.max(axis=0); mean = arr.mean(axis=0)
+                    logger.debug(
+                        "BC_DIAG_ONCE type=%d dim=%d mean=%s min=%s max=%s bounds=%s",
+                        tid, dim,
+                        np.round(mean, 6).tolist(),
+                        np.round(lo, 6).tolist(),
+                        np.round(hi, 6).tolist(),
+                        ACTION_PARAM_BOUNDS.get(tid, [])[:dim],
+                    )
+            if not hasattr(self, "_bc_diag_counter"):
+                self._bc_diag_counter = 0
+            self._bc_diag_counter += 1
+
+            # логируем редко, чтобы не спамить
+            if self._bc_diag_counter % 200 == 0:
+                from .sac_actor import ACTION_PARAM_BOUNDS
+
+                msg = []
+                for tid in sorted(set(bc_types.cpu().numpy().tolist())):
+                    dim = ExperienceExtractor.get_param_dims()[int(tid)]
+                    if dim == 0:
+                        continue
+                    mask = (bc_types == tid).cpu().numpy()
+                    arr = bc_params_raw[mask, :dim]
+                    if arr.size == 0:
+                        continue
+                    lo = arr.min(axis=0)
+                    hi = arr.max(axis=0)
+                    mean = arr.mean(axis=0)
+                    bounds = ACTION_PARAM_BOUNDS.get(int(tid), [])
+                    msg.append(
+                        f"type{tid}(dim={dim}) "
+                        f"raw_mean={np.round(mean,4).tolist()} "
+                        f"raw_min={np.round(lo,4).tolist()} "
+                        f"raw_max={np.round(hi,4).tolist()} "
+                        f"bounds={bounds[:dim]}"
+                    )
+                logger.debug("BC_DIAG raw targets: %s", " | ".join(msg)[:2000])
+
             param_loss = torch.tensor(0.0)
             param_dims = ExperienceExtractor.get_param_dims()
+            per_type_param_losses = {}
             for type_id in range(self.num_types):
                 dim = param_dims[type_id]
                 if dim == 0:
@@ -816,25 +1167,111 @@ class PSACTrainer:
                     )
                 else:
                     target_pretanh = target_raw
-                param_loss = param_loss + F.mse_loss(
-                    pred_mu, target_pretanh
-                )
 
+                mse = F.mse_loss(pred_mu, target_pretanh)
+                param_loss = param_loss + mse
+                per_type_param_losses[int(type_id)] = float(mse.detach().cpu().item())
+
+                if type_id == 0 and not hasattr(self, "_bc_mu_once"):
+                    self._bc_mu_once = True
+                    with torch.no_grad():
+                        logger.info(
+                            "BC_TYPE0_DETAIL: mse=%.3e | pred_mu[min=%.3e max=%.3e mean=%.3e] | "
+                            "tpret[min=%.3e max=%.3e mean=%.3e]",
+                            float(mse.detach().cpu().item()),
+                            float(pred_mu.min().item()), float(pred_mu.max().item()), float(pred_mu.mean().item()),
+                            float(target_pretanh.min().item()), float(target_pretanh.max().item()), float(target_pretanh.mean().item()),
+                        )
+                # ─────────────────────────────────────────────
+                # DIAG: saturation + pretanh range
+                # ─────────────────────────────────────────────
+                if hasattr(self, "_bc_diag_counter") and self._bc_diag_counter % 200 == 0:
+                    sat = (target_norm.abs() > 0.98).float().mean().item()
+                    tn_min = float(target_norm.min().item())
+                    tn_max = float(target_norm.max().item())
+                    tp_min = float(target_pretanh.min().item())
+                    tp_max = float(target_pretanh.max().item())
+                    pm_min = float(pred_mu.min().item())
+                    pm_max = float(pred_mu.max().item())
+
+                    logger.debug(
+                        "BC_DIAG type=%d dim=%d: sat_frac=%.3f target_norm[min=%.3f max=%.3f] "
+                        "pretanh[min=%.3f max=%.3f] pred_mu[min=%.3f max=%.3f]",
+                        type_id, dim, sat, tn_min, tn_max, tp_min, tp_max, pm_min, pm_max
+                    )
+
+            if not hasattr(self, "_bc_paramloss_once"):
+                self._bc_paramloss_once = True
+                # top-3 types by mse
+                top = sorted(per_type_param_losses.items(), key=lambda x: -x[1])[:3]
+                logger.info("BC_PARAMLOSS_TOP3: %s", top)
+            
             bc_loss = type_loss + param_loss
 
+        # --- NaN guard (actor) ---
+        if not torch.isfinite(sac_loss):
+            logger.error("NAN_GUARD actor: sac_loss non-finite: %s", sac_loss.detach().cpu().numpy())
+        if hasattr(bc_loss, "detach") and (not torch.isfinite(bc_loss)):
+            logger.error("NAN_GUARD actor: bc_loss non-finite: %s", bc_loss.detach().cpu().numpy())
+        
         actor_loss = sac_loss + self.bc_lambda * bc_loss
 
+        if not torch.isfinite(actor_loss):
+            logger.error(
+                "NAN_GUARD actor: actor_loss non-finite | sac=%.4e bc=%.4e lam=%.4e",
+                float(sac_loss.detach().cpu().item()),
+                float(bc_loss.detach().cpu().item()) if hasattr(bc_loss, "detach") else float(bc_loss),
+                float(self.bc_lambda),
+            )
+            # дополнительно: статистика выходов policy на states batch
+            with torch.no_grad():
+                at, ap, logp, tprobs = self.actor.sample(states)
+                logger.error(
+                    "NAN_GUARD actor outputs: logp[min=%.3e max=%.3e mean=%.3e] ap[min=%.3e max=%.3e] tprob[min=%.3e max=%.3e]",
+                    float(logp.min().item()), float(logp.max().item()), float(logp.mean().item()),
+                    float(ap.min().item()), float(ap.max().item()),
+                    float(tprobs.min().item()), float(tprobs.max().item()),
+                )
+            return float("nan"), float("nan")
+
         self.actor_optimizer.zero_grad()
+
+        if not torch.isfinite(actor_loss):
+            logger.error(
+                "ACTOR_LOSS is not finite! sac=%.4e bc=%.4e lam=%.4e",
+                float(sac_loss.detach().cpu().item()),
+                float(bc_loss.detach().cpu().item()) if hasattr(bc_loss, "detach") else float(bc_loss),
+                float(self.bc_lambda),
+            )
+        
         actor_loss.backward()
+
+        if hasattr(self, "_bc_diag_counter") and self._bc_diag_counter % 200 == 0:
+            total_norm = 0.0
+            for p in self.actor.parameters():
+                if p.grad is None:
+                    continue
+                g = p.grad.data
+                if torch.isfinite(g).all():
+                    total_norm += float(g.norm(2).item())
+                else:
+                    logger.error("Non-finite grads in actor!")
+                    break
+            logger.debug("BC_DIAG actor_grad_norm(sumL2)=%.4e", total_norm)
         torch.nn.utils.clip_grad_norm_(
             self.actor.parameters(), 0.5
         )
+
         self.actor_optimizer.step()
 
         self.bc_lambda = max(
             self.bc_lambda * self.bc_lambda_decay,
             self.bc_lambda_min,
         )
+
+        self._last_sac_loss = float(sac_loss.item())
+        self._last_bc_loss = float(bc_loss.item())
+        self._last_actor_loss = float(actor_loss.item())
 
         return sac_loss.item(), bc_loss.item()
 
@@ -873,6 +1310,12 @@ class PSACTrainer:
         self.alpha_optimizer.zero_grad()
         alpha_loss.backward()
         self.alpha_optimizer.step()
+
+        if not torch.isfinite(alpha_loss):
+            logger.error(
+                "NAN_GUARD alpha: alpha_loss non-finite | logp_mean=%s",
+                (-log_prob.mean()).detach().cpu().numpy()
+            )
 
         with torch.no_grad():
             self.log_alpha_type.clamp_(
@@ -1436,6 +1879,9 @@ class PSACTrainer:
         episode_pools: dict[str, Any] | None = None,
         visualise = None,
         mesh_name: str = "",
+        current_ratio: float = 0.6,
+        bc_ratio: float = 0.2,
+        elite_ratio: float = 0.2,
     ) -> None:
         """Run SAC training loop with strategic override."""
         interpreter = ActionInterpreter(env)
@@ -1941,9 +2387,9 @@ class PSACTrainer:
                                 current_mesh=(
                                     mesh_name
                                 ),
-                                current_ratio=0.5,
-                                bc_ratio=0.1,
-                                elite_ratio=0.1,
+                                current_ratio=current_ratio,
+                                bc_ratio=bc_ratio,
+                                elite_ratio=elite_ratio,
                             )
                         )
 

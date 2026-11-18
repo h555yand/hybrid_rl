@@ -190,7 +190,39 @@ class AdaptiveTrainingManager:
             logger.warning("Sleep SAC skipped: no success trails")
             return {"status": "skipped", "reason": "no_success_trails"}
 
+        def _trail_lens(trails):
+            if not trails:
+                return []
+            return [len(t) for t in trails if isinstance(t, list)]
+
+        succ_lens = _trail_lens(success_trails)
+        fail_lens = _trail_lens(failure_trails)
+
+        logger.info(
+            "Sleep SAC input: success_trails=%d (mean_len=%.1f, min=%s, max=%s), "
+            "failure_trails=%d (mean_len=%.1f, min=%s, max=%s)",
+            len(success_trails),
+            float(np.mean(succ_lens)) if succ_lens else 0.0,
+            int(np.min(succ_lens)) if succ_lens else None,
+            int(np.max(succ_lens)) if succ_lens else None,
+            len(failure_trails),
+            float(np.mean(fail_lens)) if fail_lens else 0.0,
+            int(np.min(fail_lens)) if fail_lens else None,
+            int(np.max(fail_lens)) if fail_lens else None,
+        )
+
         mesh_name = object_name
+
+        # ===== BUFFER DEBUG: before adding sleep data =====
+        buf = self.sac_trainer.buffer
+        stats0 = buf.get_stats()
+        logger.info("SLEEP_BUF BEFORE add: total=%d objects=%s",
+                    stats0.get("total_size", -1),
+                    list(stats0.get("objects", {}).keys()))
+
+        logger.info("SLEEP_BUF BEFORE add: mesh='%s' buckets=%s",
+                    mesh_name,
+                    stats0.get("objects", {}).get(mesh_name, {"online": 0, "bc": 0, "elite": 0}))
 
         # ═══ 1. Convert trails to PSACTransition ═══
         success_psac = self.extractor.convert_all_trajectories(
@@ -207,11 +239,30 @@ class AdaptiveTrainingManager:
             len(failure_psac), len(failure_trails),
         )
 
+        def _miss_next(psac):
+            return sum(1 for tr in psac if tr.next_state is None)
+
+        logger.info(
+            "SLEEP_BUF PSAC: success=%d miss_next=%d | failure=%d miss_next=%d",
+            len(success_psac), _miss_next(success_psac),
+            len(failure_psac), _miss_next(failure_psac),
+        )
+
         # ═══ 2. Normalize and load into buffer ═══
         all_psac = success_psac + failure_psac
         all_normalized = self.sac_trainer._normalize_bc_transitions(all_psac)
 
+        logger.info("SLEEP_BUF normalized: total=%d (success=%d failure=%d)",
+            len(all_normalized),
+            len(success_psac),
+            len(failure_psac))
+
         self.sac_trainer.buffer.set_current_mesh(mesh_name)
+
+        buf_before = self.sac_trainer.buffer.get_stats()
+        mesh_before = buf_before["objects"].get(mesh_name, {"online": 0, "bc": 0, "elite": 0})
+        total_before = buf_before["total_size"]
+
         added = 0
         for tr in all_normalized:
             if tr.next_state is None:
@@ -226,6 +277,20 @@ class AdaptiveTrainingManager:
                 mesh_name=mesh_name,
             )
             added += 1
+
+        buf_after = self.sac_trainer.buffer.get_stats()
+        mesh_after = buf_after["objects"].get(mesh_name, {"online": 0, "bc": 0, "elite": 0})
+        total_after = buf_after["total_size"]
+
+        logger.info(
+            "SLEEP_BUF AFTER add: mesh='%s' online %d→%d | bc %d→%d | elite %d→%d | total %d→%d | added=%d",
+            mesh_name,
+            mesh_before.get("online", 0), mesh_after.get("online", 0),
+            mesh_before.get("bc", 0), mesh_after.get("bc", 0),
+            mesh_before.get("elite", 0), mesh_after.get("elite", 0),
+            total_before, total_after,
+            added,
+        )
 
         # ═══ 3. Update BC data (success only → actor BC loss) ═══
         success_normalized = self.sac_trainer._normalize_bc_transitions(
@@ -245,6 +310,30 @@ class AdaptiveTrainingManager:
             self.sac_trainer.bc_data = combined_bc
         else:
             self.sac_trainer.bc_data = list(success_normalized)
+
+        # ─────────────────────────────────────────────
+        # Elite bucket: push SUCCESS transitions of current object
+        # so elite_ratio in sample_balanced actually works
+        # ─────────────────────────────────────────────
+        elite_added = 0
+        for tr in success_normalized:
+            if tr.next_state is None:
+                continue
+            self.sac_trainer.buffer.add_elite(
+                state=tr.state,
+                action_type=tr.action_type,
+                action_params=tr.action_params,
+                reward=tr.reward,
+                next_state=tr.next_state,
+                done=tr.done,
+                mesh_name=mesh_name,
+            )
+            elite_added += 1
+
+        logger.info(
+            "Sleep SAC: elite bucket filled for %s: elite_added=%d",
+            mesh_name, elite_added,
+        )
 
         if len(self.sac_trainer.buffer) < self.sac_trainer.batch_size:
             logger.warning(
@@ -269,6 +358,12 @@ class AdaptiveTrainingManager:
         # ═══ 6. SGD loop ═══
         critic_losses = []
         actor_losses = []
+
+        s = self.sac_trainer.buffer.get_stats()["objects"].get(mesh_name, {})
+        logger.info(
+            "SLEEP_BUF PRE-SGD mesh='%s' sizes: online=%d bc=%d elite=%d",
+            mesh_name, s.get("online", 0), s.get("bc", 0), s.get("elite", 0)
+        )
 
         for step_i in range(sac_update_steps):
             batch = self.sac_trainer.buffer.sample_balanced(
@@ -298,10 +393,36 @@ class AdaptiveTrainingManager:
             # Logging
             if (step_i + 1) % 500 == 0:
                 logger.info(
+                    "Sleep SGD %d/%d | critic=%.4f (td=%.4f cql=%.4f a=%.3f) | "
+                    "actor=%.4f (sac=%.4f bc=%.4f lam=%.3f) | ",
+                    step_i + 1, sac_update_steps,
+                    getattr(self.sac_trainer, "_last_critic_loss", float("nan")),
+                    getattr(self.sac_trainer, "_last_td_loss", float("nan")),
+                    getattr(self.sac_trainer, "_last_cql_penalty", float("nan")),
+                    float(self.sac_trainer.cql_alpha),
+                    getattr(self.sac_trainer, "_last_actor_loss", float("nan")),
+                    getattr(self.sac_trainer, "_last_sac_loss", float("nan")),
+                    getattr(self.sac_trainer, "_last_bc_loss", float("nan")),
+                    float(self.sac_trainer.bc_lambda),
+                )
+            if (step_i + 1) % 500 == 0:
+                logger.info(
                     "Sleep SAC step %d/%d: bc_lambda=%.3f, actor=%s",
                     step_i + 1, sac_update_steps,
                     self.sac_trainer.bc_lambda,
                     "active" if step_i >= critic_warmup_steps else "warmup",
+                )
+            if (step_i + 1) % 500 == 0:
+                # action type histogram in the sampled batch
+                uniq, cnt = np.unique(batch["action_types"], return_counts=True)
+                hist = {int(k): int(v) for k, v in zip(uniq, cnt)}
+                logger.info(
+                    "SLEEP_BUF batch@%d: n=%d current_mesh='%s' ratios(cur=%.2f bc=%.2f elite=%.2f) act_hist=%s",
+                    step_i + 1,
+                    len(batch["action_types"]),
+                    mesh_name,
+                    current_mesh_ratio, bc_ratio, elite_ratio,
+                    hist,
                 )
 
         # ═══ 7. Restore settings ═══
@@ -374,7 +495,8 @@ class AdaptiveTrainingManager:
         )
 
     def decide_mode(self) -> str:
-        level_history_len = 50
+        # dont trigger mastered ata the moment
+        level_history_len = 1_000_000
         current_level = self.arbitrator._current_level
         level_history = self._level_success_history.get(current_level)
 
@@ -392,6 +514,7 @@ class AdaptiveTrainingManager:
         sac_track = self.arbitrator._get_track(sac_results)
         blend_track = self.arbitrator._get_track(blend_results)
         best_ml_track = max(q_track, sac_track, blend_track)
+        worst_ml_track = min(q_track, sac_track, blend_track)
         h_track = max(h_track, 0.1)
 
         # --- Mastered hysteresis based on Q only ---
@@ -403,11 +526,11 @@ class AdaptiveTrainingManager:
 
         if self.mode == "mastered":
             # stay mastered while Q remains good
-            if q_evals >= min_q_evals and q_track >= exit_thr:
+            if q_evals >= min_q_evals and worst_ml_track >= exit_thr:
                 return "mastered"
             # else fall through
         else:
-            if q_evals >= min_q_evals and q_track >= enter_thr:
+            if q_evals >= min_q_evals and worst_ml_track >= enter_thr:
                 return "mastered"
 
         return "online"

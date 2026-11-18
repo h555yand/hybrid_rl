@@ -30,6 +30,7 @@ import types
 from pathlib import Path
 from typing import Any
 import random
+import os
 
 import numpy as np
 import torch
@@ -47,7 +48,7 @@ from .adaptive_manager import AdaptiveTrainingManager
 from .behavioral_cloning import BCTrainer
 from .config import DEFAULT_CONFIG
 from .episode_pools import get_or_generate_pools
-from .experience_extractor import ExperienceExtractor
+from .experience_extractor import ExperienceExtractor, PSACTransition
 from .lightweight_env import LightweightEnv
 from .mesh_factory import prepare_demo_meshes
 from .rl_goal_approach_controller import (
@@ -2450,9 +2451,9 @@ class RLGoalApproachExperiment:
         import pickle
 
         # ═══ Sleep trails collection ═══
-        _MAX_SUCCESS_TRAILS_PER_LEVEL = 200
-        _MAX_FAILURE_TRAILS_PER_LEVEL = 100
-        _SLEEP_TRAILS_SAVE_EVERY = 200  # save periodically
+        _MAX_SUCCESS_TRAILS_PER_LEVEL = 1000
+        _MAX_FAILURE_TRAILS_PER_LEVEL = 200
+        _SLEEP_TRAILS_SAVE_EVERY = 100  # save periodically
 
         # ═══ Sleep-Q normalization data (NEW) ═══
         _SLEEP_Q_SAVE_EVERY = _SLEEP_TRAILS_SAVE_EVERY
@@ -2486,6 +2487,8 @@ class RLGoalApproachExperiment:
 
         sleep_success_trails: dict[int, list] = {}
         sleep_failure_trails: dict[int, list] = {}
+        sleep_tasks_by_level: dict[int, list] = {}  # NEW: replay tasks (start/goal)
+        _MAX_TASKS_PER_LEVEL = 2000                 # cap
 
         logger.info("=" * 60)
         logger.info(
@@ -2713,6 +2716,29 @@ class RLGoalApproachExperiment:
 
             controller.set_new_goal(goal_pose, start_pos)
             online_env.set_goal(goal_pose)
+            # ─────────────────────────────────────────────
+            # NEW: Save task (start/goal) for Sleep v2 replay
+            # ─────────────────────────────────────────────
+            start_pose_full = online_env.get_pose().copy()  # [pos(3), rot(3)]
+            sensor0 = online_env.get_sensor_data()
+
+            task_entry = {
+                "episode": int(episode),
+                "level": int(adaptive_level),
+
+                "start_pos": start_pose_full[:3].tolist(),
+                "start_rot": start_pose_full[3:].tolist(),
+
+                "goal_pos": np.array(goal_pose[:3], dtype=float).tolist(),
+                "goal_rot": np.array(goal_pose[3:], dtype=float).tolist(),
+
+                # optional diagnostics (may be useful for filtering in sleep)
+                "same_side": bool(sensor0.get("same_side", True)),
+                "path_blocked": bool(sensor0.get("path_blocked", False)),
+                "handle_between": bool(level_filter.get("handle_between", False)),
+                "fallback_goal": bool(is_fallback_episode),
+            }
+
             manager.arbitrator.start_episode(level=adaptive_level)
 
             goals_before = controller._total_goals_reached
@@ -2778,16 +2804,10 @@ class RLGoalApproachExperiment:
                         )
                         _cap_list(lvl_bucket["sample"]["free"], _SLEEP_Q_MAX_STATES_PER_LEVEL)
                     else:
-                        if same_side_state:
-                            lvl_bucket["sample"]["surface"].append(
-                                state.astype(np.float32, copy=False)
-                            )
-                            _cap_list(lvl_bucket["sample"]["surface"], _SLEEP_Q_MAX_STATES_PER_LEVEL)
-                        else:
-                            lvl_bucket["sample"]["bypass"].append(
-                                state.astype(np.float32, copy=False)
-                            )
-                            _cap_list(lvl_bucket["sample"]["bypass"], _SLEEP_Q_MAX_STATES_PER_LEVEL)
+                        lvl_bucket["sample"]["surface"].append(
+                            state.astype(np.float32, copy=False)
+                        )
+                        _cap_list(lvl_bucket["sample"]["surface"], _SLEEP_Q_MAX_STATES_PER_LEVEL)
 
                 # ═══ Per-episode Q diagnostics ═══
                 # Q confidence уже посчитан внутри arbitrator._get_q_action
@@ -2930,17 +2950,23 @@ class RLGoalApproachExperiment:
             if last_transitions:
                 if success:
                     sleep_success_trails.setdefault(adaptive_level, [])
-                    # sleep_success_trails[adaptive_level].append(last_transitions)
-                    sleep_success_trails[adaptive_level].extend(
-                        [t for t in last_transitions if t.get("source") == "heuristic"]
+                    # heuristic ratio
+                    heur_steps = sum(
+                        1 for t in last_transitions
+                        if t.get("source") == "heuristic"
                     )
+                    all_steps = len(last_transitions)
+                    ratio = heur_steps / max(all_steps, 1)
+                    if ratio >= 0.50 and all_steps < 100:
+                        sleep_success_trails[adaptive_level].append(last_transitions)
+
                     if len(sleep_success_trails[adaptive_level]) > _MAX_SUCCESS_TRAILS_PER_LEVEL:
                         sleep_success_trails[adaptive_level] = (
                             sleep_success_trails[adaptive_level][-_MAX_SUCCESS_TRAILS_PER_LEVEL:]
                         )
                 else:
-                    # Failures for critic: sample ~30%
-                    if np.random.random() < 0.3:
+                    # Failures for critic: sample ~10%
+                    if np.random.random() < 0.1:
                         sleep_failure_trails.setdefault(adaptive_level, [])
                         sleep_failure_trails[adaptive_level].append(last_transitions)
                         #sleep_failure_trails[adaptive_level].extend(
@@ -3004,6 +3030,21 @@ class RLGoalApproachExperiment:
             src_stats["episode_steps"].append(ep_steps)
             if success:
                 src_stats["success_steps"].append(ep_steps)
+
+            # ─────────────────────────────────────────────
+            # NEW: finalize and store task for sleep replay
+            # ─────────────────────────────────────────────
+            task_entry.update({
+                "success": bool(success),
+                "termination": str(termination),
+                "steps": int(ep_steps),
+                "dominant_source": str(dominant_source_key),
+                "final_distance": float(final_dist),
+            })
+
+            sleep_tasks_by_level.setdefault(adaptive_level, []).append(task_entry)
+            if len(sleep_tasks_by_level[adaptive_level]) > _MAX_TASKS_PER_LEVEL:
+                sleep_tasks_by_level[adaptive_level] = sleep_tasks_by_level[adaptive_level][-_MAX_TASKS_PER_LEVEL:]
 
             # Manager update (offline retrain uses offline_env)
             manager.on_episode_complete(
@@ -3161,7 +3202,12 @@ class RLGoalApproachExperiment:
                         sleep_success_trails, sleep_failure_trails,
                         ep_successes, adaptive_level,
                         level_episode_steps, level_success_steps,
+                        tasks_by_level=sleep_tasks_by_level,   # NEW
                         sleep_q_norm=sleep_q_norm,
+                        q_success_rate=snapshot["arbitrator"]["q_success_rate"],
+                        sac_success_rate=snapshot["arbitrator"]["sac_success_rate"],
+                        blend_success_rate=snapshot["arbitrator"]["blend_success_rate"]
+
                     )
                 logger.info(
                     "Adaptive ep %d: rate=%.3f, mode=%s",
@@ -3174,7 +3220,11 @@ class RLGoalApproachExperiment:
             sleep_success_trails, sleep_failure_trails,
             ep_successes, adaptive_level,
             level_episode_steps, level_success_steps,
+            tasks_by_level=sleep_tasks_by_level,   # NEW
             sleep_q_norm=sleep_q_norm,
+            q_success_rate=snapshot["arbitrator"]["q_success_rate"],
+            sac_success_rate=snapshot["arbitrator"]["sac_success_rate"],
+            blend_success_rate=snapshot["arbitrator"]["blend_success_rate"]
         )
         # ═══ Final Q-store diagnostics ═══
         q_final_free = len(controller.q_store_free.points)
@@ -3326,19 +3376,14 @@ class RLGoalApproachExperiment:
         current_level: int,
         level_episode_steps: dict[int, list],
         level_success_steps: dict[int, list],
+        tasks_by_level: dict[int, list] | None = None,
         sleep_q_norm: dict | None = None,
+        q_success_rate=None,
+        sac_success_rate=None,
+        blend_success_rate=None,
     ) -> None:
         """Save sleep trails to disk for offline SAC consolidation."""
         # Per-level success rates
-        success_rate_by_level = {}
-        trails_count_by_level = {}
-        
-        for lvl in sorted(set(list(success_trails.keys()) + list(failure_trails.keys()))):
-            s_count = len(success_trails.get(lvl, []))
-            f_count = len(failure_trails.get(lvl, []))
-            total = s_count + f_count
-            success_rate_by_level[lvl] = round(s_count / max(total, 1), 3)
-            trails_count_by_level[lvl] = {"success": s_count, "failure": f_count}
 
         sleep_data = {
             "mesh_name": mesh_name,
@@ -3351,9 +3396,11 @@ class RLGoalApproachExperiment:
                 "overall_success_rate": round(
                     sum(ep_successes) / max(len(ep_successes), 1), 3
                 ),
-                "success_rate_by_level": success_rate_by_level,
-                "trails_count_by_level": trails_count_by_level,
+                "q_success_rate": {"level": current_level, "q_success_rate": q_success_rate},
+                "sac_success_rate": {"level": current_level, "sac_success_rate": sac_success_rate},
+                "blend_success_rate": {"level": current_level, "blend_success_rate": blend_success_rate},
             },
+            "tasks_by_level": tasks_by_level if tasks_by_level is not None else {},
         }
 
         path = log_dir / "sleep_trails.pkl"
@@ -3361,8 +3408,8 @@ class RLGoalApproachExperiment:
             pickle.dump(sleep_data, f)
 
         logger.info(
-            "Sleep trails saved: ep=%d, levels=%s, path=%s",
-            episode, trails_count_by_level, path,
+            "Sleep trails saved: ep=%d, level=%s, path=%s",
+            episode, current_level, path,
         )
 
         # ═══ Save sleep-Q normalization data (NEW) ═══
@@ -3667,7 +3714,7 @@ class RLGoalApproachExperiment:
 
         sleep_cfg = self.config.get("sleep_config", {})
         success_threshold = sleep_cfg.get("success_threshold", 0.80)
-        min_success_trails = sleep_cfg.get("min_success_trails", 20)
+        min_success_trails = sleep_cfg.get("min_success_trails", 100)
 
         def _cap_list(lst, cap: int):
             if len(lst) > cap:
@@ -3929,8 +3976,9 @@ class RLGoalApproachExperiment:
             controller.save(q_dir)
             logger.info("Sleep Q-norm: controller saved to %s", q_dir)
 
-
+        ############################################
         # ═══ Load sleep-SAC ═══
+        ###########################################
         if not trails_path.exists():
             logger.warning("Sleep skipped: no trails file at %s", trails_path)
             return
@@ -3942,6 +3990,7 @@ class RLGoalApproachExperiment:
         stats = sleep_data.get("stats", {})
         success_trails_by_level = sleep_data.get("success_trails_by_level", {})
         failure_trails_by_level = sleep_data.get("failure_trails_by_level", {})
+        tasks_by_level = sleep_data.get("tasks_by_level", {})
 
         logger.info(
             "Sleep: loaded trails for %s — %s",
@@ -3950,7 +3999,7 @@ class RLGoalApproachExperiment:
 
         # ═══ Check conditions per level ═══
         levels_to_consolidate = []
-        rate_by_level = stats.get("success_rate_by_level", {})
+        rate_by_level = stats.get("sac_success_rate", {})
 
         for level in sorted(success_trails_by_level.keys()):
             level_rate = rate_by_level.get(level, 0.0)
@@ -3976,9 +4025,19 @@ class RLGoalApproachExperiment:
                 level, level_rate, len(level_trails),
             )
 
+        sleep_tasks = []
+        for lvl in levels_to_consolidate:
+            sleep_tasks.extend(tasks_by_level.get(lvl, []))
+
+        if not sleep_tasks:
+            logger.warning("Sleep skipped: no tasks found for levels=%s", levels_to_consolidate)
+            return
+            
         if not levels_to_consolidate:
             logger.info("Sleep: nothing to consolidate for %s", mesh_name)
             return
+        
+        episode_pools = {"levels": [sleep_tasks]}
 
         # ═══ Load SAC trainer ═══
         num_types = len(ExperienceExtractor.get_type_names())
@@ -3987,9 +4046,21 @@ class RLGoalApproachExperiment:
         )
         sac_model_dir = self._sac_model_dir(self.sac_seed)
 
+        sac_cfg = {
+            k: v
+            for k, v in self.sac_config.items()
+            if k != "load_mode"
+        }
+        
+        # sleep overrides
+        sleep_cfg = self.config.get("sleep_config", {})
+        if "actor_warmup_per_level" in sleep_cfg:
+            sac_cfg["actor_warmup_per_level"] = int(sleep_cfg["actor_warmup_per_level"])
+
         sac_trainer = PSACTrainer(
             state_dim=self.rl_config.get("state_dim", 20),
             num_types=num_types,
+            **sac_cfg,
         )
 
         # Prefer adaptive SAC (already fine-tuned), fallback to training SAC
@@ -4003,52 +4074,388 @@ class RLGoalApproachExperiment:
             logger.warning("Sleep: no SAC model found, skipping")
             return
 
-        # ═══ Create manager for consolidation ═══
-        adaptive_cfg = {**self.rl_config, "mode": "adaptive"}
-        adapt_q_dir = str(
-            self.runs_dir / f"adaptive_q_seed_{self.train_seeds[0]}"
+        # ─────────────────────────────────────────────
+        # ─────────────────────────────────────────────
+        # Load BASE BC memory into replay buffer (bc_buckets)
+        # + Build RAW pools for actor BC anchor (anti-forgetting)
+        # NOTE: we postpone normalization until after we compute sleep SAC-norm.
+        # ─────────────────────────────────────────────
+        base_bc_raw: list[PSACTransition] = []
+        bc_combined_path = self.data_dir / "bc_data_combined.pkl"
+        if bc_combined_path.exists():
+            try:
+                with bc_combined_path.open("rb") as f:
+                    base_bc_raw = pickle.load(f)  # expected: List[PSACTransition] with RAW state
+
+                logger.info("SLEEP: base BC raw loaded: n=%d", len(base_bc_raw))
+            except Exception as exc:
+                logger.warning("SLEEP: failed to load base BC (%s): %s", bc_combined_path, exc)
+                base_bc_raw = []
+        else:
+            logger.warning("SLEEP: no bc_data_combined.pkl at %s (skip base BC)", bc_combined_path)
+
+        # ─────────────────────────────────────────────
+        # Sleep v2 BC mix:
+        # Use heuristic success trails as "novel BC" for this mesh,
+        # keep base BC as anti-forgetting anchor.
+        # ─────────────────────────────────────────────
+
+        # 1) Collect heuristic success trails for selected levels
+        vase_success_trails = []
+        for lvl in levels_to_consolidate:
+            vase_success_trails.extend(success_trails_by_level.get(lvl, []))
+
+        logger.info(
+            "SLEEP: vase success trails for BC: levels=%s, trails=%d",
+            levels_to_consolidate,
+            len(vase_success_trails),
         )
 
-        manager = AdaptiveTrainingManager(
-            controller=None,
-            env=None,
-            config=adaptive_cfg,
-            runs_dir=str(self.runs_dir),
-            mesh_path=str(self.data_dir / f"{mesh_name}.stl"),
-            q_save_dir=adapt_q_dir,
-            sac_save_dir=adapt_sac_dir,
-        )
+        # 2) Convert trails -> RAW PSACTransition (no normalization here yet)
+        vase_demo_raw: list[PSACTransition] = []
+        if vase_success_trails:
+            try:
+                extractor = ExperienceExtractor(config=self.rl_config, mesh_name=mesh_name)
 
-        manager.sac_trainer = sac_trainer
+                # IMPORTANT: if you want level-aware features later, pass lvl here per-trail.
+                # For now keep as-is (your previous code used level=0).
+                vase_demo_raw = extractor.convert_all_trajectories(vase_success_trails, level=0)
 
-        # ═══ Consolidate each level ═══
-        sleep_results = []
+                logger.info(
+                    "SLEEP: vase demo RAW transitions built: raw=%d (missing_next_raw=%d)",
+                    len(vase_demo_raw),
+                    sum(1 for tr in vase_demo_raw if tr.next_state is None),
+                )
+            except Exception as exc:
+                logger.warning("SLEEP: failed to build vase demo RAW: %s", exc)
+                vase_demo_raw = []
+        else:
+            logger.warning("SLEEP: no vase success trails found -> vase demo RAW will be empty")
 
-        for level in levels_to_consolidate:
-            success_trails = success_trails_by_level.get(level, [])
-            failure_trails = failure_trails_by_level.get(level, [])
+        # ─────────────────────────────────────────────
+        # 3) Sleep SAC-norm (NEW): recompute state_mean/std for this sleep run
+        # Must happen BEFORE _normalize_bc_transitions / buffer.load_bc_data.
+        # ─────────────────────────────────────────────
+        norm_cfg = sleep_cfg.get("sleep_sac_norm", {})
+        norm_enabled = bool(norm_cfg.get("enabled", True))
+        norm_cap_total = int(norm_cfg.get("max_states_total", 50000))
+        norm_cap_base = int(norm_cfg.get("max_base_states", 25000))
+        norm_cap_vase = int(norm_cfg.get("max_vase_states", 25000))
+        min_std = float(norm_cfg.get("min_std", 1e-3))
 
-            result = manager.sleep_sac_consolidation(
-                object_name=mesh_name,
-                success_trails=success_trails,
-                failure_trails=failure_trails,
-                level=level,
-                sac_update_steps=sleep_cfg.get("sac_update_steps", 3000),
-                critic_warmup_steps=sleep_cfg.get("critic_warmup_steps", 200),
-                actor_update_every=sleep_cfg.get("actor_update_every", 5),
-                actor_lr_scale=sleep_cfg.get("actor_lr_scale", 0.3),
-                bc_lambda_init=sleep_cfg.get("bc_lambda_init", 3.0),
-                bc_lambda_decay=sleep_cfg.get("bc_lambda_decay", 0.999),
-                bc_lambda_min=sleep_cfg.get("bc_lambda_min", 0.3),
-                use_cql=sleep_cfg.get("use_cql", True),
-                cql_alpha=sleep_cfg.get("cql_alpha", 0.5),
-                current_mesh_ratio=sleep_cfg.get("current_mesh_ratio", 0.7),
-                bc_ratio=sleep_cfg.get("bc_ratio", 0.2),
-                elite_ratio=sleep_cfg.get("elite_ratio", 0.1),
+        def _sample_states(transitions: list[PSACTransition], cap: int) -> list[np.ndarray]:
+            if not transitions:
+                return []
+            if len(transitions) <= cap:
+                return [tr.state for tr in transitions]
+            idx = np.random.choice(len(transitions), cap, replace=False)
+            return [transitions[i].state for i in idx]
+
+        def _maxabs_z(states: list[np.ndarray], mean: np.ndarray, std: np.ndarray, cap: int = 2000) -> float:
+            if not states:
+                return 0.0
+            arr = np.asarray(states[:cap], dtype=np.float32)
+            z = (arr - mean) / (std + 1e-8)
+            return float(np.max(np.abs(z)))
+
+        if norm_enabled:
+            old_mean = sac_trainer.state_mean
+            old_std = sac_trainer.state_std
+
+            base_states = _sample_states(base_bc_raw, norm_cap_base)
+            vase_states = _sample_states(vase_demo_raw, norm_cap_vase)
+
+            mix_states = base_states + vase_states
+            if len(mix_states) > norm_cap_total:
+                idx = np.random.choice(len(mix_states), norm_cap_total, replace=False)
+                mix_states = [mix_states[i] for i in idx]
+
+            if len(mix_states) >= 100:
+                X = np.asarray(mix_states, dtype=np.float32)
+                sleep_mean = X.mean(axis=0)
+                sleep_std = np.maximum(X.std(axis=0), min_std)
+
+                before = 0.0
+                if old_mean is not None and old_std is not None:
+                    before = _maxabs_z(vase_states, old_mean, old_std)
+
+                after = _maxabs_z(vase_states, sleep_mean, sleep_std)
+
+                sac_trainer.state_mean = sleep_mean
+                sac_trainer.state_std = sleep_std
+
+                logger.info(
+                    "SLEEP SAC-norm applied: n_mix=%d (base=%d vase=%d) min_std=%.1e | "
+                    "vase_z_maxabs before=%.3e after=%.3e",
+                    len(mix_states), len(base_states), len(vase_states), min_std,
+                    before, after,
+                )
+            else:
+                logger.warning(
+                    "SLEEP SAC-norm skipped: not enough mix_states=%d (need >=100)",
+                    len(mix_states),
+                )
+        else:
+            logger.info("SLEEP SAC-norm disabled by config")
+
+        # ─────────────────────────────────────────────
+        # 4) Now normalize transitions with updated SAC-norm and load into buffer
+        # ─────────────────────────────────────────────
+        base_bc_norm: list[PSACTransition] = []
+        if base_bc_raw:
+            base_bc_norm = sac_trainer._normalize_bc_transitions(base_bc_raw)  # noqa: SLF001
+            sac_trainer.buffer.load_bc_data(base_bc_norm)
+
+            st = sac_trainer.buffer.get_stats()
+            bc_total = sum(v["bc"] for v in st.get("objects", {}).values())
+            logger.info(
+                "SLEEP: base BC loaded into bc_buckets: requested=%d, actually_loaded=%d, per_object_cap=%d",
+                len(base_bc_norm),
+                bc_total,
+                sac_trainer.buffer.bc_capacity_per_object,
             )
-            sleep_results.append(result)
+        else:
+            logger.warning("SLEEP: base BC raw empty -> skip buffer.load_bc_data")
+
+        vase_demo_norm: list[PSACTransition] = []
+        if vase_demo_raw:
+            vase_demo_norm = sac_trainer._normalize_bc_transitions(vase_demo_raw)  # noqa: SLF001
+            logger.info(
+                "SLEEP: vase demo NORM transitions built: raw=%d normalized=%d (missing_next=%d)",
+                len(vase_demo_raw),
+                len(vase_demo_norm),
+                sum(1 for tr in vase_demo_norm if tr.next_state is None),
+            )
+        else:
+            logger.warning("SLEEP: vase demo RAW empty -> vase demo NORM will be empty")
+
+        # ─────────────────────────────────────────────
+        # 5) Build RAW BC mix for actor BC-loss (used by update_actor())
+        # Keep proportions base:new
+        # ─────────────────────────────────────────────
+        base_keep = int(sleep_cfg.get("sleep_bc_base_keep", 12000))
+        vase_keep = int(sleep_cfg.get("sleep_bc_vase_keep", 12000))
+
+        if base_bc_raw:
+            if len(base_bc_raw) > base_keep:
+                idx = np.random.choice(len(base_bc_raw), base_keep, replace=False)
+                base_part_raw = [base_bc_raw[i] for i in idx]
+            else:
+                base_part_raw = list(base_bc_raw)
+        else:
+            base_part_raw = []
+
+        if vase_demo_raw:
+            if len(vase_demo_raw) > vase_keep:
+                idx = np.random.choice(len(vase_demo_raw), vase_keep, replace=False)
+                vase_part_raw = [vase_demo_raw[i] for i in idx]
+            else:
+                vase_part_raw = list(vase_demo_raw)
+        else:
+            vase_part_raw = []
+
+        sac_trainer.bc_data = base_part_raw + vase_part_raw
+        np.random.shuffle(sac_trainer.bc_data)
+
+        logger.info(
+            "SLEEP: BC mix prepared (RAW for actor BC): base=%d vase_demo=%d total=%d",
+            len(base_part_raw), len(vase_part_raw), len(sac_trainer.bc_data),
+        )
+
+        # ─────────────────────────────────────────────
+        # 6) Optionally: add vase demos to ELITE buffer for this mesh (helps critic + sampling)
+        # ─────────────────────────────────────────────
+        fill_elite = bool(sleep_cfg.get("sleep_fill_elite_from_vase_demos", True))
+        if fill_elite and vase_demo_norm:
+            elite_added = 0
+            for tr in vase_demo_norm:
+                if tr.next_state is None:
+                    continue
+                sac_trainer.buffer.add_elite(
+                    state=tr.state,
+                    action_type=tr.action_type,
+                    action_params=tr.action_params,
+                    reward=tr.reward,
+                    next_state=tr.next_state,
+                    done=tr.done,
+                    mesh_name=mesh_name,
+                )
+                elite_added += 1
+            logger.info("SLEEP: elite filled from vase demos: elite_added=%d", elite_added)
+        else:
+            logger.info("SLEEP: elite fill skipped (enabled=%s demos=%d)", fill_elite, len(vase_demo_norm))
+
+        # ─────────────────────────────────────────────
+        # 7) Make BC less aggressive in sleep (used by train() bc_lambda schedule)
+        # ─────────────────────────────────────────────
+        sac_trainer.bc_lambda_init = float(sleep_cfg.get("sleep_bc_lambda_init", 1.0))
+        sac_trainer.bc_lambda_min = float(sleep_cfg.get("sleep_bc_lambda_min", 0.1))
+
+        logger.info(
+            "SLEEP: BC lambda overrides for sleep: init=%.3f min=%.3f",
+            sac_trainer.bc_lambda_init, sac_trainer.bc_lambda_min,
+        )
+
+        # ─────────────────────────────────────────────
+        # Sleep Phases
+        # ─────────────────────────────────────────────
+        # ─────────────────────────────────────────────
+        # Phase A: BC-only finetune on vase demos (no critic) dataset mix (vase + base)
+        # ─────────────────────────────────────────────
+        phase_a_cfg = sleep_cfg.get("sleep_phase_a", {})
+        mix_base = bool(phase_a_cfg.get("mix_base", True))
+        phase_a_base_keep = int(phase_a_cfg.get("base_keep", 4000))   # small anchor
+        phase_a_vase_keep = int(phase_a_cfg.get("vase_keep", 12000))  # main signal
+
+        phase_a_data = []
+
+        # vase part
+        if vase_demo_norm:
+            if len(vase_demo_norm) > phase_a_vase_keep:
+                idx = np.random.choice(len(vase_demo_norm), phase_a_vase_keep, replace=False)
+                phase_a_data.extend([vase_demo_norm[i] for i in idx])
+            else:
+                phase_a_data.extend(list(vase_demo_norm))
+
+        # base anchor part
+        if mix_base and base_bc_norm:
+            if len(base_bc_norm) > phase_a_base_keep:
+                idx = np.random.choice(len(base_bc_norm), phase_a_base_keep, replace=False)
+                phase_a_data.extend([base_bc_norm[i] for i in idx])
+            else:
+                phase_a_data.extend(list(base_bc_norm))
+
+        np.random.shuffle(phase_a_data)
+
+        logger.info(
+            "SLEEP: Phase A dataset mix: svase=%d base=%d total=%d",
+            min(len(vase_demo_norm), phase_a_vase_keep),
+            (min(len(base_bc_norm), phase_a_base_keep) if (mix_base and base_bc_norm) else 0),
+            len(phase_a_data),
+        )
+        bc_only_cfg = sleep_cfg.get("sleep_bc_only", {})
+        bc_only_enabled = bool(bc_only_cfg.get("enabled", True))
+
+        if bc_only_enabled and phase_a_data:
+            bc_steps = int(bc_only_cfg.get("steps", 3000))
+            bc_bs = int(bc_only_cfg.get("batch_size", 128))
+            bc_lr_scale = float(bc_only_cfg.get("lr_scale", 0.05))
+            bc_grad_clip = float(bc_only_cfg.get("grad_clip", 0.5))
+            bc_log_every = int(bc_only_cfg.get("log_every", 200))
+
+            # default: only crawl params to avoid unstable heads
+            param_types = set(bc_only_cfg.get("param_types", [0]))
+
+            logger.info(
+                "SLEEP: Phase A BC-only finetune: steps=%d bs=%d lr_scale=%.3f param_types=%s demos=%d",
+                bc_steps, bc_bs, bc_lr_scale, sorted(list(param_types)), len(vase_demo_norm)
+            )
+
+            bc_res = sac_trainer.bc_only_finetune(
+                bc_transitions=phase_a_data,
+                num_steps=bc_steps,
+                batch_size=bc_bs,
+                lr_scale=bc_lr_scale,
+                param_types=param_types,
+                grad_clip=bc_grad_clip,
+                log_every=bc_log_every,
+            )
+            logger.info("SLEEP: Phase A result: %s", bc_res)
+        else:
+            logger.info("SLEEP: Phase A BC-only skipped (enabled=%s demos=%d)",
+                        bc_only_enabled, len(vase_demo_norm) if vase_demo_norm else 0)
+
+        # ─────────────────────────────────────────────
+        # Phase B: critic-only consolidation (freeze actor updates)
+        # ─────────────────────────────────────────────
+        if bool(sleep_cfg.get("sleep_phase_b_freeze_actor", True)):
+            sac_trainer.actor_warmup_per_level = 10**9  # ensures [WARMUP] for all episodes
+            logger.info("SLEEP: Phase B actor frozen (actor_warmup_per_level set very high)")
+
+        mesh_path = str(self.data_dir / f"{mesh_name}.stl")
+        offline_env = LightweightEnv(mesh_path, seed=self.sac_seed, mesh_name=mesh_name)
+
+        controller = RLGoalApproachController(
+            agent_id=f"{mesh_name}_sleep_train",
+            config={**self.rl_config, "mode": "eval"},
+        )
+
+        # Ensure correct mesh tracking / buffer routing
+        sac_trainer.buffer.set_current_mesh(mesh_name)
+        sac_trainer.start_mesh_tracking(mesh_name)
+
+        sleep_train_episodes = int(sleep_cfg.get("sleep_train_episodes", 800))
+        sleep_warmup_steps = int(sleep_cfg.get("sleep_warmup_steps", 1000))
+        sleep_log_interval = int(sleep_cfg.get("sleep_log_interval", 50))
+
+        # More conservative settings for sleep (optional knobs)
+        # You can also put these into sac_cfg/sleep_cfg explicitly.
+        sac_trainer.use_cql = bool(sleep_cfg.get("use_cql", sac_trainer.use_cql))
+        sac_trainer.cql_alpha = float(sleep_cfg.get("cql_alpha", sac_trainer.cql_alpha))
+
+        sac_trainer.train(
+            env=offline_env,
+            controller=controller,
+            num_episodes=sleep_train_episodes,
+            warmup_steps=sleep_warmup_steps,
+            update_every=1,
+            updates_per_step=1,
+            log_interval=sleep_log_interval,
+            save_dir=adapt_sac_dir,
+            curriculum_levels=None,      # we DO NOT generate goals in sleep
+            curriculum_filters=None,
+            episode_pools=episode_pools, # uses saved start/goal tasks
+            mesh_name=mesh_name,
+            current_ratio=0.1,
+            bc_ratio=0.2,
+            elite_ratio=0.7,
+        )
+
+        # ─────────────────────────────────────────────
+        # Phase C: actor-only SAC improvement (critic frozen)
+        # ─────────────────────────────────────────────
+        phase_c_cfg = sleep_cfg.get("sleep_phase_c", {})
+        if bool(phase_c_cfg.get("enabled", True)):
+            sac_trainer.bc_lambda = 0.5
+            sac_trainer.bc_lambda_min = 0.3
+            actor_steps = int(phase_c_cfg.get("steps", 8000))
+            actor_lr_scale = float(phase_c_cfg.get("lr_scale", 0.05))
+            actor_log_every = int(phase_c_cfg.get("log_every", 500))
+
+            c_ratio = float(phase_c_cfg.get("current_ratio", 0.5))
+            b_ratio = float(phase_c_cfg.get("bc_ratio", 0.2))
+            e_ratio = float(phase_c_cfg.get("elite_ratio", 0.3))
+
+            logger.info(
+                "SLEEP: Phase C actor-only: steps=%d lr_scale=%.3f mix(cur=%.2f bc=%.2f elite=%.2f)",
+                actor_steps, actor_lr_scale, c_ratio, b_ratio, e_ratio,
+            )
+
+            res_c = sac_trainer.actor_only_sac_finetune(
+                mesh_name=mesh_name,
+                num_steps=actor_steps,
+                current_ratio=c_ratio,
+                bc_ratio=b_ratio,
+                elite_ratio=e_ratio,
+                lr_scale=actor_lr_scale,
+                log_every=actor_log_every,
+            )
+            logger.info("SLEEP: Phase C result: %s", res_c)
+        else:
+            logger.info("SLEEP: Phase C skipped (disabled)")
+
+        # Save final model
+        sac_trainer.save(adapt_sac_dir)
+        logger.info("SLEEP: saved SAC after Phase C to %s", adapt_sac_dir)
 
         # ═══ Save sleep report ═══
+        sleep_results = {
+            "status": "completed",
+            "sleep_tasks": len(sleep_tasks),
+            "levels_to_consolidate": levels_to_consolidate,
+            "sleep_train_episodes": sleep_train_episodes,
+            "sleep_warmup_steps": sleep_warmup_steps,
+        }
         import json
         report = {
             "mesh_name": mesh_name,

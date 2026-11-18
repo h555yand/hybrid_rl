@@ -157,7 +157,7 @@ class Arbitrator:
         min_eval_per_source: int = 5,
         force_heuristic: bool = False,
         temperature_override = None,
-        sac_proven_threshold: float = 0.6,
+        sac_proven_threshold: float = 0.8,
     ):
         self.controller = controller
         self.sac_actor = sac_actor
@@ -579,7 +579,7 @@ class Arbitrator:
         self.stats["total_decisions"] += 1
         level = self._current_level
         has_sac = self.sac_actor is not None
-        has_sac = False
+        # has_sac = False
         self._level_total_decisions[level] += 1
 
         # ═══ Force heuristic when stuck ═══
@@ -759,11 +759,11 @@ class Arbitrator:
         if q_type == 0:
             return *self._decide_crawl(
                 q_action, q_params, q_confidence,
-                sac_type, sac_params, has_sac,
+                sac_type, sac_params, sac_proven,
             ), q_values, confidence_info
 
         # All other actions: SAC (continuous params better)
-        if has_sac:
+        if sac_proven:
             sac_n = self._type_names.get(sac_type, f"type_{sac_type}")
             self._record_decision("sac")
             self.sac_chosen_actions[sac_n] += 1
