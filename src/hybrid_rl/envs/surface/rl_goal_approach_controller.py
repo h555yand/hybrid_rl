@@ -673,7 +673,7 @@ class RLGoalApproachController:
             f"]"
             f"|peff={phase_eff:.2f}|pthr={phase_thr}"
             # f"|_last_surface_debug: {self._last_surface_debug}"
-            f"|_wall_side_debug: {sensor_data.get("wall_side_debug")}"
+            f"|_wall_side_debug: {sensor_data.get('wall_side_debug')}"
         )
 
         if strategic_source:
