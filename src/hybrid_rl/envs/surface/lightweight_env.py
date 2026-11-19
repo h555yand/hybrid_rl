@@ -710,6 +710,23 @@ class LightweightEnv:
         
         edge_traversed = False
 
+        # --- NEW: detect being near rim/open edge (topological boundary) ---
+        near_rim = False
+        try:
+            h = self.height_axis
+            rim_h = self.open_edge_height
+            # tolerance: couple mm. 3-5mm обычно норм.
+            rim_tol = 4.0
+            near_rim = abs(float(old_pos[h] - rim_h)) <= rim_tol
+        except Exception:
+            near_rim = False
+
+        # --- NEW: mark rim -> wall as edge traversal (topological crossing) ---
+        # We only mark it when starting from a horizontal surface near the rim
+        # and snapping to a vertical surface.
+        if can_transition and is_from_horiz and (not is_new_horiz) and near_rim:
+            edge_traversed = True
+            
         # Edge transition: opposite-facing "horizontal" surfaces
         if (
             not can_transition
@@ -878,84 +895,35 @@ class LightweightEnv:
                     )
 
                     if need_flip:
-                        opp_pos = (
-                            closest[0] - hit_n * 5.0
-                        )
-                        cl_opp, d_opp, f_opp = (
-                            self.mesh.nearest.on_surface(
-                                [opp_pos]
-                            )
-                        )
-                        n_opp = self.mesh.face_normals[
-                            f_opp[0]
-                        ].copy()
-                        n_opp /= (
-                            np.linalg.norm(n_opp)
-                            + 1e-12
-                        )
+                        opp_pos = (closest[0] - hit_n * 5.0)
+                        cl_opp, d_opp, f_opp = (self.mesh.nearest.on_surface([opp_pos]))
+                        n_opp = self.mesh.face_normals[f_opp[0]].copy()
+                        n_opp /= (np.linalg.norm(n_opp)+ 1e-12)
 
-                        if not self._is_horizontal(
-                            n_opp
-                        ):
+                        if not self._is_horizontal(n_opp):
                             n_opp_h = n_opp.copy()
-                            n_opp_h[
-                                self.height_axis
-                            ] = 0.0
-                            nol = np.linalg.norm(
-                                n_opp_h
-                            )
+                            n_opp_h[self.height_axis] = 0.0
+                            nol = np.linalg.norm(n_opp_h)
                             if nol > 1e-8:
-                                opp_r = (
-                                    cl_opp[0]
-                                    - self._mesh_centroid
-                                )
-                                opp_r[
-                                    self.height_axis
-                                ] = 0.0
-                                opp_sr = float(
-                                    np.linalg.norm(
-                                        opp_r
-                                    )
-                                )
+                                opp_r = (cl_opp[0] - self._mesh_centroid)
+                                opp_r[self.height_axis] = 0.0
+                                opp_sr = float(np.linalg.norm(opp_r))
                                 if opp_sr > 1e-8:
-                                    opp_outward = (
-                                        float(
-                                            np.dot(
-                                                n_opp_h
-                                                / nol,
-                                                opp_r
-                                                / opp_sr,
-                                            )
-                                        )
-                                        > 0
+                                    opp_outward = (float(np.dot(n_opp_h / nol, opp_r / opp_sr, )) > 0
                                     )
                                     if from_bottom:
-                                        if (
-                                            from_inner_bottom
-                                        ):
-                                            ok = (
-                                                not opp_outward
-                                            )
+                                        if (from_inner_bottom):
+                                            ok = (not opp_outward)
                                         else:
-                                            ok = (
-                                                opp_outward
-                                            )
+                                            ok = (opp_outward)
                                     else:
-                                        if (
-                                            agent_on_inner_edge
-                                        ):
-                                            ok = (
-                                                opp_outward
-                                            )
+                                        if (agent_on_inner_edge):
+                                            ok = (opp_outward)
                                         else:
-                                            ok = (
-                                                not opp_outward
-                                            )
+                                            ok = (not opp_outward)
                                     if ok:
                                         hit_n = n_opp
-                                        closest = (
-                                            cl_opp
-                                        )
+                                        closest = (cl_opp)
                 else:
                     self._wall_side_debug = "hn0"
             else:
@@ -1222,17 +1190,18 @@ class LightweightEnv:
             return snap
         
         new_pos = snap["position"]
-        
-        # CCD-lite collision check for non-edge moves
-        if self._check_motion_collision_ccd(
-            old_pos,
-            new_pos,
-            radius=1.0,       # agent collision radius (mm)
-            sample_step=1.5,  # spacing along segment (mm)
-            max_samples=12,
-            end_margin=1.0,   # ignore 1mm near endpoints
-        ):
-            # Try same-side fallback (оставляем твою текущую логику 1-в-1)
+
+        # Hollow-flip check
+        if self._is_hollow and self.mesh.is_watertight:
+            inside_old = bool(self.mesh.contains([old_pos])[0])
+            inside_new = bool(self.mesh.contains([new_pos])[0])
+            if inside_old != inside_new:
+                snap["valid"] = False
+                return snap
+
+        # ray-bundle segment intersection
+        if self._check_through_wall_bundle(old_pos, new_pos, old_normal, eps=0.30, delta=0.40):
+            # Try same-side fallback (оставь твою текущую логику)
             probe = old_pos + world_dir * step_size + old_normal * 3.0
             cl, d, f = self.mesh.nearest.on_surface([probe])
             n_fb = self.mesh.face_normals[f[0]].copy()
@@ -1244,10 +1213,7 @@ class LightweightEnv:
             fallback_pos = cl[0] + n_fb * 2.0
 
             if (
-                not self._check_motion_collision_ccd(
-                    old_pos, fallback_pos,
-                    radius=1.0, sample_step=1.5, max_samples=12, end_margin=1.0
-                )
+                not self._check_through_wall_bundle(old_pos, fallback_pos, old_normal, eps=0.30, delta=0.40)
                 and np.dot(n_fb, old_normal) > -0.1
                 and d[0] < step_size * 3.0
             ):
@@ -1257,6 +1223,74 @@ class LightweightEnv:
                 snap["valid"] = False
         
         return snap
+
+    def _check_through_wall_bundle(
+        self,
+        old_pos: np.ndarray,
+        new_pos: np.ndarray,
+        old_normal: np.ndarray | None,
+        eps: float = 0.30,     # mm: ignore hits very near the endpoints
+        delta: float = 0.40,   # mm: ray origin offsets (bundle) to avoid grazing misses
+    ) -> bool:
+        """
+        Robust segment-mesh intersection test.
+        Returns True if motion from old_pos to new_pos crosses mesh surface
+        in the interior of the segment (excluding eps near ends).
+        Uses a small ray bundle to reduce grazing/coplanar miss cases.
+        """
+        old_pos = np.asarray(old_pos, dtype=float)
+        new_pos = np.asarray(new_pos, dtype=float)
+
+        v = new_pos - old_pos
+        dist = float(np.linalg.norm(v))
+        if dist < 1e-6:
+            return False
+
+        d = v / dist
+        eps_local = min(eps, dist * 0.1)
+
+        offsets = [np.zeros(3)]
+
+        if old_normal is not None:
+            n = np.asarray(old_normal, dtype=float)
+            n /= (np.linalg.norm(n) + 1e-12)
+
+            # tangent roughly perpendicular to motion
+            t = np.cross(d, n)
+            t_norm = float(np.linalg.norm(t))
+            if t_norm < 1e-6:
+                a = np.array([1.0, 0.0, 0.0])
+                if abs(float(np.dot(a, d))) > 0.9:
+                    a = np.array([0.0, 1.0, 0.0])
+                t = np.cross(d, a)
+                t_norm = float(np.linalg.norm(t))
+            t /= (t_norm + 1e-12)
+
+            offsets += [n * delta, -n * delta, t * delta, -t * delta]
+        else:
+            # fallback: jitter only with an arbitrary perpendicular direction
+            a = np.array([1.0, 0.0, 0.0])
+            if abs(float(np.dot(a, d))) > 0.9:
+                a = np.array([0.0, 1.0, 0.0])
+            t = np.cross(d, a)
+            t /= (np.linalg.norm(t) + 1e-12)
+            offsets += [t * delta, -t * delta]
+
+        for off in offsets:
+            origin = old_pos + off
+            locs, _, _ = self.mesh.ray.intersects_location(
+                ray_origins=[origin],
+                ray_directions=[d],
+            )
+            if len(locs) == 0:
+                continue
+
+            hit_dists = np.linalg.norm(locs - origin, axis=1)
+            inside = (hit_dists > eps_local) & (hit_dists < dist - eps_local)
+            if np.any(inside):
+                return True
+
+        return False
 
     def _check_motion_collision_ccd(
         self,
