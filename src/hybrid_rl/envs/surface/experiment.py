@@ -1944,9 +1944,13 @@ class RLGoalApproachExperiment:
             if isinstance(mesh_cfg, dict):
                 num_episodes = mesh_cfg["episodes"]
                 pool_seed = mesh_cfg.get("pool_seed", self.sac_seed)
+                curriculum_levels = mesh_cfg.get("curriculum_levels", self.curriculum_levels)
+                curriculum_filters = mesh_cfg.get("curriculum_filters", self.curriculum_filters)
             else:
                 num_episodes = mesh_cfg
                 pool_seed = self.sac_seed
+                curriculum_levels = self.curriculum_levels
+                curriculum_filters = self.curriculum_filters
 
             mesh_path = str(
                 self.data_dir / f"{mesh_name}.stl"
@@ -1968,10 +1972,10 @@ class RLGoalApproachExperiment:
                 seeds=[pool_seed],
                 episodes_per_level=num_episodes,
                 scripts_dir=self.scripts_dir,
-                curriculum_levels=self.curriculum_levels,
+                curriculum_levels=curriculum_levels,
                 regenerate=self.regenerate_scripts,
                 prefix=f"sac_train_{mesh_name}_ps{pool_seed}",
-                curriculum_filters=self.curriculum_filters,
+                curriculum_filters=curriculum_filters,
             )
 
             trainer.start_mesh_tracking(mesh_name)

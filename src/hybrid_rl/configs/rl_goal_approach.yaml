@@ -2,10 +2,10 @@ seed: 42
 # Visualization: null | text | pictures | video
 visualise: text
 regenerate_scripts: true
-do_train: true
-do_eval: true
-do_heur_eval: true
-do_bc_train: true
+do_train: false
+do_eval: false
+do_heur_eval: false
+do_bc_train: false
 do_sac_train: true
 do_sac_eval: true
 do_adaptive: false
@@ -203,14 +203,14 @@ training_stages:
   #    - {}
 
   # ── Phase 2: Hollow objects ──
-  - mesh: vase
-    episodes: 1000
-    epsilon_start: 1.0
-    epsilon_min: 0.95
-    load_mode: auto
-    warmup_episodes: 100
-    promote_threshold: 0.70
-    promote_window: 200
+  #- mesh: vase
+  #  episodes: 1000
+  #  epsilon_start: 1.0
+  #  epsilon_min: 0.95
+  #  load_mode: auto
+  #  warmup_episodes: 100
+  #  promote_threshold: 0.70
+  #  promote_window: 200
 
   #- mesh: mug
   #  episodes: 2000
@@ -247,21 +247,21 @@ training_stages:
 # ═══════════════════════════════════════════
 eval_meshes:
   # Train set — primitives
-  - mesh: cube
-    curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
-      - {}
-  - mesh: sphere
-    curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
-      - {}
-  - mesh: cylinder
-    curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
-      - {}
+  #- mesh: cube
+  #  curriculum_filters:
+  #    - {same_side: true, path_blocked: false}
+  #    - {same_side: true, path_blocked: true}
+  #    - {}
+  #- mesh: sphere
+  #  curriculum_filters:
+  #    - {same_side: true, path_blocked: false}
+  #    - {same_side: true, path_blocked: true}
+  #    - {}
+  #- mesh: cylinder
+  #  curriculum_filters:
+  #    - {same_side: true, path_blocked: false}
+  #    - {same_side: true, path_blocked: true}
+  #    - {}
   #- mesh: flat_square
   #  curriculum_filters:
   #    - {same_side: true, path_blocked: false}
@@ -298,7 +298,7 @@ bc_mesh_names:
   #- flat_square
   #- cone
   #- thin_cylinder
-  - vase
+  #- vase
   #- mug
 
 # ═══ BC balancing ═══
@@ -310,7 +310,7 @@ bc_mesh_weights:
   #flat_square: 0.5   # очень простой, мало нового
   #cone: 1.0
   #thin_cylinder: 0.5
-  vase: 2.0          # hollow навигация — ключевой для cup
+  #vase: 2.0          # hollow навигация — ключевой для cup
   #mug: 2.5           # самый сложный, handle+rim — максимум данных
 
 bc_level_weights:
@@ -488,26 +488,47 @@ sac_config:
   buffer_capacity: 1000000
   bc_reserve_fraction: 0.20
   max_steps_per_goal: 500
-  eval_interval: 100
+  eval_interval: 500
   eval_episodes: 50
   use_strategic_override: false
   use_cql: true
   cql_alpha: 1.0
 
-sac_episodes_per_mesh:
-  cube: 1000
-  sphere: 1000
-  cylinder: 1000
+#sac_episodes_per_mesh:
+  #cube: 500
+  #sphere: 500
+  #cylinder: 500
   #flat_square: 500
   #cone: 1000
   #thin_cylinder: 500
-  vase: 1000
+  #vase: 1000
   #mug: 1000
 
-#sac_episodes_per_mesh:
-#  mug:
-#    episodes: 3000
-#    pool_seed: 301
+sac_episodes_per_mesh:
+  cube:
+    episodes: 500
+    curriculum_filters:
+        - {same_side: true, path_blocked: false}
+        - {same_side: true, path_blocked: true}
+        - {}
+  sphere:
+    episodes: 500
+    curriculum_filters:
+        - {same_side: true, path_blocked: false}
+        - {same_side: true, path_blocked: true}
+        - {}
+  cylinder:
+    episodes: 500
+    curriculum_filters:
+        - {same_side: true, path_blocked: false}
+        - {same_side: true, path_blocked: true}
+        - {}
+  vase:
+    episodes: 500
+    curriculum_filters:
+        - {same_side: true, path_blocked: false}
+        - {same_side: true, path_blocked: true}
+        - {same_side: false}
 
 sac_eval_episodes_per_level: 100
 

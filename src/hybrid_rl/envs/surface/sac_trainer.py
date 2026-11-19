@@ -801,7 +801,7 @@ class PSACTrainer:
         self._crit_diag_counter += 1
         if self._crit_diag_counter % 200 == 0:
             with torch.no_grad():
-                logger.info(
+                logger.debug(
                     "CRIT_DIAG: r_mean=%.3f target_q[mean=%.3e std=%.3e min=%.3e max=%.3e] "
                     "q1[mean=%.3e std=%.3e] q2[mean=%.3e std=%.3e]",
                     float(rewards.mean().item()),
