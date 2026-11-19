@@ -378,6 +378,8 @@ class RLGoalApproachController:
         self._prev_pose_height = None
         self.learning_enabled = True
         self._prev_edge_dist = None
+        self._bottom_orbit_sign = None
+        self._bottom_wall_lock = 0
 
         logger.info(
             f"RLGoalApproachController initialized: "
@@ -670,6 +672,8 @@ class RLGoalApproachController:
             f"{p_chosen_str}"
             f"]"
             f"|peff={phase_eff:.2f}|pthr={phase_thr}"
+            # f"|_last_surface_debug: {self._last_surface_debug}"
+            f"|_wall_side_debug: {sensor_data.get("wall_side_debug")}"
         )
 
         if strategic_source:
@@ -820,6 +824,8 @@ class RLGoalApproachController:
         self._prev_goal_alignment = None
         self._prev_pose_height = None
         self._prev_edge_dist = None
+        self._bottom_orbit_sign = None
+        self._bottom_wall_lock = 0
         
     def step(
         self,
@@ -3351,26 +3357,45 @@ class RLGoalApproachController:
                     if e_t is not None:
                         tangential_dist = float(np.linalg.norm(e_t))
                         if tangential_dist > 0.1:
-                            tb1, tb2 = self._build_tangent_basis(
-                                rot, n_hat
-                            )
+                            tb1, tb2 = self._build_tangent_basis(rot, n_hat)
                             if tb1 is not None:
                                 best = None
                                 best_score = -1e18
                                 scores = np.full(8, -1e18, dtype=float)
-                                for i, deg in enumerate(
-                                    self.action_space.SURFACE_DIRECTIONS
-                                ):
+
+                                up_dir = np.asarray(
+                                    sensor_data.get("up_direction", [0, 0, 1]),
+                                    dtype=float,
+                                )
+                                up_len = float(np.linalg.norm(up_dir))
+                                if up_len > 1e-8:
+                                    up_dir = up_dir / up_len
+                                else:
+                                    up_dir = np.array([0.0, 0.0, 1.0], dtype=float)
+
+                                # NEW: bottom->wall lock (read once)
+                                lock = int(getattr(self, "_bottom_wall_lock", 0))
+
+                                for i, deg in enumerate(self.action_space.SURFACE_DIRECTIONS):
                                     a = np.radians(deg)
                                     v_world = np.cos(a) * tb1 + np.sin(a) * tb2
+
                                     v_norm = float(np.linalg.norm(v_world))
                                     if v_norm < 1e-8:
                                         continue
                                     v_world /= v_norm
+
                                     new_e = e_t - step * v_world
                                     score = float(
                                         np.dot(e_t, e_t) - np.dot(new_e, new_e)
                                     )
+
+                                    # If lock active: forbid directions that go "down" (toward bottom)
+                                    if lock > 0:
+                                        vertical = float(np.dot(v_world, up_dir))
+                                        if vertical < -0.05:
+                                            score -= 1e6  # essentially forbid
+
                                     scores[i] = score
                                     if score > best_score:
                                         best_score = score
@@ -3392,7 +3417,12 @@ class RLGoalApproachController:
                                         "tangential_dist": round(tangential_dist, 2),
                                         "subgoal_dir": subgoal_dir.tolist() if subgoal_dir is not None else None,
                                         "agent_rot": current_pose[3:6].tolist(),
+                                        "lock": lock,
                                     }
+
+                                    # decay lock once per decision step (not per direction)
+                                    if getattr(self, "_bottom_wall_lock", 0) > 0:
+                                        self._bottom_wall_lock -= 1
                         else:
                             self._last_surface_debug = {
                                 "phase": "CRAWL_TO_EDGE",
@@ -5148,6 +5178,11 @@ class RLGoalApproachController:
                 abs(float(np.dot(n, up_dir))) > 0.85
             )
 
+            # Detect transition off bottom: if we are NOT horizontal now,
+            # arm a short lock to prevent falling back to bottom.
+            if not is_on_horizontal:
+                self._bottom_wall_lock = max(getattr(self, "_bottom_wall_lock", 0), 4)
+                
             if is_on_horizontal:
                 extents = np.asarray(
                     sensor_data.get(
@@ -5327,23 +5362,50 @@ class RLGoalApproachController:
                             )
                         return None
                     else:
-                        # near_bottom
-                        away = (
-                            current_pose[:3] - center
-                        )
-                        crawl_dir = (
-                            away
-                            - np.dot(away, n) * n
-                        )
-                        crawl_len = np.linalg.norm(
-                            crawl_dir
-                        )
-                        if crawl_len > 1e-8:
-                            self._crawl_edge_debug = "HB"
-                            return (
-                                crawl_dir / crawl_len
-                            )
-                        return None
+                        # near_bottom (HB): avoid radial bounce by adding stable orbit component
+                        away = current_pose[:3] - center
+                        away_t = away - np.dot(away, n) * n
+                        away_len = float(np.linalg.norm(away_t))
+
+                        if away_len < 1e-8:
+                            self._crawl_edge_debug = "HB|degen"
+                            return None
+
+                        away_t /= away_len
+
+                        # Orbit direction along bottom plane (perpendicular to away, around up_dir)
+                        orbit = np.cross(up_dir, away_t)
+                        orbit_len = float(np.linalg.norm(orbit))
+                        if orbit_len > 1e-8:
+                            orbit /= orbit_len
+                        else:
+                            orbit = np.zeros(3)
+
+                        # Choose a stable orbit sign for the whole episode to prevent oscillations
+                        if getattr(self, "_bottom_orbit_sign", None) is None:
+                            goal_dir = self._current_goal[:3] - current_pose[:3]
+                            goal_dir[height_axis] = 0.0  # horizontal component only
+                            g_len = float(np.linalg.norm(goal_dir))
+                            if g_len > 1e-8 and orbit_len > 1e-8:
+                                goal_dir /= g_len
+                                s = float(np.sign(np.dot(orbit, goal_dir)))
+                                self._bottom_orbit_sign = 1.0 if s >= 0 else -1.0
+                            else:
+                                self._bottom_orbit_sign = 1.0
+
+                        orbit *= float(self._bottom_orbit_sign)
+
+                        # Blend: mostly outward to reach wall, with orbit to slide along it
+                        crawl_dir = 0.85 * away_t + 0.35 * orbit
+                        crawl_dir = crawl_dir - np.dot(crawl_dir, n) * n  # keep tangential
+                        crawl_len = float(np.linalg.norm(crawl_dir))
+                        if crawl_len < 1e-8:
+                            self._crawl_edge_debug = "HB|blend_degen"
+                            return away_t  # fallback
+
+                        crawl_dir /= crawl_len
+                        self._crawl_edge_debug = f"HB|orb={int(self._bottom_orbit_sign)}"
+                        return crawl_dir
                 else:
                     # ═══ NOT on edge ═══
                     bbox_min = center - extents / 2.0

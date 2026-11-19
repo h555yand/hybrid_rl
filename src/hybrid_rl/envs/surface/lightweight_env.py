@@ -276,6 +276,7 @@ class LightweightEnv:
             "open_edge_height": self.open_edge_height,
             "snap_debug": getattr(self, "_last_snap_debug", ""),
             "is_hollow": getattr(self, "_is_hollow", False),
+            "wall_side_debug": getattr(self, "_wall_side_debug", ""),
         }
 
     def _same_side_air(self, agent_pos, goal_pos, agent_normal):
@@ -672,6 +673,8 @@ class LightweightEnv:
     def _find_snap_target(self, old_pos, old_normal, world_dir, step_size, curvature_k1=None):
         """Find the best surface point to snap to."""
         self._wall_side_debug = ""
+        w2h_str = ""
+        stall_debug = ""
         
         closest, dist, face_id = self.mesh.nearest.on_surface(
             [self.agent_pos]
@@ -937,12 +940,49 @@ class LightweightEnv:
             snap_h = closest[0][self.height_axis]
             bmin_h = self.mesh.bounds[0][self.height_axis]
             bmax_h = self.mesh.bounds[1][self.height_axis]
+
+            # NEW: wall -> rim is also a topological edge crossing (allow hollow-flip)
+            rim_tol = 4.0  # mm (можно 5.0 если нужно)
+            near_rim_new = abs(float(snap_h - self.open_edge_height)) <= rim_tol
+
+            if self._is_hollow and near_rim_new:
+                edge_traversed = True
+                wrim_str = "|wrim=1"
+            else:
+                wrim_str = ""
             
             old_n_h = old_normal.copy()
             old_n_h[self.height_axis] = 0.0
             old_radial = old_pos - self._mesh_centroid
             old_radial[self.height_axis] = 0.0
 
+            # --- DEBUG: wall -> horizontal snap info ---
+            try:
+                snap_h = float(closest[0][self.height_axis])
+                bmin_h = float(self.mesh.bounds[0][self.height_axis])
+                bmax_h = float(self.mesh.bounds[1][self.height_axis])
+                bottom_h = bmin_h if self.up_sign > 0 else bmax_h
+                rim_h = float(self.open_edge_height)
+                near_bottom = abs(snap_h - bottom_h) < 5.0
+                du = float(np.dot(world_dir, self.up_direction))
+                w2h_str = (
+                    f"|w2h=1"
+                    f"{wrim_str}"
+                    f"|nb={int(near_bottom)}"
+                    f"|du={du:.3f}"
+                    f"|sh={snap_h:.1f}"
+                    f"|bh={bottom_h:.1f}"
+                    f"|rh={rim_h:.1f}"
+                    f"|sdist={float(dist[0]):.2f}"
+                )
+            except Exception:
+                w2h_str = "|w2h=1|err=1"
+
+            self._wall_side_debug = (
+                f"{self._wall_side_debug}"
+                f"{w2h_str}"
+            )
+                
             if (
                 np.linalg.norm(old_n_h) > 0.3
                 and np.linalg.norm(old_radial) > 1e-8
@@ -988,7 +1028,6 @@ class LightweightEnv:
                 }
 
         # ═══ Edge stall detection ═══
-        stall_debug = "none"
         if (
             can_transition
             and is_from_horiz
@@ -1036,6 +1075,7 @@ class LightweightEnv:
                         f"|hn={[round(x,2) for x in hit_n.tolist()]}"
                         f"|edge={int(edge_traversed)}"
                         f"|stall={stall_debug}"
+                        f"{w2h_str}"
                     )
                     
                     return {
@@ -1044,13 +1084,14 @@ class LightweightEnv:
                         "edge_traversed": True,
                         "valid": True,
                     }
-                
+
         self._wall_side_debug = (
             f"PRE|fh={int(is_from_horiz)}"
             f"|nh={int(is_new_horiz)}"
             f"|hn={[round(x,2) for x in hit_n.tolist()]}"
             f"|edge={int(edge_traversed)}"
             f"|stall={stall_debug}"
+            f"{w2h_str}"
         )
 
         new_pos = closest[0] + hit_n * 2.0

@@ -1,10 +1,10 @@
 seed: 42
 # Visualization: null | text | pictures | video
 visualise: video
-regenerate_scripts: false
+regenerate_scripts: true
 do_train: false
-do_eval: true
-do_heur_eval: false
+do_eval: false
+do_heur_eval: true
 do_bc_train: false
 do_sac_train: false
 do_sac_eval: false
