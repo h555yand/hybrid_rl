@@ -1,6 +1,6 @@
 seed: 42
 # Visualization: null | text | pictures | video
-visualise: video
+visualise: text
 regenerate_scripts: true
 do_train: false
 do_eval: false
