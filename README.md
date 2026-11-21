@@ -1390,11 +1390,20 @@ When stuck: random action probability increases progressively (15% → 50%), and
 | **Total** | **67%** | **168** | **131** | **95%** | — |
 
 ### Evaluation (unseen scenarios)
-
+Старое
 | Scenario | ε = 0.3 | ε = 0.1 |
 |----------|:-------:|:-------:|
 | eval_medium_with_obs | SR = 70%, col = 12% | SR = 43%, col = 9% |
 | eval_far_dense | SR = 61%, col = 14% | SR = 33%, col = 10% |
+
+
+С новым HNSW stroe 
+============================================================
+EVALUATION SUMMARY
+============================================================
+  eval_medium_with_obs          : SR=68% (68/100) col=13 tout=19
+  eval_far_dense                : SR=58% (58/100) col=11 tout=31
+  
 
 > **Epsilon sensitivity:** At ε = 0.3 (70% Q + 30% heuristic), the system performs best. At ε = 0.1 (90% Q), performance drops significantly — Q-store alone is not yet reliable enough. This mirrors the parent project's finding that the blend of Q-store and heuristic outperforms either alone, and motivates the planned adaptive arbitrator.
 

@@ -168,7 +168,7 @@ experiment:
       her_goal_reward: 0.5
 
       # Eval
-      eval_epsilon: 0.3
+      eval_epsilon: 0.1
       eval_alpha_multiplier: 0.1
 
     # ═══════════════════════════════════════════
@@ -236,7 +236,7 @@ experiment:
       - name: medium_with_obs
         episodes: 300
         epsilon_start: 1.0
-        epsilon_min: 0.5
+        epsilon_min: 0.95
         warmup_episodes: 50
         load_mode: null
         min_dist: 4.0
@@ -251,7 +251,7 @@ experiment:
       - name: far_dense_obs
         episodes: 300
         epsilon_start: 1.0
-        epsilon_min: 0.5
+        epsilon_min: 0.95
         warmup_episodes: 50
         load_mode: auto
         min_dist: 6.0
@@ -265,7 +265,7 @@ experiment:
       # ── Phase 4: Hardening with traps ──
       - name: hardening_traps
         episodes: 300
-        epsilon_start: 0.5
+        epsilon_start: 0.95
         epsilon_min: 0.1
         warmup_episodes: 0
         load_mode: auto
