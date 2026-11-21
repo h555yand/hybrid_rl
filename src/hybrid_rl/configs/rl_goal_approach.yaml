@@ -8,8 +8,8 @@ do_heur_eval: false
 do_bc_train: false
 do_sac_train: false
 do_sac_eval: false
-do_adaptive: false
-do_sleep: true
+do_adaptive: true
+do_sleep: false
 do_ycb_eval: false
 
 train_seeds: [11]

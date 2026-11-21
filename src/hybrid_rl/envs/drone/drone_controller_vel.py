@@ -56,7 +56,7 @@ from drone.drone_config_vel import DEFAULT_DRONE_CONFIG_VEL
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from hybrid_rl.core.hnsw_state_store import HNSWStateStore
+from .hnsw_state_store import HNSWStateStore
 
 logger = logging.getLogger(__name__)
 
