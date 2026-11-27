@@ -579,7 +579,7 @@ class Arbitrator:
         self.stats["total_decisions"] += 1
         level = self._current_level
         has_sac = self.sac_actor is not None
-        # has_sac = False
+        has_sac = False
         self._level_total_decisions[level] += 1
 
         # ═══ Force heuristic when stuck ═══
@@ -589,16 +589,16 @@ class Arbitrator:
                 "forced_heuristic(mode=force_all)",
             ), None, None
 
-        phase = getattr(self.controller, '_current_phase', 'CRAWL_TO_GOAL')
-        if phase == "DETACH_NEEDED":
-            return *self._decide_heuristic(
-                state, current_pose, sensor_data,
-                "forced_heuristic(phase=DETACH_NEEDED)",
-            ), None, None
+        #phase = getattr(self.controller, '_current_phase', 'CRAWL_TO_GOAL')
+        #if phase == "DETACH_NEEDED":
+        #    return *self._decide_heuristic(
+        #        state, current_pose, sensor_data,
+        #        "forced_heuristic(phase=DETACH_NEEDED)",
+        #    ), None, None
 
         # ═══ Get proposals ═══
         q_action, q_confidence, q_spread, q_recency, q_best_norm, q2_z, q_values, confidence_info = (
-            self._get_q_action(state, sensor_data)
+            self._get_q_action(state, current_pose, sensor_data)
         )
         q_type = ExperienceExtractor.DISCRETE_TO_PSAC[q_action][0]
         q_params = self._discrete_to_params(q_action)
@@ -730,7 +730,7 @@ class Arbitrator:
         # ═══════════════════════════════════════════════════════
         # DECISION TREE
         # ═══════════════════════════════════════════════════════
-
+    
         # --- 1. Q NOT RELIABLE → SAC if proven, else heuristic ---
         if not q_is_reliable:
             if sac_proven:
@@ -1004,7 +1004,7 @@ class Arbitrator:
 
         return np.zeros(3, dtype=np.float32)
 
-    def _get_q_action(self, state, sensor_data):
+    def _get_q_action(self, state, current_pose, sensor_data):
         store = self.controller._select_store(state, sensor_data)
 
         if store is self.controller.q_store_free:
@@ -1095,21 +1095,21 @@ class Arbitrator:
         else:
             q_spread = 0.0
 
-        eps = self.controller._get_current_epsilon()
-        temperature = max(np.clip(0.5 * eps, 0.01, 0.5), 0.05)
-        if self.temperature_override is not None:
-            temperature = self.temperature_override
-
-        v = q_values.copy()
-        v[~valid] = -1e9
-        v = v / temperature
-        v = v - np.max(v)
-        exp_v = np.exp(v)
-        probs = exp_v / exp_v.sum()
-        q_action = int(np.random.choice(len(probs), p=probs))
+        # --- NEW: unified Q-policy proposal from controller (includes strategic) ---
+        # Q-only proposal: disable heuristic blending by forcing epsilon=0
+        q_action, _ = self.controller.select_action(
+            state=state,
+            current_pose=current_pose,
+            sensor_data=sensor_data,
+            epsilon=0.0,
+            strategic_epsilon=0.0,
+            temperature_override=self.temperature_override,
+            explain=False,
+            deterministic=True,
+        )
 
         return q_action, q_confidence, q_spread, recency, best_q_norm, q2_z, q_values, confidence_info
-    
+
     def _get_q_action_old(self, state):
         store = self.controller._select_store(state)
         running_stats = (
@@ -1236,18 +1236,15 @@ class Arbitrator:
             return self.controller._prev_sensor_data
         return None
 
-    def _get_heuristic_action(
-        self,
-        state: np.ndarray,
-        current_pose: np.ndarray,
-        sensor_data: Dict[str, Any],
-    ) -> int:
-        return self.controller._choose_action_heuristic(
+    def _get_heuristic_action(self, state, current_pose, sensor_data) -> int:
+        h_action, _ = self.controller.select_heuristic_action(
             state=state,
             current_pose=current_pose,
             sensor_data=sensor_data,
+            explain=False,
         )
-
+        return int(h_action)
+        
     def on_episode_end(self, success: bool):
         level = self._current_level
         counts = Counter(self._current_episode_sources)

@@ -340,7 +340,7 @@ class RLGoalApproachController:
             "collision_lost_object": 0,
             "collision_other": 0,
         }
-        self.temperature_override = None
+        self.temperature_override = self.config.get("temperature_override", 0.05)
         # Running Q statistics for advantage-based action selection (v2)
         self._running_q_stats_free = RunningQStats(warmup=200)
         self._running_q_stats_surface = RunningQStats(warmup=200)
@@ -842,6 +842,7 @@ class RLGoalApproachController:
         self._last_detach_sub_steps = sensor_data.get("detach_sub_steps", 1)
         self._steps += 1
         self._total_steps += 1
+        deterministic = True
 
         state = self._compute_state(current_pose, sensor_data)
         logger.debug(
@@ -896,6 +897,7 @@ class RLGoalApproachController:
                 }
             )
             if self.is_training and getattr(self, "learning_enabled", True):
+                deterministic = False
                 if done:
                     td_target = reward
                 else:
@@ -949,11 +951,12 @@ class RLGoalApproachController:
         ) == "v2":
             print("no v2")
         else:
-            action_index, explanation = self._choose_action(
+            action_index, explanation = self.select_action(
                 state=state,
                 current_pose=current_pose,
                 sensor_data=sensor_data,
                 explain=True,
+                deterministic=deterministic,
             )
 
         self._prev_state = state
@@ -2352,7 +2355,46 @@ class RLGoalApproachController:
     # ══════════════════════════════════════════════════════════
     # ACTION SELECTION
     # ══════════════════════════════════════════════════════════
-    def _choose_action_heuristic(self, state, current_pose, sensor_data):
+    def select_heuristic_action(
+        self,
+        state: np.ndarray,
+        current_pose: np.ndarray,
+        sensor_data: Dict[str, Any],
+        *,
+        explain: bool = False,
+    ):
+        """
+        Unified heuristic-only policy proposal (may include forced detach logic).
+        Returns discrete 24-action index.
+        """
+        action_index, _ = self.select_action(
+            state=state,
+            current_pose=current_pose,
+            sensor_data=sensor_data,
+            epsilon=1.0,
+            strategic_epsilon=1.0,
+            temperature_override=self.temperature_override,
+            explain=explain,
+            deterministic=True,
+        )
+
+        if not explain:
+            return action_index, None
+
+        # Lightweight explanation: reuse state debug builder
+        dbg = self.get_state_debug_info(
+            state=state,
+            current_pose=current_pose,
+            sensor_data=sensor_data,
+            chosen_action=action_index,
+            probs=None,
+            q_values=None,
+            q_confidence=None,
+            strategic_source="heuristic_only",
+        )
+        return action_index, {"interpretation": dbg, "chosen_action": action_index}
+
+    def _choose_action_heuristic_old(self, state, current_pose, sensor_data):
         heuristic, _ = self._compute_heuristic_bias(
             state=state,
             current_pose=current_pose,
@@ -2628,6 +2670,7 @@ class RLGoalApproachController:
         current_pose: np.ndarray,
         sensor_data: Dict[str, Any],
         explain: bool = False,
+        deterministic: bool = False,
     ):
         store = self._select_store(state, sensor_data)
         if store.name == "surface_bypass" and store.next_id == 0:
@@ -2906,35 +2949,42 @@ class RLGoalApproachController:
 
         # ═══ SOFTMAX SAMPLING (tactical level) ═══
         if action_index is None:
-            v = combined / temperature
-            v = v - np.max(v)
-            exp_v = np.exp(v)
-            probs = exp_v / exp_v.sum()
-
-            p_random = 0.02 * eps
-            if np.random.random() < p_random:
-                is_random_override = True
-                valid_mask = np.ones(
-                    self.num_actions, dtype=bool
-                )
-                masked_check = self.apply_action_mask(
-                    np.zeros(self.num_actions), state
-                )
-                valid_mask[masked_check < -1e8] = False
-                if (
-                    state[11] > 0.5
-                    and state[13] < 5.0 * self.action_space.surface_step
-                ):
-                    valid_mask[self.action_space.IDX_DETACH] = False
-
-                valid_indices = np.where(valid_mask)[0]
-                action_index = int(np.random.choice(valid_indices))
+            if deterministic:
+                # Fully deterministic: greedy argmax on combined
+                action_index = int(np.argmax(combined))
                 probs = np.zeros(self.num_actions)
                 probs[action_index] = 1.0
+                is_random_override = False
             else:
-                action_index = int(
-                    np.random.choice(len(probs), p=probs)
-                )
+                v = combined / temperature
+                v = v - np.max(v)
+                exp_v = np.exp(v)
+                probs = exp_v / exp_v.sum()
+
+                p_random = 0.02 * eps
+                if np.random.random() < p_random:
+                    is_random_override = True
+                    valid_mask = np.ones(
+                        self.num_actions, dtype=bool
+                    )
+                    masked_check = self.apply_action_mask(
+                        np.zeros(self.num_actions), state
+                    )
+                    valid_mask[masked_check < -1e8] = False
+                    if (
+                        state[11] > 0.5
+                        and state[13] < 5.0 * self.action_space.surface_step
+                    ):
+                        valid_mask[self.action_space.IDX_DETACH] = False
+
+                    valid_indices = np.where(valid_mask)[0]
+                    action_index = int(np.random.choice(valid_indices))
+                    probs = np.zeros(self.num_actions)
+                    probs[action_index] = 1.0
+                else:
+                    action_index = int(
+                        np.random.choice(len(probs), p=probs)
+                    )
         else:
             probs = np.zeros(self.num_actions)
             probs[action_index] = 1.0
@@ -6854,6 +6904,53 @@ class RLGoalApproachController:
                 },
             }
         return stats
+
+    def select_action(
+        self,
+        state: np.ndarray,
+        current_pose: np.ndarray,
+        sensor_data: Dict[str, Any],
+        *,
+        epsilon: Optional[float] = None,
+        strategic_epsilon: Optional[float] = None,
+        temperature_override: Optional[float] = None,
+        explain: bool = False,
+        deterministic: bool = False,
+    ):
+        """
+        Unified policy selection used by both controller.step() and Arbitrator.
+
+        - Includes strategic logic (detach/direction) from _choose_action.
+        - Uses the same softmax sampling as _choose_action.
+        """
+
+        # Backup mutable knobs
+        old_eps = self.epsilon
+        old_strat_eps = self.strategic_epsilon
+        old_temp = self.temperature_override
+
+        try:
+            if epsilon is not None:
+                self.epsilon = float(epsilon)
+            if strategic_epsilon is not None:
+                self.strategic_epsilon = float(strategic_epsilon)
+            if temperature_override is not None:
+                self.temperature_override = temperature_override
+
+            action_index, explanation = self._choose_action(
+                state=state,
+                current_pose=current_pose,
+                sensor_data=sensor_data,
+                explain=explain,
+                deterministic=deterministic
+            )
+            return action_index, explanation
+
+        finally:
+            # Restore
+            self.epsilon = old_eps
+            self.strategic_epsilon = old_strat_eps
+            self.temperature_override = old_temp
 
     def update_only(self, current_pose, sensor_data, action_index, source: str = None):
         if self._current_goal is None:

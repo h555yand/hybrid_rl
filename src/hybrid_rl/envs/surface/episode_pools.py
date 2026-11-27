@@ -235,7 +235,7 @@ def generate_episode_pools(
                         reference_pos=start_pos,
                         min_dist=min_d,
                         max_dist=max_d,
-                        max_attempts=2000,
+                        max_attempts=max_attempts,
                         mesh_sample=True,
                     )
                 )

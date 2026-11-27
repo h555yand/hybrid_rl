@@ -161,19 +161,19 @@ class RLGoalApproachExperiment:
             )
         )
         self.train_seeds: list[int] = self.config.get(
-            "train_seeds", [11]
+            "train_seeds", [None]
         )
         self.eval_seeds: list[int] = self.config.get(
-            "eval_seeds", [44]
+            "eval_seeds", [None]
         )
         self.sac_eval_seeds: list[int] = self.config.get(
-            "sac_eval_seeds", [77, 88, 99]
+            "sac_eval_seeds", [None]
         )
         self.sac_seed: int = self.config.get(
-            "sac_seed", self.train_seeds[0]
+            "sac_seed", None
         )
         self.adapt_seed: int = self.config.get(
-            "adapt_seed", 42
+            "adapt_seed", None
         )
         self.eval_episodes_per_level: int = self.config.get(
             "eval_episodes_per_level", 500
@@ -220,10 +220,10 @@ class RLGoalApproachExperiment:
 
         # Adaptive config
         self.adaptive_mesh: str = self.config.get(
-            "adaptive_mesh", "cup"
+            "adaptive_mesh", "vase"
         )
         self.adaptive_episodes: int = self.config.get(
-            "adaptive_episodes", 3000
+            "adaptive_episodes", 500
         )
 
         # Eval meshes
@@ -1961,7 +1961,7 @@ class RLGoalApproachExperiment:
                 num_episodes,
                 pool_seed,
             )
-            env = LightweightEnv(mesh_path, mesh_name=Path(mesh_path).stem)
+            env = LightweightEnv(mesh_path, mesh_name=Path(mesh_path).stem, seed=pool_seed)
             controller = RLGoalApproachController(
                 agent_id=f"sac_{mesh_name}",
                 config={**self.rl_config, "mode": "eval"},
@@ -2218,6 +2218,7 @@ class RLGoalApproachExperiment:
                 pool = sac_eval_pools[eval_seed]["levels"][level_idx]
 
                 np.random.seed(eval_seed)  # noqa: NPY002
+                random.seed(eval_seed)
                 torch.manual_seed(eval_seed)
 
                 env = LightweightEnv(mesh_path, seed=eval_seed, mesh_name=Path(mesh_path).stem)
@@ -2462,7 +2463,7 @@ class RLGoalApproachExperiment:
         # ═══ Sleep-Q normalization data (NEW) ═══
         _SLEEP_Q_SAVE_EVERY = _SLEEP_TRAILS_SAVE_EVERY
         _SLEEP_Q_START_K = 5
-        _SLEEP_Q_STRIDE = 5
+        _SLEEP_Q_STRIDE = 1
         _SLEEP_Q_MAX_STATES_PER_LEVEL = 50_000
         _SLEEP_Q_MAX_START_PER_LEVEL = 10_000
 
@@ -2501,22 +2502,25 @@ class RLGoalApproachExperiment:
         )
         logger.info("=" * 60)
 
-        np.random.seed(adapt_seed)
-        random.seed(adapt_seed)
-
         num_types = len(ExperienceExtractor.get_type_names())
         type_names = ExperienceExtractor.get_type_names()
 
-        adaptive_cfg = {**self.rl_config, "mode": "adaptive"}
+        adaptive_cfg = {
+            **self.rl_config,
+            "mode": "adaptive",
+            "unfreeze_normalization": True,
+            "warmup_episodes": 0,
+        }
         adaptive_max_steps = self.rl_config.get(
             "max_steps_per_goal", 400
         )
+        force_heuristic = True
 
         # ═══ Load controller ═══
         q_load_dir = (
             adapt_q_dir
             if (Path(adapt_q_dir) / "config.json").exists()
-            else self._q_model_dir(adapt_seed)
+            else self._q_model_dir(self.train_seeds[0])
         )
         logger.info("Loading Q-store from: %s", q_load_dir)
 
@@ -2526,6 +2530,18 @@ class RLGoalApproachExperiment:
             config=adaptive_cfg,
         )
         controller._collision_stats = {}
+
+        if adaptive_cfg.get("unfreeze_normalization", False):
+            for store in [
+                controller.q_store_free,
+                controller.q_store_surface,
+                controller.strategic_detach,
+                controller.strategic_direction,
+            ]:
+                store._norm_frozen = False
+                store._freeze_done = False
+                store._state_buffer.clear()
+            logger.info("Normalization unfrozen for transfer learning")
 
         # ═══ Q-store diagnostics: initial sizes ═══
         q_store_initial_free = len(controller.q_store_free.points)
@@ -2570,6 +2586,7 @@ class RLGoalApproachExperiment:
             online_sac_update_steps=40,
             enable_online_sac_updates=False,
             enable_offline_sac_retrain=False,
+            force_heuristic=force_heuristic
         )
         manager.sac_trainer = sac_trainer
 
@@ -2670,7 +2687,7 @@ class RLGoalApproachExperiment:
                     reference_pos=start_pos,
                     min_dist=min_dist,
                     max_dist=max_dist,
-                    max_attempts=2000,
+                    max_attempts=200,
                     mesh_sample=True,
                 )
 
@@ -2713,7 +2730,7 @@ class RLGoalApproachExperiment:
                     reference_pos=start_pos,
                     min_dist=min_dist,
                     max_dist=max_dist,
-                    max_attempts=2000,
+                    max_attempts=200,
                     mesh_sample=True,
                 )
                 is_fallback_episode = True
@@ -2756,6 +2773,13 @@ class RLGoalApproachExperiment:
             ep_q_confidences: list[float] = []
             ep_q_reliable_steps = 0
             ep_q_total_steps = 0
+            # --- NEW: per-episode buffers for sleep-Q norm (commit on success) ---
+            ep_q_start_states: list[np.ndarray] = []
+            ep_q_start_prox: list[float] = []
+            ep_q_start_qconf: list[float] = []
+
+            ep_q_sample_free: list[np.ndarray] = []
+            ep_q_sample_surface: list[np.ndarray] = []
 
             # ═══ Step loop ═══
             for step in range(adaptive_max_steps):
@@ -2769,50 +2793,34 @@ class RLGoalApproachExperiment:
                 )
                 controller._current_source = source
 
-                # ═══ Collect sleep-Q normalization stats (NEW) ═══
-                lvl_bucket = _ensure_q_level(adaptive_level)
-                lvl_bucket["counts"]["steps_seen"] += 1
-
+                # ═══ Collect sleep-Q normalization stats (per-episode, commit later) ═══
                 # Start-of-episode states (first K steps)
                 if step < _SLEEP_Q_START_K:
-                    lvl_bucket["start"]["states"].append(
-                        state.astype(np.float32, copy=False)
-                    )
+                    ep_q_start_states.append(state.astype(np.float32, copy=False))
+
                     if confidence_info is not None:
-                        lvl_bucket["start"]["prox"].append(
-                            float(confidence_info.get("proximity", 0.0))
-                        )
-                        lvl_bucket["start"]["q_conf"].append(
-                            float(confidence_info.get("overall", 0.0))
-                        )
+                        ep_q_start_prox.append(float(confidence_info.get("proximity", 0.0)))
+                        ep_q_start_qconf.append(float(confidence_info.get("overall", 0.0)))
                     else:
-                        lvl_bucket["start"]["prox"].append(0.0)
-                        lvl_bucket["start"]["q_conf"].append(0.0)
-
-                    _cap_list(lvl_bucket["start"]["states"], _SLEEP_Q_MAX_START_PER_LEVEL)
-                    _cap_list(lvl_bucket["start"]["prox"], _SLEEP_Q_MAX_START_PER_LEVEL)
-                    _cap_list(lvl_bucket["start"]["q_conf"], _SLEEP_Q_MAX_START_PER_LEVEL)
-
+                        ep_q_start_prox.append(0.0)
+                        ep_q_start_qconf.append(0.0)
+                        
+                # Sparse samples across episode for global normalization coverage
                 # Sparse samples across episode for global normalization coverage
                 if (step % _SLEEP_Q_STRIDE) == 0:
                     on_object = float(state[11]) > 0.5
 
-                    # same_side stored in state (ssS) at index 27 (state_dim=28)
                     same_side_state = True
                     if len(state) > 27:
                         same_side_state = bool(float(state[27]) > 0.5)
 
                     if not on_object:
-                        lvl_bucket["sample"]["free"].append(
-                            state.astype(np.float32, copy=False)
-                        )
-                        _cap_list(lvl_bucket["sample"]["free"], _SLEEP_Q_MAX_STATES_PER_LEVEL)
+                        ep_q_sample_free.append(state.astype(np.float32, copy=False))
                     else:
-                        lvl_bucket["sample"]["surface"].append(
-                            state.astype(np.float32, copy=False)
-                        )
-                        _cap_list(lvl_bucket["sample"]["surface"], _SLEEP_Q_MAX_STATES_PER_LEVEL)
-
+                        # Пока сохраняем как раньше: всё on_object -> surface.
+                        # Если позже захочешь, можно разнести same_side -> bypass.
+                        ep_q_sample_surface.append(state.astype(np.float32, copy=False))
+                        
                 # ═══ Per-episode Q diagnostics ═══
                 # Q confidence уже посчитан внутри arbitrator._get_q_action
                 # Берём из последних значений arbitrator
@@ -2942,13 +2950,37 @@ class RLGoalApproachExperiment:
                     break
 
             # ═══ Episode result ═══
-            success = (
-                controller._total_goals_reached > goals_before
-            )
+            success = (controller._total_goals_reached > goals_before)
             ep_successes.append(success)
             
-            # Count episodes for sleep-Q stats (NEW)
-            _ensure_q_level(adaptive_level)["counts"]["episodes"] += 1
+            # --- NEW: commit sleep-Q norm buffers only for good episodes ---
+            ep_len = len(last_transitions) if last_transitions else ep_steps  # более надёжно last_transitions
+
+            if success and (ep_len < 100):
+                lvl_bucket = _ensure_q_level(adaptive_level)
+
+                # counts
+                lvl_bucket["counts"]["episodes"] += 1
+                # сколько шагов мы реально добавили в qnorm из этого эпизода:
+                lvl_bucket["counts"]["steps_seen"] += ep_len
+
+                # commit start
+                lvl_bucket["start"]["states"].extend(ep_q_start_states)
+                lvl_bucket["start"]["prox"].extend(ep_q_start_prox)
+                lvl_bucket["start"]["q_conf"].extend(ep_q_start_qconf)
+
+                _cap_list(lvl_bucket["start"]["states"], _SLEEP_Q_MAX_START_PER_LEVEL)
+                _cap_list(lvl_bucket["start"]["prox"], _SLEEP_Q_MAX_START_PER_LEVEL)
+                _cap_list(lvl_bucket["start"]["q_conf"], _SLEEP_Q_MAX_START_PER_LEVEL)
+
+                # commit samples
+                lvl_bucket["sample"]["free"].extend(ep_q_sample_free)
+                lvl_bucket["sample"]["surface"].extend(ep_q_sample_surface)
+                # lvl_bucket["sample"]["bypass"].extend(ep_q_sample_bypass)  # если ключ существует
+
+                _cap_list(lvl_bucket["sample"]["free"], _SLEEP_Q_MAX_STATES_PER_LEVEL)
+                _cap_list(lvl_bucket["sample"]["surface"], _SLEEP_Q_MAX_STATES_PER_LEVEL)
+                # _cap_list(lvl_bucket["sample"]["bypass"], _SLEEP_Q_MAX_STATES_PER_LEVEL)
 
             # ═══ Collect sleep trails ═══
             if last_transitions:
@@ -3658,16 +3690,16 @@ class RLGoalApproachExperiment:
         mesh_path = str(
             self.data_dir / f"{self.adaptive_mesh}.stl"
         )
-        adapt_seed = self.train_seeds[0]
 
         np.random.seed(self.adapt_seed)
         random.seed(self.adapt_seed)
+        torch.manual_seed(self.adapt_seed)
 
-        env = LightweightEnv(mesh_path, seed=adapt_seed, mesh_name=self.adaptive_mesh)
+        env = LightweightEnv(mesh_path, seed=self.adapt_seed, mesh_name=self.adaptive_mesh)
 
         adapt_q_dir = str(
             self.runs_dir
-            / f"adaptive_q_seed_{adapt_seed}"
+            / f"adaptive_q_seed_{self.train_seeds[0]}"
         )
         adapt_sac_dir = str(
             self.runs_dir
@@ -3699,7 +3731,7 @@ class RLGoalApproachExperiment:
             curriculum_filters=self.curriculum_filters,
             adapt_q_dir=adapt_q_dir,
             adapt_sac_dir=adapt_sac_dir,
-            adapt_seed=adapt_seed,
+            adapt_seed=self.adapt_seed,
             log_dir=log_dir,
             mesh_path=mesh_path,
             visualizer=visualizer,
@@ -3793,8 +3825,40 @@ class RLGoalApproachExperiment:
             std = states_arr.std(axis=0)
             std = np.maximum(std, min_std)
             return mean, std
+        
+        def _sample_mix(current_list, replay_list, current_ratio: float, replay_cap: int | None = None, rng=None):
+            current_list = list(current_list) if current_list else []
+            replay_list = list(replay_list) if replay_list else []
+            if rng is None:
+                rng = np.random
 
-        def _sample_mix(current_list, replay_list, total: int, current_ratio: float):
+            C = len(current_list)
+            if C == 0:
+                return []
+
+            r = float(current_ratio)
+            r = min(max(r, 1e-6), 1.0)
+
+            # desired replay count to achieve ratio r given we take all current
+            if r >= 1.0:
+                desired_R = 0
+            else:
+                desired_R = int(round(C * (1.0 - r) / r))
+
+            if replay_cap is not None:
+                desired_R = min(desired_R, int(replay_cap))
+
+            desired_R = min(desired_R, len(replay_list))
+
+            if desired_R == len(replay_list):
+                rep = replay_list
+            else:
+                idx = rng.choice(len(replay_list), desired_R, replace=False)
+                rep = [replay_list[i] for i in idx]
+
+            return current_list + rep
+
+        def _sample_mix_old(current_list, replay_list, total: int, current_ratio: float):
             """Return list of states (python list), sampled from current/replay."""
             current_list = list(current_list) if current_list else []
             replay_list = list(replay_list) if replay_list else []
@@ -3823,7 +3887,7 @@ class RLGoalApproachExperiment:
         trails_path = log_dir / "sleep_trails.pkl"
 
         # ═══ Load sleep-Q norm data ═══
-        _run_sleep_Q = False
+        _run_sleep_Q = True
         if not _run_sleep_Q:
             logger.warning("Q sleep option skipped")
         else:
@@ -4008,9 +4072,9 @@ class RLGoalApproachExperiment:
                     rep_free, rep_surface, rep_bypass = [], [], []
 
                 # 4) Sample mixed pools
-                mix_free = _sample_mix(cur_free, rep_free, max_total, current_mesh_ratio)
-                mix_surface = _sample_mix(cur_surface, rep_surface, max_total, current_mesh_ratio)
-                mix_bypass = _sample_mix(cur_bypass, rep_bypass, max_total, current_mesh_ratio)
+                #mix_free = _sample_mix(cur_free, rep_free, current_mesh_ratio)
+                mix_surface = _sample_mix(cur_surface, rep_surface, current_mesh_ratio)
+                #mix_bypass = _sample_mix(cur_bypass, rep_bypass, current_mesh_ratio)
 
                 # 5) Recompute mean/std + rebuild index for each store
                 def _apply_norm_and_rebuild(store, states_list, store_label: str):
@@ -4035,9 +4099,9 @@ class RLGoalApproachExperiment:
                         store_label, len(states_list),
                     )
 
-                _apply_norm_and_rebuild(controller.q_store_free, mix_free, "free")
+                # _apply_norm_and_rebuild(controller.q_store_free, mix_free, "free")
                 _apply_norm_and_rebuild(controller.q_store_surface, mix_surface, "surface")
-                _apply_norm_and_rebuild(controller.q_store_surface_bypass, mix_bypass, "surface_bypass")
+                # _apply_norm_and_rebuild(controller.q_store_surface_bypass, mix_bypass, "surface_bypass")
 
                 # 6) Save controller back
                 controller.save(q_dir)
@@ -4046,7 +4110,7 @@ class RLGoalApproachExperiment:
         ############################################
         # ═══ Load sleep-SAC ═══
         ###########################################
-        _run_sleep_sac_complete = True
+        _run_sleep_sac_complete = False
         if _run_sleep_sac_complete:
             
             logger.warning("Start SAC sleep option _run_sleep_sac_complete")

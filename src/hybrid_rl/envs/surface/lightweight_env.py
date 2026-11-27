@@ -48,8 +48,12 @@ class LightweightEnv:
         # Roll - turn head to shoulder - rotation around the Z axis
         # self.agent_rot = [Pitch, Yaw, Roll]
         # self.agent_rot = [X-angle, Y-angle, Z-angle]
-        # Note: seed is set globally in train() => np.random.seed()
-        # trimesh.sample() uses global np.random
+        self.seed = seed
+        # NEW: dedicated RNG for reproducible but non-repeating sampling
+        # If seed is None -> non-deterministic behavior (acceptable for interactive runs)
+        self.rng = np.random.default_rng(seed)
+        # (optional) track how many sampling calls were made (debug/repro)
+        self._sample_calls = 0
         self._passed_through = False
         self._detach_had_collision = False
         self._compute_up_direction()
@@ -59,6 +63,12 @@ class LightweightEnv:
         self._edge_traversed = None
         self._last_snap_debug = ""
         self._wall_side_debug = ""
+
+    def _next_sample_seed(self) -> int:
+        """Return a fresh deterministic seed for trimesh sampling calls."""
+        self._sample_calls += 1
+        # trimesh expects an int seed (portable across numpy/trimesh versions)
+        return int(self.rng.integers(0, 2**32 - 1, dtype=np.uint32))
 
     def _check_is_hollow(self) -> bool:
         """Hardcoded hollow detection by mesh name.
@@ -85,7 +95,7 @@ class LightweightEnv:
             self.agent_pos = np.array(position, dtype=float)
         else:
             # Random point on surface (using controlled RNG)
-            points, face_ids = self.mesh.sample(1, return_index=True)
+            points, face_ids = self.mesh.sample(1, return_index=True, seed=self._next_sample_seed())
 
             normal = self.mesh.face_normals[face_ids[0]]
             self.agent_pos = points[0] + normal * 2.0  # 2 mm from the surface outwards
@@ -381,7 +391,7 @@ class LightweightEnv:
         )
 
         if mesh_sample:
-            points, face_ids = self.mesh.sample(max_attempts, return_index=True)
+            points, face_ids = self.mesh.sample(max_attempts, return_index=True, seed=self._next_sample_seed())
             for i in range(max_attempts):
                 normal = self.mesh.face_normals[face_ids[i]]
                 position = points[i] + normal * 2.0
@@ -401,7 +411,7 @@ class LightweightEnv:
                 return np.concatenate([position, rotation])
         else:
             for _ in range(max_attempts):
-                points, face_ids = self.mesh.sample(1, return_index=True)
+                points, face_ids = self.mesh.sample(1, return_index=True, seed=self._next_sample_seed())
                 normal = self.mesh.face_normals[face_ids[0]]
                 position = points[0] + normal * 2.0
 
@@ -417,7 +427,7 @@ class LightweightEnv:
 
         # Fallback: no point was within the range for max_attempts.
         # Return a random point.
-        points, face_ids = self.mesh.sample(1, return_index=True)
+        points, face_ids = self.mesh.sample(1, return_index=True, seed=self._next_sample_seed())
         normal = self.mesh.face_normals[face_ids[0]]
         position = points[0] + normal * 2.0
         rotation = self._look_at_direction(-normal)

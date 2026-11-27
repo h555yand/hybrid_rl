@@ -73,6 +73,7 @@ class AdaptiveTrainingManager:
         promote_window: int = 100,
         enable_online_sac_updates: bool = True,
         enable_offline_sac_retrain: bool = True,
+        force_heuristic = False
     ):
         self.controller = controller
         self.env = env
@@ -131,7 +132,8 @@ class AdaptiveTrainingManager:
         if controller is not None:
             self.arbitrator = Arbitrator(
                 controller=controller,
-                temperature_override=config.get("temperature_override", None)
+                temperature_override=config.get("temperature_override", None),
+                force_heuristic=force_heuristic
             )
         else:
             self.arbitrator = None
