@@ -19,7 +19,7 @@ sac_eval_seeds: [20]
 adapt_seed: 40
 
 promote_threshold: 0.7
-promote_window: 100
+promote_window: 200
 
 curriculum_levels:
   - [10.0, 60.0]    # L0: same_side, no path_blocked
@@ -137,22 +137,22 @@ training_stages:
   #    - {same_side: false}
 
   # Tests
-  - mesh: vase
-    episodes: 300
-    epsilon_start: 1.0
-    epsilon_min: 0.95
-    load_mode: auto
-    warmup_episodes: 50
-    promote_threshold: 0.70
-    promote_window: 50
-    curriculum_levels:
-      - [10.0, 60.0]    # L0: same_side, no path_blocked
-      - [10.0, 80.0]    # L1: same_side, path_blocked
-      - [10.0, 120.0]   # L2: different sides
-    curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
-      - {same_side: false}
+  #- mesh: vase
+  #  episodes: 300
+  #  epsilon_start: 1.0
+  #  epsilon_min: 1.0
+  #  load_mode: auto
+  #  warmup_episodes: 0
+  #  promote_threshold: 0.70
+  #  promote_window: 100
+  #  curriculum_levels:
+  #    - [10.0, 60.0]    # L0: same_side, no path_blocked
+  #    - [10.0, 80.0]    # L1: same_side, path_blocked
+  #    - [10.0, 120.0]   # L2: different sides
+  #  curriculum_filters:
+  #    - {same_side: true, path_blocked: false}
+  #    - {same_side: true, path_blocked: true}
+  #    - {same_side: false}
 
   #- mesh: mug
   #  episodes: 2000
@@ -423,7 +423,7 @@ sac_eval_episodes_per_level: 100
 
 ##################### adaptive ############
 adaptive_mesh: vase
-adaptive_episodes: 300
+adaptive_episodes: 1000
 #############################################
 
 offline_check_window: 100

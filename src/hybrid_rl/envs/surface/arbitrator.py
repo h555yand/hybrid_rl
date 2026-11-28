@@ -296,6 +296,10 @@ class Arbitrator:
         self._q_unreliable_streak = 0
         self._q_instant_threshold = 0.70  # можно 0.85..0.95
 
+        self._heur_roundtrip_total = 0
+        self._heur_roundtrip_mismatch = 0
+        self._heur_roundtrip_examples = deque(maxlen=50)  # чтобы увидеть конкретные кейсы
+
     def _needs_calibration(self, level: int) -> Optional[str]:
         """Check if SAC needs calibration on this level.
         
@@ -786,9 +790,33 @@ class Arbitrator:
     def _decide_heuristic(self, state, current_pose, sensor_data, reason):
         """Execute heuristic decision with standard bookkeeping."""
         level = self._current_level
+        
+        # 24-discrete heuristic action
         h_action = self._get_heuristic_action(state, current_pose, sensor_data)
+
+        # convert to (type, params)
         h_type = ExperienceExtractor.DISCRETE_TO_PSAC[h_action][0]
         h_params = self._discrete_to_params(h_action)
+
+        # round-trip back to 24-discrete
+        idx2 = sac_to_discrete(h_type, h_params)
+
+        # stats
+        self._heur_roundtrip_total += 1
+        if idx2 != int(h_action):
+            self._heur_roundtrip_mismatch += 1
+            self._heur_roundtrip_examples.append({
+                "level": int(level),
+                "h_action": int(h_action),
+                "rt_action": int(idx2),
+                "type": int(h_type),
+                "params": [float(x) for x in h_params.tolist()],
+                # полезные контекстные флаги
+                "on_object": bool(state[11] > 0.5),
+                "path_blocked": bool(sensor_data.get("path_blocked", False)),
+                "same_side": bool(sensor_data.get("same_side", True)),
+            })
+
         self._record_decision("heuristic")
         self._level_heuristic_decisions[level] += 1
         h_name = self._type_names.get(h_type, f"type_{h_type}")
@@ -1430,6 +1458,16 @@ class Arbitrator:
                 },
             }
 
+        rt_total = max(getattr(self, "_heur_roundtrip_total", 0), 1)
+        rt_mis = getattr(self, "_heur_roundtrip_mismatch", 0)
+
+        roundtrip = {
+            "total": int(getattr(self, "_heur_roundtrip_total", 0)),
+            "mismatch": int(rt_mis),
+            "mismatch_rate": round(rt_mis / rt_total, 6),
+            "examples": list(getattr(self, "_heur_roundtrip_examples", []))[-10:],
+        }
+
         return {
             "total_decisions": self.stats["total_decisions"],
             "q_store_rate": round(self.stats["q_store_chosen"] / total, 3),
@@ -1481,5 +1519,6 @@ class Arbitrator:
             "recent_disagreements": disagree_log[-20:],  # last 20 for inspection
             "q_diagnostics": q_diag_global,
             "q_diagnostics_per_level": q_diag_per_level,
+            "heuristic_roundtrip": roundtrip,
         }
     

@@ -6190,11 +6190,12 @@ class RLGoalApproachController:
                 else:
                     switch_target = 0.0
 
-                self.strategic_detach.update_q_value(
-                    t_state, action=1,
-                    td_target=switch_target,
-                    alpha=switch_alpha,
-                )
+                if self.is_training and self.learning_enabled:
+                    self.strategic_detach.update_q_value(
+                        t_state, action=1,
+                        td_target=switch_target,
+                        alpha=switch_alpha,
+                    )
 
                 # ═══ CHANGED: retrospective stuck states ═══
                 # Only update if detach was clearly good or bad
@@ -6214,12 +6215,13 @@ class RLGoalApproachController:
                         t_retro = self._compute_detach_state_from_full(
                             tr["state"], path_blocked=pb, movement_efficiency=eff,
                         )
-                        self.strategic_detach.update_q_value(
-                            t_retro, action=1,
-                            td_target=switch_target * 0.5,
-                            alpha=switch_alpha * 0.3,
-                            count_visit=False,
-                        )
+                        if self.is_training and self.learning_enabled:
+                            self.strategic_detach.update_q_value(
+                                t_retro, action=1,
+                                td_target=switch_target * 0.5,
+                                alpha=switch_alpha * 0.3,
+                                count_visit=False,
+                            )
                 elif switch_target < -0.5:
                     # Detach was clearly bad — teach stuck states that stay is better
                     for tr in stuck_states:
@@ -6228,12 +6230,13 @@ class RLGoalApproachController:
                         t_retro = self._compute_detach_state_from_full(
                             tr["state"], path_blocked=pb, movement_efficiency=eff,
                         )
-                        self.strategic_detach.update_q_value(
-                            t_retro, action=0,
-                            td_target=0.3,
-                            alpha=switch_alpha * 0.2,
-                            count_visit=False,
-                        )
+                        if self.is_training and self.learning_enabled:
+                            self.strategic_detach.update_q_value(
+                                t_retro, action=0,
+                                td_target=0.3,
+                                alpha=switch_alpha * 0.2,
+                                count_visit=False,
+                            )
 
                 # ═══ KEPT: long air penalty ═══
                 max_reasonable_air = 50
@@ -6241,13 +6244,14 @@ class RLGoalApproachController:
                     air_steps_after > max_reasonable_air
                     and not landed
                 ):
-                    self.strategic_detach.update_q_value(
-                        t_state, action=1,
-                        td_target=cfg.get(
-                            "strategic_reward_switch_long_air", -0.5
-                        ),
-                        alpha=switch_alpha * 0.5,
-                    )
+                    if self.is_training and self.learning_enabled:
+                        self.strategic_detach.update_q_value(
+                            t_state, action=1,
+                            td_target=cfg.get(
+                                "strategic_reward_switch_long_air", -0.5
+                            ),
+                            alpha=switch_alpha * 0.5,
+                        )
 
         # ── Episodes WITHOUT detach ──
         if not had_detach:
@@ -6298,12 +6302,13 @@ class RLGoalApproachController:
                         t_state = self._compute_detach_state_from_full(
                             s, path_blocked=pb, movement_efficiency=eff,
                         )
-                        self.strategic_detach.update_q_value(
-                            t_state, action=0,  # stay was bad
-                            td_target=-0.3,
-                            alpha=switch_alpha * 0.5,
-                            count_visit=False,
-                        )
+                        if self.is_training and self.learning_enabled:
+                            self.strategic_detach.update_q_value(
+                                t_state, action=0,  # stay was bad
+                                td_target=-0.3,
+                                alpha=switch_alpha * 0.5,
+                                count_visit=False,
+                            )
                         # ═══ REMOVED: no counterfactual switch reward ═══
                         # Was:
                         # self.strategic_detach.update_q_value(
@@ -6341,17 +6346,19 @@ class RLGoalApproachController:
                     pb = d_state[4]
                     allow_insert = i in insert_indices
                     if pb > 0.5:
-                        self.strategic_direction.update_q_value(
-                            d_state, action=1, td_target=0.5,
-                            alpha=dir_alpha,
-                            count_visit=allow_insert,
-                        )
+                        if self.is_training and self.learning_enabled:
+                            self.strategic_direction.update_q_value(
+                                d_state, action=1, td_target=0.5,
+                                alpha=dir_alpha,
+                                count_visit=allow_insert,
+                            )
                     else:
-                        self.strategic_direction.update_q_value(
-                            d_state, action=0, td_target=0.5,
-                            alpha=dir_alpha,
-                            count_visit=allow_insert,
-                        )
+                        if self.is_training and self.learning_enabled:
+                            self.strategic_direction.update_q_value(
+                                d_state, action=0, td_target=0.5,
+                                alpha=dir_alpha,
+                                count_visit=allow_insert,
+                            )
 
             elif termination_reason == "timeout":
                 for i, tr in enumerate(air_transitions):
@@ -6364,17 +6371,19 @@ class RLGoalApproachController:
                     pb = d_state[4]
                     allow_insert = i in insert_indices
                     if pb > 0.5:
-                        self.strategic_direction.update_q_value(
-                            d_state, action=1, td_target=-0.2,
-                            alpha=dir_alpha * 0.5,
-                            count_visit=allow_insert,
-                        )
+                        if self.is_training and self.learning_enabled:
+                            self.strategic_direction.update_q_value(
+                                d_state, action=1, td_target=-0.2,
+                                alpha=dir_alpha * 0.5,
+                                count_visit=allow_insert,
+                            )
                     else:
-                        self.strategic_direction.update_q_value(
-                            d_state, action=0, td_target=-0.2,
-                            alpha=dir_alpha * 0.5,
-                            count_visit=allow_insert,
-                        )
+                        if self.is_training and self.learning_enabled:
+                            self.strategic_direction.update_q_value(
+                                d_state, action=0, td_target=-0.2,
+                                alpha=dir_alpha * 0.5,
+                                count_visit=allow_insert,
+                            )
 
             elif termination_reason in (
                 "collision_surface_violation",
@@ -6390,17 +6399,19 @@ class RLGoalApproachController:
                     pb = d_state[4]
                     allow_insert = i in insert_indices
                     if pb > 0.5:
-                        self.strategic_direction.update_q_value(
-                            d_state, action=1, td_target=-0.3,
-                            alpha=dir_alpha * 0.3,
-                            count_visit=allow_insert,
-                        )
+                        if self.is_training and self.learning_enabled:
+                            self.strategic_direction.update_q_value(
+                                d_state, action=1, td_target=-0.3,
+                                alpha=dir_alpha * 0.3,
+                                count_visit=allow_insert,
+                            )
                     else:
-                        self.strategic_direction.update_q_value(
-                            d_state, action=0, td_target=-0.1,
-                            alpha=dir_alpha * 0.3,
-                            count_visit=allow_insert,
-                        )
+                        if self.is_training and self.learning_enabled:
+                            self.strategic_direction.update_q_value(
+                                d_state, action=0, td_target=-0.1,
+                                alpha=dir_alpha * 0.3,
+                                count_visit=allow_insert,
+                            )
 
         # ═══ Update Strategic SAC ═══
         if (

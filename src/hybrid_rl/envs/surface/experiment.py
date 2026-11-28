@@ -2514,7 +2514,7 @@ class RLGoalApproachExperiment:
         adaptive_max_steps = self.rl_config.get(
             "max_steps_per_goal", 400
         )
-        force_heuristic = True
+        force_heuristic = False
 
         # ═══ Load controller ═══
         q_load_dir = (
